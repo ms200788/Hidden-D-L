@@ -1,7 +1,17 @@
 # bot.py
 # Vault-style Telegram bot implementing upload sessions, deep links, persistent auto-delete jobs (minutes),
 # DB backups, and admin commands.
-# Reply-based /setmessage, /setimage, /setchannel flows implemented (owner replies to message/ link).
+#
+# This file is a full, fixed, ready-to-deploy implementation (polling mode) for aiogram v2.x.
+# - Reply-based /setmessage, /setimage, /setchannel, /setforcechannel flows.
+# - Upload sessions for owner (store messages in memory, finalize to upload channel).
+# - Random deeplink tokens (https://t.me/<bot>?start=<token>).
+# - Persistent sqlite DB for sessions/files/settings and APScheduler jobstore for delete jobs.
+# - Periodic DB backup (default every 12 hours) and immediate backup after owner changes/uploads.
+# - Health endpoint served by aiohttp so Render / UptimeRobot can ping the worker.
+#
+# NOTE: configure environment variables (BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL_ID, DB_CHANNEL_ID, etc.)
+# via Render or environment before running.
 
 import os
 import logging
@@ -43,6 +53,7 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "12"))
 AUTO_BACKUP_HOURS = int(os.environ.get("AUTO_BACKUP_HOURS", "12"))
 
+# Basic validation
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if OWNER_ID == 0:
@@ -62,7 +73,7 @@ logger = logging.getLogger("vaultbot")
 # -------------------------
 # Bot & Dispatcher
 # -------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=None)  # we'll control parse_mode per-message
+bot = Bot(token=BOT_TOKEN, parse_mode=None)  # we'll send plain text by default to avoid parse errors
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
@@ -78,12 +89,14 @@ scheduler.configure(timezone="UTC")
 # -------------------------
 # Callback data factories
 # -------------------------
+# We'll keep callback payloads small and store large/long items in an in-memory temp map.
 cb_choose_protect = CallbackData("protect", "session", "choice")
 cb_retry = CallbackData("retry", "session")
 cb_help_button = CallbackData("helpbtn", "action")
 cb_setmessage_confirm = CallbackData("setmsg", "which", "tempid")
-cb_setimage_confirm = CallbackData("setimg", "which", "fileid")
-cb_setchannel_confirm = CallbackData("setch", "alias", "link")
+cb_setimage_confirm = CallbackData("setimg", "which", "tempid")
+cb_setchannel_confirm = CallbackData("setch", "tempid")
+cb_setforcechannel_confirm = CallbackData("setforcech", "tempid")
 
 # -------------------------
 # DB schema
@@ -145,6 +158,9 @@ CREATE TABLE IF NOT EXISTS delete_jobs (
 db: sqlite3.Connection  # global
 
 def init_db(path: str = DB_PATH):
+    """
+    Initialize sqlite DB. Create directory for DB if missing and create schema if first run.
+    """
     global db
     os.makedirs(os.path.dirname(path), exist_ok=True)
     need_init = not os.path.exists(path)
@@ -208,6 +224,13 @@ def sql_get_session(session_id:int):
     r = cur.fetchone()
     return dict(r) if r else None
 
+def sql_get_session_by_token(token:str):
+    global db
+    cur = db.cursor()
+    cur.execute("SELECT * FROM sessions WHERE deep_link=?", (token,))
+    r = cur.fetchone()
+    return dict(r) if r else None
+
 def sql_get_session_files(session_id:int):
     global db
     cur = db.cursor()
@@ -247,7 +270,7 @@ def sql_stats():
     files = cur.fetchone()["files"]
     cur.execute("SELECT COUNT(*) as sessions FROM sessions")
     sessions = cur.fetchone()["sessions"]
-    # compute blocked-like heuristic: users who haven't been seen in >365 days (not perfect)
+    # heuristic "blocked / old" users count (not strictly blocked, but not seen for long time)
     cur.execute("SELECT COUNT(*) as old FROM users WHERE last_seen < ?", ((datetime.utcnow()-timedelta(days=365)).isoformat(),))
     old = cur.fetchone()["old"]
     return {"total_users": total_users, "active_2d": active, "files": files, "sessions": sessions, "old": old}
@@ -273,7 +296,7 @@ def sql_mark_job_done(job_id:int):
     db.commit()
 
 # -------------------------
-# In-memory upload sessions
+# In-memory upload sessions & temp stores
 # -------------------------
 active_uploads: Dict[int, Dict[str, Any]] = {}
 
@@ -293,10 +316,17 @@ def append_upload_message(owner_id:int, msg: types.Message):
 def get_upload_messages(owner_id:int) -> List[types.Message]:
     return active_uploads.get(owner_id, {}).get("messages", [])
 
+# temporary map for reply-based setters, keyed by token
+temp_map: Dict[str, Dict[str, Any]] = {}
+
 # -------------------------
 # Utilities
 # -------------------------
 async def safe_send(chat_id, text=None, parse_mode=None, **kwargs):
+    """
+    Send a plain/controlled message and handle common exceptions gracefully.
+    parse_mode should be None (we avoid HTML/Markdown unless explicitly required).
+    """
     try:
         if text is None:
             return None
@@ -314,6 +344,9 @@ async def safe_send(chat_id, text=None, parse_mode=None, **kwargs):
     return None
 
 async def safe_copy(to_chat_id:int, from_chat_id:int, message_id:int, **kwargs):
+    """
+    Copy message and handle retries.
+    """
     try:
         return await bot.copy_message(to_chat_id, from_chat_id, message_id, **kwargs)
     except RetryAfter as e:
@@ -325,26 +358,32 @@ async def safe_copy(to_chat_id:int, from_chat_id:int, message_id:int, **kwargs):
         return None
 
 async def resolve_channel_link(link: str) -> Optional[int]:
+    """
+    Resolve various forms of channel identifiers to a Telegram chat id.
+    Accepts -100XXXXXXXXXX, numeric, @username, t.me/username, or raw username.
+    Returns chat id or None.
+    """
     link = (link or "").strip()
     if not link:
         return None
     try:
-        # Accept -100... numeric id or raw numeric id
+        # direct numeric id detection
         if link.startswith("-100") or (link.startswith("-") and link[1:].isdigit()) or link.isdigit() or (link.startswith("-") and link[1:].isdigit()):
-            # try int
             try:
                 return int(link)
             except Exception:
                 pass
+        # t.me links
         if link.startswith("https://t.me/") or link.startswith("http://t.me/"):
             name = link.split("/")[-1]
             if name:
                 ch = await bot.get_chat(name)
                 return ch.id
+        # @username
         if link.startswith("@"):
             ch = await bot.get_chat(link)
             return ch.id
-        # fallback: try to get_chat for the token
+        # fallback: try to get_chat
         ch = await bot.get_chat(link)
         return ch.id
     except ChatNotFound:
@@ -358,6 +397,10 @@ async def resolve_channel_link(link: str) -> Optional[int]:
 # DB backup & restore
 # -------------------------
 async def backup_db_to_channel():
+    """
+    Upload local sqlite DB as a document to the DB_CHANNEL_ID and pin it for restore convenience.
+    Returns sent message or None.
+    """
     try:
         if DB_CHANNEL_ID == 0:
             logger.error("DB_CHANNEL_ID not set")
@@ -370,7 +413,6 @@ async def backup_db_to_channel():
                                            caption=f"DB backup {datetime.utcnow().isoformat()}",
                                            disable_notification=True)
         try:
-            # try to pin for restore convenience
             await bot.pin_chat_message(DB_CHANNEL_ID, sent.message_id, disable_notification=True)
         except ChatNotFound:
             logger.error("ChatNotFound while pinning DB. Bot might not be in the DB channel.")
@@ -382,9 +424,11 @@ async def backup_db_to_channel():
         return None
 
 async def restore_db_from_pinned():
+    """
+    If local DB missing, try to restore from pinned document in DB channel.
+    """
     global db
     try:
-        # If local DB exists, skip restore
         if os.path.exists(DB_PATH):
             logger.info("Local DB present; skipping restore.")
             return True
@@ -399,7 +443,6 @@ async def restore_db_from_pinned():
             file_id = pinned.document.file_id
             file = await bot.get_file(file_id)
             tmp = tempfile.NamedTemporaryFile(delete=False)
-            # download_file returns path in aiogram v2 File object: file.file_path
             await bot.download_file(file.file_path, tmp.name)
             tmp.close()
             os.replace(tmp.name, DB_PATH)
@@ -417,6 +460,9 @@ async def restore_db_from_pinned():
 # Delete job executor
 # -------------------------
 async def execute_delete_job(job_id:int, job_row:Dict[str,Any]):
+    """
+    Deletes scheduled messages from target chat and marks job done.
+    """
     try:
         msg_ids = json.loads(job_row["message_ids"])
         target_chat = int(job_row["target_chat_id"])
@@ -441,6 +487,9 @@ async def execute_delete_job(job_id:int, job_row:Dict[str,Any]):
         logger.exception("Failed delete job %s", job_id)
 
 async def restore_pending_jobs_and_schedule():
+    """
+    Read pending jobs from DB and schedule them in APScheduler on startup.
+    """
     logger.info("Restoring pending delete jobs")
     pending = sql_list_pending_jobs()
     for job in pending:
@@ -479,8 +528,10 @@ def is_owner(user_id:int)->bool:
 
 def build_channel_buttons(optional_list:List[Dict[str,str]], forced_list:List[Dict[str,str]]):
     kb = InlineKeyboardMarkup()
+    # optional channels first as buttons
     for ch in optional_list[:4]:
         kb.add(InlineKeyboardButton(ch.get("name","Channel"), url=ch.get("link")))
+    # forced channels (join) next
     for ch in forced_list[:3]:
         kb.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
     kb.add(InlineKeyboardButton("Help", callback_data=cb_help_button.new(action="open")))
@@ -490,23 +541,23 @@ def build_channel_buttons(optional_list:List[Dict[str,str]], forced_list:List[Di
 # Helper: generate random deeplink token
 # -------------------------
 def random_token(length=10):
-    # url-safe short token
+    """
+    Generate short random token safe for use in deeplinks.
+    """
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
-
-# -------------------------
-# Temporary storage for reply-based setters
-# -------------------------
-# We'll store small temporary items in memory keyed by owner id.
-temp_setters: Dict[int, Dict[str, Any]] = {}
 
 # -------------------------
 # Command handlers
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
+    """
+    /start handler supports:
+    - no payload: show start text (with optional channel buttons)
+    - payload numeric id or token: deliver session files for that session
+    """
     try:
-        # store user
         sql_add_user(message.from_user)
         args = message.get_args().strip()
         payload = args if args else None
@@ -515,7 +566,6 @@ async def cmd_start(message: types.Message):
         start_text = db_get("start_text", "")
         if not start_text:
             start_text = f"Welcome, {message.from_user.first_name or message.from_user.username or 'guest'}!"
-        # replace placeholders safely (text no parse mode)
         start_text = start_text.replace("{username}", message.from_user.username or "").replace("{first_name}", message.from_user.first_name or "")
 
         optional_json = db_get("optional_channels", "[]")
@@ -531,17 +581,10 @@ async def cmd_start(message: types.Message):
         kb = build_channel_buttons(optional, forced)
 
         if not payload:
-            # show start message + image (if set) and channel buttons
+            # send start message (with image if configured)
             start_image = db_get("start_image")
             if start_image:
                 try:
-                    if start_image:
-    try:
-        await message.answer_photo(start_image, caption=start_text or "Welcome!")
-    except Exception:
-        await message.answer(start_text or "Welcome!")
-else:
-    await message.answer(start_text or "Welcome!")
                     await bot.send_photo(message.chat.id, start_image, caption=start_text, reply_markup=kb)
                 except Exception:
                     # fallback to text only
@@ -550,26 +593,19 @@ else:
                 await safe_send(message.chat.id, start_text, parse_mode=None, reply_markup=kb)
             return
 
-        # payload implies deeplink with session id or token
-        # Accept session id (int) or token (string)
-        session_identifier = payload
+        # payload handling: try numeric id first, otherwise treat as token
         session_row = None
-        # try numeric
         try:
-            sid = int(session_identifier)
+            sid = int(payload)
             session_row = sql_get_session(sid)
         except Exception:
-            # try token lookup
-            cur = db.cursor()
-            cur.execute("SELECT * FROM sessions WHERE deep_link=?", (session_identifier,))
-            r = cur.fetchone()
-            session_row = dict(r) if r else None
+            session_row = sql_get_session_by_token(payload)
 
         if not session_row or session_row.get("revoked"):
             await safe_send(message.chat.id, "This session link is invalid or revoked.", parse_mode=None)
             return
 
-        # verify forced join channels for this session
+        # verify forced join channels for this session (global forced channels)
         blocked = False
         unresolved = []
         forced_list = json.loads(db_get("force_channels", "[]") or "[]")
@@ -599,6 +635,7 @@ else:
             kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=session_row["id"])))
             await safe_send(message.chat.id, "You must join the required channels first.", parse_mode=None, reply_markup=kb2)
             return
+
         if unresolved:
             kb2 = InlineKeyboardMarkup()
             for ch in forced_list[:3]:
@@ -618,11 +655,11 @@ else:
                     delivered_msg_ids.append(m.message_id)
                 else:
                     try:
-                        # copy from upload channel vault message id to user
+                        # copy from vault message (UPLOAD_CHANNEL_ID) -> user's chat
                         m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"], caption=f.get("caption") or "", protect_content=bool(protect_flag) and not owner_is_requester)
                         delivered_msg_ids.append(m.message_id)
                     except Exception:
-                        # fallback to sending by file_id
+                        # fallback to sending file by id
                         if f["file_type"] == "photo":
                             sent = await bot.send_photo(message.chat.id, f["file_id"], caption=f.get("caption") or "")
                             delivered_msg_ids.append(sent.message_id)
@@ -691,10 +728,10 @@ async def _on_choose_protect(call: types.CallbackQuery, callback_data: dict):
     try:
         choice = int(callback_data.get("choice", "0"))
         if OWNER_ID not in active_uploads:
-            await call.message.answer("Upload session expired.")
+            await call.message.answer("Upload session expired.", parse_mode=None)
             return
         active_uploads[OWNER_ID]["_protect_choice"] = choice
-        await call.message.answer("Enter auto-delete timer in minutes (0-10080). 0 = no auto-delete. Reply with a number (e.g., 60).")
+        await call.message.answer("Enter auto-delete timer in minutes (0-10080). 0 = no auto-delete. Reply with a number (e.g., 60).", parse_mode=None)
     except Exception:
         logger.exception("Error in choose_protect callback")
 
@@ -728,7 +765,6 @@ async def _receive_minutes(m: types.Message):
         deep_token = random_token(10)
         session_temp_id = sql_insert_session(OWNER_ID, protect, mins, "Untitled", header_chat_id, header_msg_id, deep_token)
         me = await bot.get_me()
-        # create deeplink with token instead of numeric id for privacy
         deep_link = deep_token
         try:
             await bot.edit_message_text(f"Session {session_temp_id}\nhttps://t.me/{me.username}?start={deep_link}", UPLOAD_CHANNEL_ID, header_msg_id)
@@ -764,7 +800,7 @@ async def _receive_minutes(m: types.Message):
         cur = db.cursor()
         cur.execute("UPDATE sessions SET deep_link=?, header_msg_id=?, header_chat_id=? WHERE id=?", (deep_link, header_msg_id, header_chat_id, session_temp_id))
         db.commit()
-        # backup DB now that we've added a session
+        # backup after upload finalized
         await backup_db_to_channel()
         cancel_upload_session(OWNER_ID)
         await m.reply(f"Session finalized: https://t.me/{me.username}?start={deep_link}", parse_mode=None)
@@ -781,13 +817,16 @@ async def _receive_minutes(m: types.Message):
 
 @dp.message_handler(content_types=types.ContentTypes.ANY)
 async def catch_all_store_uploads(message: types.Message):
+    """
+    - If owner: store messages into upload session (in-memory).
+    - If not owner: update user's last_seen timestamp.
+    """
     try:
-        # if not owner update user's last seen
         if message.from_user.id != OWNER_ID:
             sql_update_user_lastseen(message.from_user.id, message.from_user.username or "", message.from_user.first_name or "", message.from_user.last_name or "")
             return
-        # owner is storing messages for upload
         if OWNER_ID in active_uploads:
+            # ignore commands
             if message.text and message.text.strip().startswith("/"):
                 return
             if message.text and active_uploads[OWNER_ID].get("exclude_text"):
@@ -802,26 +841,26 @@ async def catch_all_store_uploads(message: types.Message):
         logger.exception("Error in catch_all_store_uploads")
 
 # -------------------------
-# Reply-based settings handlers
+# Reply-based settings handlers (owner only)
 # -------------------------
-# /setmessage (owner must reply to a text message and issue the command)
+# /setmessage - reply to a text message and then choose Start or Help
 @dp.message_handler(commands=["setmessage"])
 async def cmd_setmessage(message: types.Message):
     if not is_owner(message.from_user.id):
         await safe_send(message.chat.id, "Unauthorized.", parse_mode=None)
         return
     if not message.reply_to_message:
-        await safe_send(message.chat.id, "Reply to a text message with /setmessage to use this command. Example: reply to a message containing the start text, then send /setmessage", parse_mode=None)
+        await safe_send(message.chat.id, "Reply to a text message with /setmessage to set Start or Help text.", parse_mode=None)
         return
     rt = message.reply_to_message
     if not rt.text:
-        await safe_send(message.chat.id, "Reply must contain a text message to set.", parse_mode=None)
+        await safe_send(message.chat.id, "Replied message must contain text.", parse_mode=None)
         return
-    # store temporarily
-    temp_setters[message.from_user.id] = {"type": "text", "value": rt.text}
+    token = secrets.token_urlsafe(6)
+    temp_map[token] = {"owner": message.from_user.id, "type": "text", "value": rt.text}
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("Set as Start", callback_data=cb_setmessage_confirm.new(which="start", tempid=str(message.from_user.id))),
-           InlineKeyboardButton("Set as Help", callback_data=cb_setmessage_confirm.new(which="help", tempid=str(message.from_user.id))))
+    kb.add(InlineKeyboardButton("Set as Start", callback_data=cb_setmessage_confirm.new(which="start", tempid=token)),
+           InlineKeyboardButton("Set as Help", callback_data=cb_setmessage_confirm.new(which="help", tempid=token)))
     await safe_send(message.chat.id, "Choose where to set the replied text:", parse_mode=None, reply_markup=kb)
 
 @dp.callback_query_handler(cb_setmessage_confirm.filter())
@@ -829,50 +868,55 @@ async def _on_setmessage_confirm(call: types.CallbackQuery, callback_data: dict)
     await call.answer()
     try:
         which = callback_data.get("which")
-        tempid = int(callback_data.get("tempid"))
-        if tempid not in temp_setters:
-            await call.message.answer("No pending message found.")
+        tempid = callback_data.get("tempid")
+        entry = temp_map.pop(tempid, None)
+        if not entry:
+            await safe_send(call.from_user.id, "No pending text to set.", parse_mode=None)
             return
-        data = temp_setters.pop(tempid, None)
-        if not data:
-            await call.message.answer("No pending message found.")
+        if entry.get("owner") != call.from_user.id:
+            await safe_send(call.from_user.id, "Unauthorized (owner mismatch).", parse_mode=None)
             return
-        txt = data.get("value", "")
+        txt = entry.get("value", "")
         if which == "start":
             db_set("start_text", txt)
-            await call.message.answer("Start message updated.", parse_mode=None)
+            await safe_send(call.from_user.id, "Start message updated.", parse_mode=None)
         else:
             db_set("help_text", txt)
-            await call.message.answer("Help message updated.", parse_mode=None)
+            await safe_send(call.from_user.id, "Help message updated.", parse_mode=None)
+        # backup after owner change
+        await backup_db_to_channel()
     except Exception:
         logger.exception("Error in setmessage confirm")
-        await call.message.answer("Failed to set message.", parse_mode=None)
+        try:
+            await safe_send(call.from_user.id, "Failed to set message.", parse_mode=None)
+        except Exception:
+            pass
 
-# /setimage (owner must reply to a photo/document/sticker and issue /setimage)
+# /setimage - reply to media and choose where to set (start/help)
 @dp.message_handler(commands=["setimage"])
 async def cmd_setimage(message: types.Message):
     if not is_owner(message.from_user.id):
         await safe_send(message.chat.id, "Unauthorized.", parse_mode=None)
         return
     if not message.reply_to_message:
-        await safe_send(message.chat.id, "Reply to a photo/document/sticker with /setimage to use this command.", parse_mode=None)
+        await safe_send(message.chat.id, "Reply to a photo/document/sticker with /setimage.", parse_mode=None)
         return
     rt = message.reply_to_message
     file_id = None
     if rt.photo:
         file_id = rt.photo[-1].file_id
     elif rt.document:
-        # accept image document (like png)
         file_id = rt.document.file_id
     elif rt.sticker:
         file_id = rt.sticker.file_id
     else:
-        await safe_send(message.chat.id, "Reply must contain an image/photo/document/sticker.", parse_mode=None)
+        await safe_send(message.chat.id, "Replied message must contain an image/photo/document/sticker.", parse_mode=None)
         return
-    # ask where to set it
+    token = secrets.token_urlsafe(6)
+    temp_map[token] = {"owner": message.from_user.id, "type": "image", "file_id": file_id}
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("Set as Start Image", callback_data=cb_setimage_confirm.new(which="start", fileid=file_id)),
-           InlineKeyboardButton("Set as Help Image", callback_data=cb_setimage_confirm.new(which="help", fileid=file_id)))
+    kb.add(InlineKeyboardButton("Set as Start Image", callback_data=cb_setimage_confirm.new(which="start", tempid=token)),
+           InlineKeyboardButton("Set as Help Image", callback_data=cb_setimage_confirm.new(which="help", tempid=token)))
     await safe_send(message.chat.id, "Choose where to set the replied image:", parse_mode=None, reply_markup=kb)
 
 @dp.callback_query_handler(cb_setimage_confirm.filter())
@@ -880,99 +924,201 @@ async def _on_setimage_confirm(call: types.CallbackQuery, callback_data: dict):
     await call.answer()
     try:
         which = callback_data.get("which")
-        fileid = callback_data.get("fileid")
-        if not fileid:
-            await call.message.answer("No file id found.")
+        tempid = callback_data.get("tempid")
+        entry = temp_map.pop(tempid, None)
+        if not entry:
+            await safe_send(call.from_user.id, "No pending image found.", parse_mode=None)
             return
+        if entry.get("owner") != call.from_user.id:
+            await safe_send(call.from_user.id, "Unauthorized (owner mismatch).", parse_mode=None)
+            return
+        fileid = entry.get("file_id")
         if which == "start":
             db_set("start_image", fileid)
-            await call.message.answer("Start image updated.", parse_mode=None)
+            await safe_send(call.from_user.id, "Start image updated.", parse_mode=None)
         else:
             db_set("help_image", fileid)
-            await call.message.answer("Help image updated.", parse_mode=None)
+            await safe_send(call.from_user.id, "Help image updated.", parse_mode=None)
+        # backup after owner change
+        await backup_db_to_channel()
     except Exception:
         logger.exception("Error in setimage confirm")
-        await call.message.answer("Failed to set image.", parse_mode=None)
+        try:
+            await safe_send(call.from_user.id, "Failed to set image.", parse_mode=None)
+        except Exception:
+            pass
 
-# /setchannel (owner replies to a message that contains a channel link or username OR replies anywhere and provides the link text)
+# /setchannel - reply to a message containing a channel link or provide alias+link
 @dp.message_handler(commands=["setchannel"])
 async def cmd_setchannel(message: types.Message):
     if not is_owner(message.from_user.id):
         await safe_send(message.chat.id, "Unauthorized.", parse_mode=None)
         return
     args = message.get_args().strip()
-    # If reply exists and contains a link, we prefer that
     link_source = None
     if message.reply_to_message and message.reply_to_message.text:
         link_source = message.reply_to_message.text.strip()
     if not args and not link_source:
-        await safe_send(message.chat.id, "Usage: Reply to a message containing a channel link (https://t.me/...) and send /setchannel <Alias>. Example: reply to a channel link and send: /setchannel Join", parse_mode=None)
-        return
-    # parse alias
-    if not args:
-        await safe_send(message.chat.id, "Please provide alias after /setchannel. Example: /setchannel Join", parse_mode=None)
+        await safe_send(message.chat.id, "Usage: Reply to a message containing a channel link and run `/setchannel <Alias>` OR send `/setchannel <Alias> <link>`.", parse_mode=None)
         return
     parts = args.split(" ", 1)
-    alias = parts[0].strip()
-    # the link to set: if reply contains link use that, else use the rest of args
-    link = None
+    alias = parts[0].strip() if parts else ""
+    if not alias:
+        await safe_send(message.chat.id, "Provide alias after /setchannel. Example: /setchannel Join", parse_mode=None)
+        return
     if link_source:
         link = link_source
     else:
         if len(parts) >= 2:
             link = parts[1].strip()
         else:
-            await safe_send(message.chat.id, "Provide a link in the reply or after the alias. Example: reply to channel link and /setchannel Join", parse_mode=None)
+            await safe_send(message.chat.id, "Provide link in the reply or after alias. Example: reply to channel link and /setchannel Join", parse_mode=None)
             return
-    # resolve or clean link
+    # resolve to get nicer t.me link if possible
     resolved = await resolve_channel_link(link)
-    # We'll store the original link text (useful for button URL), but prefer https://t.me/username if resolved
-    button_link = link
     if resolved:
-        # try to fetch chat username to produce t.me link
         try:
             ch = await bot.get_chat(resolved)
             if getattr(ch, "username", None):
                 button_link = f"https://t.me/{ch.username}"
             else:
-                button_link = link  # keep original numeric id or link
+                # if no username, keep provided link
+                button_link = link
         except Exception:
             button_link = link
-    # confirm with inline button
+    else:
+        button_link = link
+    token = secrets.token_urlsafe(6)
+    temp_map[token] = {"owner": message.from_user.id, "type": "optional_channel", "alias": alias, "link": button_link}
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(f"Confirm add '{alias}'", callback_data=cb_setchannel_confirm.new(alias=alias, link=button_link)))
-    await safe_send(message.chat.id, f"Adding channel alias '{alias}' with link:\n{button_link}\nPress confirm to save.", parse_mode=None, reply_markup=kb)
+    kb.add(InlineKeyboardButton(f"Confirm add '{alias}'", callback_data=cb_setchannel_confirm.new(tempid=token)))
+    await safe_send(message.chat.id, f"Adding optional channel alias '{alias}' with link:\n{button_link}\nPress confirm to save.", parse_mode=None, reply_markup=kb)
 
 @dp.callback_query_handler(cb_setchannel_confirm.filter())
 async def _on_setchannel_confirm(call: types.CallbackQuery, callback_data: dict):
     await call.answer()
     try:
-        alias = callback_data.get("alias")
-        link = callback_data.get("link")
-        if not alias or not link:
-            await call.message.answer("Invalid data.")
+        tempid = callback_data.get("tempid")
+        entry = temp_map.pop(tempid, None)
+        if not entry:
+            await safe_send(call.from_user.id, "No pending channel to add.", parse_mode=None)
             return
+        if entry.get("owner") != call.from_user.id:
+            await safe_send(call.from_user.id, "Unauthorized (owner mismatch).", parse_mode=None)
+            return
+        alias = entry.get("alias")
+        link = entry.get("link")
         try:
             arr = json.loads(db_get("optional_channels", "[]") or "[]")
         except Exception:
             arr = []
         updated = False
-        for entry in arr:
-            if entry.get("name") == alias or entry.get("link") == link:
-                entry["name"] = alias
-                entry["link"] = link
+        for ent in arr:
+            if ent.get("name") == alias or ent.get("link") == link:
+                ent["name"] = alias
+                ent["link"] = link
                 updated = True
                 break
         if not updated:
             if len(arr) >= 4:
-                await call.message.answer("Max 4 optional channels allowed.", parse_mode=None)
+                await safe_send(call.from_user.id, "Max 4 optional channels allowed.", parse_mode=None)
                 return
             arr.append({"name": alias, "link": link})
         db_set("optional_channels", json.dumps(arr))
-        await call.message.answer("Optional channel added/updated.", parse_mode=None)
+        await safe_send(call.from_user.id, "Optional channel added/updated.", parse_mode=None)
+        # backup after owner change
+        await backup_db_to_channel()
     except Exception:
         logger.exception("Error in setchannel confirm")
-        await call.message.answer("Failed to set channel.", parse_mode=None)
+        try:
+            await safe_send(call.from_user.id, "Failed to set channel.", parse_mode=None)
+        except Exception:
+            pass
+
+# /setforcechannel - similar to setchannel but stored under force_channels and limited to 3
+@dp.message_handler(commands=["setforcechannel"])
+async def cmd_setforcechannel(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await safe_send(message.chat.id, "Unauthorized.", parse_mode=None)
+        return
+    args = message.get_args().strip()
+    link_source = None
+    if message.reply_to_message and message.reply_to_message.text:
+        link_source = message.reply_to_message.text.strip()
+    if not args and not link_source:
+        await safe_send(message.chat.id, "Usage: Reply to a message containing a channel link and run `/setforcechannel <Alias>` OR send `/setforcechannel <Alias> <link>`.", parse_mode=None)
+        return
+    parts = args.split(" ", 1)
+    alias = parts[0].strip() if parts else ""
+    if not alias:
+        await safe_send(message.chat.id, "Provide alias after /setforcechannel. Example: /setforcechannel JoinNow", parse_mode=None)
+        return
+    if link_source:
+        link = link_source
+    else:
+        if len(parts) >= 2:
+            link = parts[1].strip()
+        else:
+            await safe_send(message.chat.id, "Provide link in the reply or after alias. Example: reply to channel link and /setforcechannel JoinNow", parse_mode=None)
+            return
+    resolved = await resolve_channel_link(link)
+    if resolved:
+        try:
+            ch = await bot.get_chat(resolved)
+            if getattr(ch, "username", None):
+                button_link = f"https://t.me/{ch.username}"
+            else:
+                button_link = link
+        except Exception:
+            button_link = link
+    else:
+        button_link = link
+    token = secrets.token_urlsafe(6)
+    temp_map[token] = {"owner": message.from_user.id, "type": "force_channel", "alias": alias, "link": button_link}
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(f"Confirm add forced '{alias}'", callback_data=cb_setforcechannel_confirm.new(tempid=token)))
+    await safe_send(message.chat.id, f"Adding forced channel alias '{alias}' with link:\n{button_link}\nPress confirm to save.", parse_mode=None, reply_markup=kb)
+
+@dp.callback_query_handler(cb_setforcechannel_confirm.filter())
+async def _on_setforcechannel_confirm(call: types.CallbackQuery, callback_data: dict):
+    await call.answer()
+    try:
+        tempid = callback_data.get("tempid")
+        entry = temp_map.pop(tempid, None)
+        if not entry:
+            await safe_send(call.from_user.id, "No pending forced channel to add.", parse_mode=None)
+            return
+        if entry.get("owner") != call.from_user.id:
+            await safe_send(call.from_user.id, "Unauthorized (owner mismatch).", parse_mode=None)
+            return
+        alias = entry.get("alias")
+        link = entry.get("link")
+        try:
+            arr = json.loads(db_get("force_channels", "[]") or "[]")
+        except Exception:
+            arr = []
+        updated = False
+        for ent in arr:
+            if ent.get("name") == alias or ent.get("link") == link:
+                ent["name"] = alias
+                ent["link"] = link
+                updated = True
+                break
+        if not updated:
+            if len(arr) >= 3:
+                await safe_send(call.from_user.id, "Max 3 forced channels allowed.", parse_mode=None)
+                return
+            arr.append({"name": alias, "link": link})
+        db_set("force_channels", json.dumps(arr))
+        await safe_send(call.from_user.id, "Forced channel added/updated.", parse_mode=None)
+        # backup after owner change
+        await backup_db_to_channel()
+    except Exception:
+        logger.exception("Error in setforcechannel confirm")
+        try:
+            await safe_send(call.from_user.id, "Failed to set forced channel.", parse_mode=None)
+        except Exception:
+            pass
 
 # -------------------------
 # Help handlers
@@ -1015,22 +1161,21 @@ async def cmd_adminp(message: types.Message):
         await safe_send(message.chat.id, "Unauthorized.", parse_mode=None)
         return
     txt = (
-        "Owner panel:\n"
+        "Owner panel (plain text):\n"
         "/upload - start upload session\n"
         "/d - finalize upload (choose protect + minutes)\n"
         "/e - cancel upload\n"
-        "/setmessage - reply to a text with this command to set start/help message\n"
-        "/setimage - reply to an image with this command to set start/help image\n"
-        "/setchannel - reply to a message with channel link and use this command with alias to add optional channel\n"
-        "/setforcechannel - add forced join channels (reply or provide alias + link)\n"
+        "/setmessage - reply to a text to set start/help message\n"
+        "/setimage - reply to an image to set start/help image\n"
+        "/setchannel - reply to a channel link and run /setchannel <Alias> (optional channels)\n"
+        "/setforcechannel - reply to a channel link and run /setforcechannel <Alias> (forced join channels)\n"
         "/stats - show stats\n"
         "/list_sessions - list sessions\n"
         "/revoke <id> - revoke a session\n"
-        "/broadcast - reply to message to broadcast\n"
+        "/broadcast - reply to a message to broadcast to users (copy type)\n"
         "/backup_db - backup DB to DB channel\n"
         "/restore_db - restore DB from pinned\n"
     )
-    # send plain text to avoid parse issues
     await safe_send(message.chat.id, txt, parse_mode=None)
 
 @dp.message_handler(commands=["stats"])
@@ -1080,6 +1225,8 @@ async def cmd_revoke(message: types.Message):
         return
     sql_set_session_revoked(sid, 1)
     await safe_send(message.chat.id, f"Session {sid} revoked.", parse_mode=None)
+    # optionally backup after revocation
+    await backup_db_to_channel()
 
 @dp.message_handler(commands=["broadcast"])
 async def cmd_broadcast(message: types.Message):
@@ -1160,6 +1307,8 @@ async def cmd_del_session(message: types.Message):
     cur.execute("DELETE FROM sessions WHERE id=?", (sid,))
     db.commit()
     await safe_send(message.chat.id, "Session deleted.", parse_mode=None)
+    # backup after deletion
+    await backup_db_to_channel()
 
 # -------------------------
 # Callback retry handler
@@ -1175,9 +1324,7 @@ async def cb_retry_handler(call: types.CallbackQuery, callback_data: dict):
 # -------------------------
 @dp.errors_handler()
 async def global_error_handler(update, exception):
-    # log full trace
     logger.exception("Update handling failed: %s", exception)
-    # swallow to avoid crash loop
     return True
 
 # -------------------------
@@ -1244,9 +1391,7 @@ async def on_shutdown(dispatcher):
 # Run (polling mode - Render friendly)
 # -------------------------
 if __name__ == "__main__":
-    # start polling with startup/shutdown hooks
     try:
-        # Ensure health server and dispatcher startup
         executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Stopped by user")
