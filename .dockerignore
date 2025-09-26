@@ -2,8 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.sqlite3
-/data
+*.db
 .env
-.vscode
-.idea
+*.log
+*.sqlite3
+.git
+.gitignore
+.DS_Store
