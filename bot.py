@@ -30,6 +30,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))
 
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", None)
+
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "true").lower() in ("1", "true", "yes")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE") or os.getenv("RENDER_EXTERNAL_URL")  # e.g. https://hidden-d-l.onrender.com
