@@ -1,28 +1,25 @@
-# Use a lightweight Python base
+# Use official slim Python image
 FROM python:3.11-slim
-
-# Disable .pyc and enable unbuffered logs
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
 
-# Install system deps needed for psycopg2
-RUN apt-get update && apt-get install -y \
-    build-essential \
+# Install system dependencies needed for asyncpg & building wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     libpq-dev \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy and install Python dependencies first (cache layer)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy project files
-COPY . .
+# Copy the rest of the app
+COPY . /app
 
-# Expose port (for webhook via aiohttp)
-EXPOSE 10000
+# Expose port (Render will provide PORT env)
+EXPOSE 8080
 
-# Run the bot
+# Default command to run your bot
 CMD ["python", "bot.py"]
