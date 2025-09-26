@@ -4,14 +4,16 @@ services:
     env: docker
     plan: free
     autoDeploy: true
+    region: oregon
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: OWNER_ID
         sync: false
-      - key: DATABASE_URL
-        value: postgresql://neondb_owner:npg_9QTvO4MhbWgB@ep-red-heart-af32eovr-pooler.c-2.us-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
-      - key: WEBHOOK_URL
+      - key: UPLOAD_CHANNEL_ID
         sync: false
     healthCheckPath: /health
-    region: oregon
+    ports:
+      - 10000
