@@ -1034,23 +1034,26 @@ def create_aiohttp_app() -> web.Application:
 # Entrypoint (Webhook Only)
 # -------------------------
 
-from aiohttp import web
-import asyncio
+# -------------------------
+# Entrypoint (Webhook Only, Fixed)
+# -------------------------
 
-async def on_startup(dp):
-    # Set webhook to Render external URL
+from aiohttp import web
+
+async def on_startup_app(app: web.Application):
+    # set webhook
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}"
     await bot.set_webhook(webhook_url)
     logger.info(f"Webhook set: {webhook_url}")
 
-    # Initialize DB if needed
+    # initialize DB
     try:
         await init_db()
         logger.info("Database initialized.")
     except Exception as e:
         logger.error(f"Database init failed: {e}")
 
-async def on_shutdown(dp):
+async def on_shutdown_app(app: web.Application):
     logger.info("Shutting down..")
     try:
         await bot.delete_webhook()
@@ -1061,27 +1064,24 @@ async def on_shutdown(dp):
     await dp.storage.wait_closed()
     logger.info("Bot shutdown complete.")
 
-# Health endpoint for UptimeRobot
+# health endpoint
 async def healthcheck(request):
     return web.Response(text="ok")
 
 def main():
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
-
-    # aiogram webhook handler
+    # create webhook app
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path=f"/webhook/{BOT_TOKEN}")
-    
-    # Add health routes again (get_new_configured_app replaces app)
+
+    # add health endpoints
     app.router.add_get("/", healthcheck)
     app.router.add_get("/health", healthcheck)
 
-    # Register startup/shutdown
-    dp.loop.create_task(on_startup(dp))
-    dp.loop.create_task(on_shutdown(dp))
+    # register startup/shutdown
+    app.on_startup.append(on_startup_app)
+    app.on_shutdown.append(on_shutdown_app)
 
+    # run aiohttp server
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 if __name__ == "__main__":
