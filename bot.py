@@ -10,16 +10,13 @@ Features:
  - Auto-delete scheduling
  - Protect content option
  - Health endpoint for UptimeRobot
- - Webhook startup optimized for Render (sets webhook to RENDER_EXTERNAL_URL + WEBHOOK_PATH)
- - Long, documented file ~800+ lines to match user's request
+ - Webhook startup optimized for Render (sets webhook to RENDER_EXTERNAL_URL + /webhook/<BOT_TOKEN>)
 """
 
 import os
 import logging
 import asyncio
-import json
 import secrets
-import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Any
 
@@ -28,10 +25,10 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
-from aiogram.utils.executor import start_webhook
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher.webhook import get_new_configured_app
 
 # ---------------------------
 # Basic configuration & envs
@@ -66,7 +63,7 @@ if not UPLOAD_CHANNEL_ID:
 
 # support both numeric channel ID and username
 try:
-    if UPLOAD_CHANNEL_ID.isdigit() or (UPLOAD_CHANNEL_ID.startswith("-") and UPLOAD_CHANNEL_ID[1:].isdigit()):
+    if UPLOAD_CHANNEL_ID.lstrip("-").isdigit():
         UPLOAD_CHANNEL_ID_INT = int(UPLOAD_CHANNEL_ID)
     else:
         UPLOAD_CHANNEL_ID_INT = UPLOAD_CHANNEL_ID  # e.g. @my_private_channel
@@ -75,18 +72,16 @@ except Exception:
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # e.g. https://my-app.onrender.com
 if not RENDER_EXTERNAL_URL:
-    # It is allowed to set later, but we prefer it set now.
-    logger.warning("RENDER_EXTERNAL_URL not set. Webhook won't be configured automatically.")
+    logger.warning("RENDER_EXTERNAL_URL not set. Webhook won't be configured automatically. You can set it in Render or env.")
 
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_HOST = RENDER_EXTERNAL_URL.rstrip("/") if RENDER_EXTERNAL_URL else None
-WEBHOOK_URL = (WEBHOOK_HOST + WEBHOOK_PATH) if WEBHOOK_HOST else None
+WEBHOOK_URL = (RENDER_EXTERNAL_URL.rstrip("/") + WEBHOOK_PATH + f"/{BOT_TOKEN}") if RENDER_EXTERNAL_URL else None
 
 SKIP_UPDATES = os.getenv("SKIP_UPDATES", "1") == "1"
 
 # Constants
-DEEP_LINK_TTL_SECONDS = 60 * 60 * 24 * 30  # optional TTL for sessions (30 days) — you can remove or modify
+DEEP_LINK_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 
 # ---------------------------
 # Bot & Dispatcher
@@ -110,11 +105,9 @@ class BroadcastStates(StatesGroup):
     WAITING_FOR_BROADCAST = State()
 
 class SetMessageStates(StatesGroup):
-    WAITING_FOR_MESSAGE_TYPE = State()
     WAITING_FOR_MESSAGE_TEXT = State()
 
 class SetImageStates(StatesGroup):
-    WAITING_FOR_IMAGE_TYPE = State()
     WAITING_FOR_IMAGE_FILE = State()
 
 # ---------------------------
@@ -123,7 +116,7 @@ class SetImageStates(StatesGroup):
 
 class Database:
     """
-    Simple wrapper around asyncpg connection pool with helper queries.
+    Wrapper around asyncpg connection pool with helper queries and schema init.
     """
 
     def __init__(self, dsn: str):
@@ -132,24 +125,20 @@ class Database:
 
     async def connect(self):
         logger.info("Connecting to database...")
+        # create pool
         self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=10)
         logger.info("Connected to database")
-        # Initialize schema if necessary
+        # initialize schema
         await self._init_schema()
 
     async def close(self):
         if self.pool:
             await self.pool.close()
+            logger.info("Database pool closed")
 
     async def _init_schema(self):
         """
         Create required tables if they do not exist.
-        Minimal schema covering:
-         - users
-         - messages (start/help text and file_ids)
-         - sessions
-         - session_files
-         - stats (optional aggregated)
         """
         assert self.pool is not None
         async with self.pool.acquire() as conn:
@@ -165,9 +154,9 @@ class Database:
                 # messages table
                 await conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
-                    name TEXT PRIMARY KEY,  -- 'start_text', 'help_text', 'start_image', 'help_image'
+                    name TEXT PRIMARY KEY,
                     text TEXT,
-                    file_id TEXT,           -- for images
+                    file_id TEXT,
                     updated_at TIMESTAMP WITH TIME ZONE NOT NULL
                 );
                 """)
@@ -183,26 +172,26 @@ class Database:
                     expires_at TIMESTAMP WITH TIME ZONE
                 );
                 """)
-                # session_files table
+                # session_files
                 await conn.execute("""
                 CREATE TABLE IF NOT EXISTS session_files (
                     id SERIAL PRIMARY KEY,
                     session_id TEXT REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    file_type TEXT NOT NULL,     -- 'photo', 'document', 'video', etc.
+                    file_type TEXT NOT NULL,
                     file_id TEXT NOT NULL,
                     orig_file_name TEXT,
                     caption TEXT,
                     position INT DEFAULT 0
                 );
                 """)
-                # stats table
+                # stats
                 await conn.execute("""
                 CREATE TABLE IF NOT EXISTS stats (
                     key TEXT PRIMARY KEY,
                     value BIGINT DEFAULT 0
                 );
                 """)
-                # initialize some stats keys if not exist
+                # initialize stats keys if missing
                 await conn.execute("""
                 INSERT INTO stats(key, value)
                 VALUES
@@ -210,7 +199,7 @@ class Database:
                   ('total_files', 0)
                 ON CONFLICT (key) DO NOTHING;
                 """)
-                # create an index for session_files for faster fetching
+                # index
                 await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_session_files_session ON session_files(session_id);
                 """)
@@ -325,6 +314,9 @@ class Database:
 # Global DB instance
 db = Database(DATABASE_URL)
 
+async def init_db():
+    await db.connect()
+
 # ---------------------------
 # Utility helper functions
 # ---------------------------
@@ -343,18 +335,17 @@ def build_start_deep_link(session_token: str) -> str:
     Create a t.me deep link for the bot
     Example: https://t.me/MyBot?start=AbCdEf
     """
-    # Use bot username to build link, but it's simpler to return t.me/ + bot_username
-    # We'll try to use bot.get_me if needed. For now use generic t.me link with token
     username = None
     try:
-        # this call is allowed asynchronously if bot initialized
         username = bot.get_current().username
     except Exception:
         pass
     if username:
         return f"https://t.me/{username}?start={session_token}"
     else:
-        return f"https://t.me/{BOT_TOKEN.split(':')[0]}?start={session_token}"  # fallback; not ideal
+        # best effort fallback (bot id prefix); not guaranteed pretty but works
+        bot_id_prefix = BOT_TOKEN.split(":")[0]
+        return f"https://t.me/{bot_id_prefix}?start={session_token}"
 
 def pretty_minutes(minutes: int) -> str:
     if minutes <= 0:
@@ -378,54 +369,6 @@ async def safe_send(chat_id: int, **kwargs) -> Optional[types.Message]:
     except Exception as e:
         logger.exception("Failed to send message to %s: %s", chat_id, e)
         return None
-
-# ---------------------------
-# Startup / Shutdown handlers
-# ---------------------------
-
-async def on_startup(dp: Dispatcher):
-    """
-    Called by executor.start_webhook at startup.
-    Connect to DB and set webhook
-    """
-    logger.info("on_startup called")
-    # Connect to DB pool
-    await db.connect()
-
-    # Clear webhook if already set? We'll set to the RENDER_EXTERNAL_URL if provided.
-    if WEBHOOK_URL:
-        try:
-            await bot.set_webhook(WEBHOOK_URL)
-            logger.info("Webhook set to: %s", WEBHOOK_URL)
-        except Exception as e:
-            logger.exception("Failed to set webhook: %s", e)
-    else:
-        logger.warning("WEBHOOK_URL not available; webhook won't be registered. Set RENDER_EXTERNAL_URL to enable automatic webhook registration.")
-
-async def on_shutdown(dp: Dispatcher):
-    logger.info("on_shutdown called")
-    try:
-        # Remove webhook on shutdown
-        if WEBHOOK_URL:
-            try:
-                await bot.delete_webhook()
-                logger.info("Webhook deleted")
-            except Exception as e:
-                logger.exception("Failed to delete webhook on shutdown: %s", e)
-    finally:
-        await db.close()
-        await bot.close()
-        logger.info("Bot closed and DB pool closed")
-
-# ---------------------------
-# Health endpoint (aiohttp)
-# ---------------------------
-
-async def health(request: web.Request):
-    """
-    Return ok for health checks (UptimeRobot)
-    """
-    return web.Response(text="ok")
 
 # ---------------------------
 # Message / Command Handlers
@@ -509,14 +452,13 @@ async def handle_deep_link_start(message: types.Message, session_token: str):
             # Use different send_* based on f_type
             send_kwargs = {"chat_id": user_id, "caption": caption, "protect_content": protect and not is_owner_user}
             if f_type == "photo":
-                # photo file_id may refer to a single photo; send_photo expects file_id
                 msg = await bot.send_photo(photo=file_id, **send_kwargs)
             elif f_type == "video":
                 msg = await bot.send_video(video=file_id, **send_kwargs)
             elif f_type == "audio":
                 msg = await bot.send_audio(audio=file_id, **send_kwargs)
             elif f_type == "voice":
-                # voice doesn't accept caption
+                # voice doesn't accept caption param in some versions
                 msg = await bot.send_voice(chat_id=user_id, voice=file_id, protect_content=protect and not is_owner_user)
             elif f_type == "document":
                 msg = await bot.send_document(document=file_id, **send_kwargs)
@@ -531,14 +473,12 @@ async def handle_deep_link_start(message: types.Message, session_token: str):
 
     # schedule deletions if needed (non-owner)
     if auto_delete_minutes and auto_delete_minutes > 0 and not is_owner_user:
-        # schedule deletion asynchronously
         asyncio.create_task(schedule_deletions(user_id, sent_messages, auto_delete_minutes))
 
 # schedule deletion helper
 async def schedule_deletions(chat_id: int, messages: List[types.Message], minutes: int):
     """
     Sleep and delete messages after X minutes. We capture message ids and try to delete them.
-    Only deletes messages in the user's chat (not DB or upload channel).
     """
     try:
         logger.info("Scheduling deletion of %d messages in chat %s after %d minutes", len(messages), chat_id, minutes)
@@ -547,7 +487,6 @@ async def schedule_deletions(chat_id: int, messages: List[types.Message], minute
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
             except Exception as e:
-                # message might have been deleted already or forbidden
                 logger.debug("Could not delete message %s in chat %s: %s", getattr(msg, "message_id", None), chat_id, e)
     except Exception as e:
         logger.exception("Error while scheduling deletions: %s", e)
@@ -570,7 +509,6 @@ async def cb_show_help(callback_query: types.CallbackQuery):
     else:
         await safe_send(user_id, text=(help_text or "Help"))
 
-    # answer callback to remove loading UI in client
     try:
         await callback_query.answer()
     except Exception:
@@ -600,7 +538,6 @@ async def cmd_setmessage(message: types.Message):
     if not is_owner(message.from_user.id):
         await safe_send(message.from_user.id, text="You are not authorized to use this command.")
         return
-    # Ask which message to set
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("Start message", callback_data="setmsg_start"),
@@ -643,18 +580,14 @@ async def cmd_setimage(message: types.Message):
     if not is_owner(message.from_user.id):
         await safe_send(message.from_user.id, text="You are not authorized to use this command.")
         return
-    # This command requires reply to an image (owner replies to image with /setimage)
-    # If the message is a reply to image, we can prompt which slot to set
     if not message.reply_to_message:
         await message.reply("Reply to an image (or any media) with /setimage to set it as start or help image.")
         return
-    # Extract file_id of media in reply_to_message
     target_msg = message.reply_to_message
     file_id, ftype = extract_file_id_from_msg(target_msg)
     if not file_id:
         await message.reply("Couldn't extract file from the replied message. Make sure you replied to a photo/document/video.")
         return
-    # Ask whether to set for start or help
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("Set as Start Image", callback_data=f"setimg_start::{file_id}"),
@@ -667,7 +600,7 @@ async def cb_setimg(callback_query: types.CallbackQuery):
     if not is_owner(callback_query.from_user.id):
         await callback_query.answer("Not authorized", show_alert=True)
         return
-    payload = callback_query.data  # e.g. setimg_start::<file_id>
+    payload = callback_query.data
     try:
         kind, file_id = payload.split("::", 1)
         kind = kind.split("_", 1)[1]  # 'start' or 'help'
@@ -685,7 +618,6 @@ def extract_file_id_from_msg(msg: types.Message) -> Tuple[Optional[str], Optiona
     Handles: photo, document, video, audio, voice, animation
     """
     if msg.photo:
-        # message.photo is a list of PhotoSize; pick last (largest)
         return msg.photo[-1].file_id, "photo"
     if msg.document:
         return msg.document.file_id, "document"
@@ -715,46 +647,33 @@ async def cancel_broadcast(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=BroadcastStates.WAITING_FOR_BROADCAST, content_types=types.ContentTypes.ANY)
 async def handle_broadcast(message: types.Message, state: FSMContext):
-    """
-    Copy the message to all users as copy (so no forward tags).
-    Keep inline buttons if present.
-    This operation can be heavy depending on user count — we iterate users and copy/call send methods.
-    """
     if not is_owner(message.from_user.id):
         await message.reply("You are not authorized to broadcast.")
         await state.finish()
         return
 
-    # get list of users
     total_users = await db.count_total_users()
     await message.reply(f"Starting broadcast to {total_users} users. This may take a while...")
 
-    # gather inline keyboard if exists in original message
     reply_markup = None
     if message.reply_markup:
         reply_markup = message.reply_markup
 
     # fetch all users
-    # WARNING: for large userbase a SELECT * could be heavy; here we stream in DB but for simplicity we fetch all
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM users;")
         user_ids = [r["user_id"] for r in rows]
 
-    # prepare a function to forward/copy/send safely per user
     sent_count = 0
     failed_count = 0
     for uid in user_ids:
         try:
-            # we want copy semantics: use copy_message for media + text
-            # copy_message works with message_id from original chat - but we are executing from owner chat.
-            # Simpler approach: for text-only use send_message, for media extract file_id and send corresponding.
             if message.text and not (message.photo or message.document or message.video or message.audio or message.animation):
                 await bot.send_message(chat_id=uid, text=message.text, reply_markup=reply_markup)
             else:
-                # if media present, extract file_id and send using send_* preserving caption
                 file_id, ftype = extract_file_id_from_msg(message)
                 caption = None
-                if message.caption:
+                if hasattr(message, "caption") and message.caption:
                     caption = message.caption
                 if ftype == "photo":
                     await bot.send_photo(chat_id=uid, photo=file_id, caption=caption, reply_markup=reply_markup)
@@ -767,18 +686,15 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
                 elif ftype == "animation":
                     await bot.send_animation(chat_id=uid, animation=file_id, caption=caption, reply_markup=reply_markup)
                 else:
-                    # fallback: send text + maybe a link to the media
                     if message.text:
                         await bot.send_message(chat_id=uid, text=message.text, reply_markup=reply_markup)
                     else:
                         await bot.send_message(chat_id=uid, text="(Broadcast content)", reply_markup=reply_markup)
             sent_count += 1
-            # small sleep to avoid hitting limits for huge lists
             await asyncio.sleep(0.05)
         except Exception as e:
             failed_count += 1
             logger.debug("Broadcast failed for %s: %s", uid, e)
-            # continue broadcasting to others
 
     await message.reply(f"Broadcast finished. Sent: {sent_count}, Failed: {failed_count}")
     await state.finish()
@@ -790,7 +706,7 @@ async def cmd_stats(message: types.Message):
         await message.reply("Not authorized.")
         return
     total_users = await db.count_total_users()
-    since = datetime.utcnow() - timedelta(days=2)  # last 48 hours
+    since = datetime.utcnow() - timedelta(days=2)
     active_users = await db.count_active_users_since(since)
     total_upload_sessions = await db.get_stat("total_upload_sessions")
     total_files = await db.get_stat("total_files")
@@ -809,7 +725,7 @@ async def cmd_upload(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         await message.reply("Only owner can use /upload.")
         return
-    await state.update_data(upload_files=[])  # will be list of dicts
+    await state.update_data(upload_files=[])
     await message.reply("Upload mode started. Send files (photos, videos, documents). When finished send /d (done) or /c (cancel).")
     await UploadStates.WAITING_FOR_FILES.set()
 
@@ -828,7 +744,6 @@ async def finish_upload(message: types.Message, state: FSMContext):
         await message.reply("No files uploaded. Cancelled.")
         await state.finish()
         return
-    # ask Protect Content?
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("Yes (prevent forward/save)", callback_data="upload_protect_yes"),
@@ -843,7 +758,6 @@ async def capture_upload_files(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         await message.reply("Only owner can upload.")
         return
-    # Extract file_id and type
     file_id, ftype = extract_file_id_from_msg(message)
     caption = getattr(message, "caption", None) or None
     orig_name = None
@@ -852,15 +766,12 @@ async def capture_upload_files(message: types.Message, state: FSMContext):
     if not file_id:
         await message.reply("Unrecognized file type. Supported: photo, document, video, audio, animation, voice.")
         return
-    # Copy media to upload channel to ensure persistence (bot uploads media to upload channel)
-    # We'll use bot.copy_message to preserve file without downloading
+    # Copy to upload channel to ensure persistence
     try:
         copied = None
         try:
-            # copy_message requires from_chat_id and message_id: we copy the original message
             copied = await bot.copy_message(chat_id=UPLOAD_CHANNEL_ID_INT, from_chat_id=message.chat.id, message_id=message.message_id)
         except Exception as e:
-            # fallback: send the file using send_* passing file_id; copy_message might be restricted for some types
             logger.debug("copy_message failed: %s. Trying send methods.", e)
             if ftype == "photo":
                 copied = await bot.send_photo(chat_id=UPLOAD_CHANNEL_ID_INT, photo=file_id, caption=caption)
@@ -876,8 +787,6 @@ async def capture_upload_files(message: types.Message, state: FSMContext):
                 copied = await bot.send_voice(chat_id=UPLOAD_CHANNEL_ID_INT, voice=file_id)
             else:
                 copied = await bot.send_document(chat_id=UPLOAD_CHANNEL_ID_INT, document=file_id, caption=caption)
-        # Note: copied might be a Message; the file_id on Telegram remains the same usually
-        # Save to FSM data
         data = await state.get_data()
         upload_files = data.get("upload_files", [])
         position = len(upload_files)
@@ -921,7 +830,6 @@ async def handle_autodelete_input(message: types.Message, state: FSMContext):
         await message.reply("Allowed range 0 - 10080 minutes.")
         return
     await state.update_data(auto_delete_minutes=minutes)
-    # confirmation: ask for optional title
     await UploadStates.CONFIRMATION.set()
     await message.reply("Provide a title/name for this upload session (optional). Send plain text title, or send /skip to skip.")
 
@@ -943,21 +851,15 @@ async def finalize_upload_session(message: types.Message, state: FSMContext, tit
         await message.reply("No files found — canceling.")
         await state.finish()
         return
-    # create session in DB
     session_token = generate_session_token(9)
-    # optional expiration (we don't enforce expiry in db unless you want). You can compute expires_at = datetime.utcnow() + timedelta(seconds=DEEP_LINK_TTL_SECONDS)
     expires_at = datetime.utcnow() + timedelta(seconds=DEEP_LINK_TTL_SECONDS)
     await db.create_session(session_token, message.from_user.id, protect, auto_delete_minutes, title, expires_at)
-    # insert files
     pos = 0
     for f in files:
         await db.add_session_file(session_token, f["file_type"], f["file_id"], f.get("orig_name"), f.get("caption"), pos)
         pos += 1
-    # increment stats
     await db.increment_upload_sessions()
-    # send deep link
     deep_link = build_start_deep_link(session_token)
-    # show session summary
     summary = (
         f"Upload session created ✅\n\n"
         f"Session ID: <code>{session_token}</code>\n"
@@ -970,7 +872,7 @@ async def finalize_upload_session(message: types.Message, state: FSMContext, tit
     await message.reply(summary, parse_mode=ParseMode.HTML)
     await state.finish()
 
-# allow owner to list session files? (optional helper)
+# allow owner to list session files
 @dp.message_handler(commands=["listsession"])
 async def cmd_list_session(message: types.Message):
     if not is_owner(message.from_user.id):
@@ -990,99 +892,104 @@ async def cmd_list_session(message: types.Message):
     for f in files:
         await message.reply(f"{f['position']}: {f['file_type']} - file_id: {f['file_id']} caption: {f['caption']}")
 
-# Fallback handler for unrecognized commands (optional)
+# Fallback handler for cancel
 @dp.message_handler(commands=["cancel"])
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.finish()
     await message.reply("Operation cancelled (global).")
 
-# fallback for all other messages to update last_active and respond politely
+# fallback for all other messages to update last_active
 @dp.message_handler()
 async def fallback_all(message: types.Message):
-    # update user's last active
     await db.add_or_update_user(message.from_user.id)
-    # minimal auto-response for unknown commands or plain chat
-    # we keep it unobtrusive
     if message.text and message.text.startswith("/"):
-        # unknown command
         return
-    # optionally do nothing; to avoid spam, don't reply to ordinary messages
     return
+
+# ---------------------------
+# Startup / Shutdown handlers
+# ---------------------------
+
+async def on_startup_app(app: web.Application):
+    # Init DB first
+    try:
+        await init_db()
+        logger.info("Database initialized.")
+    except Exception as e:
+        logger.exception("Database init failed: %s", e)
+        # If DB cannot be initialized, abort startup (let Render restart)
+        raise
+
+    # Set webhook only after DB is ready
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(WEBHOOK_URL)
+            logger.info("Webhook set to: %s", WEBHOOK_URL)
+        except Exception as e:
+            logger.exception("Failed to set webhook: %s", e)
+            # proceed — webhook may be set manually
+    else:
+        # fallback: set webhook to /webhook/<BOT_TOKEN> path if RENDER_EXTERNAL_URL not provided
+        fallback_url = f"{RENDER_EXTERNAL_URL.rstrip('/') if RENDER_EXTERNAL_URL else ''}{WEBHOOK_PATH}/{BOT_TOKEN}"
+        try:
+            if fallback_url:
+                await bot.set_webhook(fallback_url)
+                logger.info("Webhook set to fallback: %s", fallback_url)
+        except Exception as e:
+            logger.debug("Failed to set fallback webhook: %s", e)
+
+async def on_shutdown_app(app: web.Application):
+    logger.info("Shutting down..")
+    try:
+        if WEBHOOK_URL:
+            await bot.delete_webhook()
+            logger.info("Webhook deleted.")
+    except Exception as e:
+        logger.exception("Failed to delete webhook on shutdown: %s", e)
+    try:
+        await db.close()
+    except Exception:
+        pass
+    try:
+        await dp.storage.close()
+        await dp.storage.wait_closed()
+    except Exception:
+        pass
+    try:
+        await bot.close()
+    except Exception:
+        pass
+    logger.info("Bot closed and DB pool closed")
+
+# ---------------------------
+# Health endpoint (aiohttp)
+# ---------------------------
+
+async def health(request: web.Request):
+    return web.Response(text="ok")
 
 # ---------------------------
 # Webhook entry and aiohttp app
 # ---------------------------
 
-# We will use aiogram's start_webhook for the dispatcher which starts its own web server.
-# Additionally we will supply a small aiohttp app to provide /health endpoint by running an aiohttp sub-app.
-# start_webhook can accept host and port, and will handle requests to /webhook automatically.
-
-# However, some deployment setups desire an additional /health route on the same server. start_webhook also supports aiohttp_webapp injection via the 'web_app' param in newer aiogram versions.
-# To keep compatibility, we'll create a simple aiohttp application and mount health route.
-
 def create_aiohttp_app() -> web.Application:
-    app = web.Application()
+    # Use aiogram helper to get a configured app that routes updates to aiogram
+    app = get_new_configured_app(dispatcher=dp, path=f"{WEBHOOK_PATH}/{BOT_TOKEN}")
+    # expose health endpoints
     app.router.add_get("/health", health)
     app.router.add_get("/", health)
+    # attach lifecycle handlers
+    app.on_startup.append(on_startup_app)
+    app.on_shutdown.append(on_shutdown_app)
     return app
 
 # ---------------------------
 # Entrypoint
 # ---------------------------
 
-# -------------------------
-# Entrypoint (Webhook Only)
-# -------------------------
-
-# -------------------------
-# Entrypoint (Webhook Only, Fixed)
-# -------------------------
-
-from aiohttp import web
-
-async def on_startup_app(app: web.Application):
-    # set webhook
-    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}"
-    await bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set: {webhook_url}")
-
-    # initialize DB
-    try:
-        await init_db()
-        logger.info("Database initialized.")
-    except Exception as e:
-        logger.error(f"Database init failed: {e}")
-
-async def on_shutdown_app(app: web.Application):
-    logger.info("Shutting down..")
-    try:
-        await bot.delete_webhook()
-        logger.info("Webhook deleted.")
-    except Exception as e:
-        logger.error(f"Failed to delete webhook: {e}")
-    await dp.storage.close()
-    await dp.storage.wait_closed()
-    logger.info("Bot shutdown complete.")
-
-# health endpoint
-async def healthcheck(request):
-    return web.Response(text="ok")
-
 def main():
-    # create webhook app
-    from aiogram.dispatcher.webhook import get_new_configured_app
-    app = get_new_configured_app(dispatcher=dp, path=f"/webhook/{BOT_TOKEN}")
-
-    # add health endpoints
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
-
-    # register startup/shutdown
-    app.on_startup.append(on_startup_app)
-    app.on_shutdown.append(on_shutdown_app)
-
-    # run aiohttp server
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    app = create_aiohttp_app()
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()
