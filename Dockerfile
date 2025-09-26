@@ -1,25 +1,22 @@
-# Use Python base image
+# Use an official Python image
 FROM python:3.11-slim
 
-# Set workdir
+# Prevents Python from writing .pyc files
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements first (better caching)
-COPY requirements.txt /app/
+# Install dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy rest of the code
-COPY . /app/
+# Copy project files
+COPY . .
 
-# Expose port for webhook
-EXPOSE 10000
+# Expose port (needed for aiohttp webhook)
+EXPOSE 8080
 
-# Entrypoint and command
-ENTRYPOINT ["python"]
-CMD ["bot.py"]
+# Start the bot
+CMD ["python", "bot.py"]
