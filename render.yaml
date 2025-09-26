@@ -1,26 +1,16 @@
 services:
   - type: web
-    name: vault-bot
+    name: telegram-bot
     env: docker
     plan: free
-    region: oregon
-    branch: main
     dockerfilePath: ./Dockerfile
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
-        sync: false       # set this in Render dashboard
-      - key: OWNER_ID
-        sync: false       # your Telegram user ID
-      - key: UPLOAD_CHANNEL_ID
-        sync: false       # Telegram channel for storing files
+        sync: false
       - key: DATABASE_URL
-        sync: false       # Neon PostgreSQL connection string
-      - key: BROADCAST_CONCURRENCY
-        value: "12"
-      - key: LOG_LEVEL
-        value: "INFO"
+        sync: false
+      - key: OWNER_ID
+        sync: false
       - key: RENDER_EXTERNAL_URL
-        fromService:
-          type: web
-          name: vault-bot
-          property: url
+        sync: true   # Render automatically provides this
