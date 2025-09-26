@@ -12,5 +12,7 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
+      - key: UPLOAD_CHANNEL_ID
+        sync: false
       - key: RENDER_EXTERNAL_URL
-        sync: true   # Render automatically provides this
+        sync: true   # Render provides this automatically at runtime
