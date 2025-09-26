@@ -1,21 +1,26 @@
-# Dockerfile for Render deploy (aiogram 2.x, webhook mode)
+# Use slim python image
 FROM python:3.11-slim
 
+# Set work directory
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Install system deps
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy bot source
-COPY bot.py /app/bot.py
+# Copy requirements
+COPY requirements.txt .
 
-# Create data dir for sqlite & backups
-RUN mkdir -p /data
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Environment defaults (can be overridden in Render)
-ENV DB_PATH=/data/database.sqlite3
-ENV JOB_DB_PATH=/data/jobs.sqlite
-ENV PORT=10000
+# Copy app files
+COPY . .
 
+# Expose port (for webhook / healthcheck)
+EXPOSE 8000
+
+# Start bot
 CMD ["python", "bot.py"]
