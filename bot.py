@@ -737,34 +737,24 @@ async def on_shutdown_webhook(dp):
 # -------------------------
 # Entrypoint for v2 on Render
 # -------------------------
-def run_app_v2():
-    # aiogram v2's start_webhook needs webhook_path and host/port
-    webhook_path = WEBHOOK_PATH
-    # host & port:
-    host = "0.0.0.0"
-    port = int(os.getenv("PORT", PORT))
+from aiohttp import web
 
-    # we also create a small aiohttp app for the health route (aiogram will mount its own web app)
-    from aiohttp import web as _web
+async def healthcheck(request):
+    return web.Response(text="ok")
 
-    async def _health(request):
-        return _web.Response(text="ok")
+async def on_startup(dp):
+    await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
 
-    _web_app = _web.Application()
-    _web_app.router.add_get("/", _health)
-    _web_app.router.add_get("/health", _health)
-
-    # start_webhook will create and run its own web server; we just call it.
-    # Provide the on_startup and on_shutdown hooks we defined.
-    log.info("Starting aiogram v2 webhook on %s:%s%s", host, port, webhook_path)
-    # Note: start_webhook has signature: start_webhook(dispatcher, webhook_path, skip_updates, host, port, on_startup, on_shutdown)
-    executor.start_webhook(dispatcher=dp,
-                           webhook_path=webhook_path,
-                           skip_updates=True,
-                           host=host,
-                           port=port,
-                           on_startup=on_startup_webhook,
-                           on_shutdown=on_shutdown_webhook)
+def main():
+    app = web.Application()
+    app.router.add_post("/webhook", dp.middleware(AppDispatcher))
+    app.router.add_get("/health", healthcheck)
+    return app
 
 if __name__ == "__main__":
-    run_app_v2()
+    from aiogram import executor
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+
+    web.run_app(main(), host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
