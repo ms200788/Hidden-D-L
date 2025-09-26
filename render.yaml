@@ -1,19 +1,18 @@
 services:
   - type: web
-    name: telegram-bot
+    name: bot.py
     env: docker
     plan: free
-    autoDeploy: true
     region: oregon
+    branch: main
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: DATABASE_URL
-        sync: false
       - key: BOT_TOKEN
-        sync: false
-      - key: OWNER_ID
-        sync: false
-      - key: UPLOAD_CHANNEL_ID
-        sync: false
-    healthCheckPath: /health
-    ports:
-      - 10000
+        sync: false       # set in Render dashboard
+      - key: DATABASE_URL
+        sync: false       # set in Render dashboard
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: telegram-bot
+          property: url
