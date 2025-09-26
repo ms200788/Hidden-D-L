@@ -575,7 +575,7 @@ async def _handle_deep_link_async(message: types.Message, start_payload: str):
     expire_at = None
     if auto_minutes and auto_minutes > 0:
         expire_at = datetime.now(timezone.utc) + timedelta(minutes=auto_minutes)
-        info = await bot.send_message(chat_id=message.chat.id, text=f"⚠️ These files will be auto-deleted from this chat in {auto_minutes} minutes.")
+        info = await bot.send_message(chat_id=message.chat.id, text=f"⚠️ These files will be auto-deleted in {auto_minutes} minutes.")
         sent_message_ids.append(info.message_id)
 
     async with DB_POOL.acquire() as conn:
