@@ -1,10 +1,15 @@
-# =====================================
-# Telegram Bot (Webhook-only for Render)
-# Features: Uploads, Deep-linking, Stats, Broadcast, Sessions, Auto-delete
-# Database: Neon (Postgres via asyncpg)
-# Hosting: Render (aiohttp web server + UptimeRobot healthcheck)
-# =====================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Block 1/3
+Core imports, configuration, database layer, FSM state definitions, and utility helpers.
 
+Paste BLOCK 1, then BLOCK 2, then BLOCK 3 (I'll provide those next).
+"""
+
+# -------------------------
+# Imports
+# -------------------------
 import os
 import logging
 import asyncio
@@ -12,182 +17,363 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Any
 
+import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ParseMode,
-    Message,
-)
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ParseMode, Message
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.executor import start_webhook
 
-import asyncpg
-from aiohttp import web
-
-# -------------------------------------
-# Logging Setup
-# -------------------------------------
+# -------------------------
+# Logging
+# -------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# -------------------------------------
-# Environment Variables
-# -------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# -------------------------
+# Environment / Configuration
+# -------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.critical("BOT_TOKEN is not set. Exiting.")
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))
+if OWNER_ID == 0:
+    logger.warning("OWNER_ID not set or zero. Some owner-only features will be inaccessible.")
 
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    logger.critical("DATABASE_URL not set. Exiting.")
+    raise RuntimeError("DATABASE_URL environment variable is required")
 
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", "8080"))
+UPLOAD_CHANNEL_ID = os.getenv("UPLOAD_CHANNEL_ID")
+if not UPLOAD_CHANNEL_ID:
+    logger.critical("UPLOAD_CHANNEL_ID not set. Exiting.")
+    raise RuntimeError("UPLOAD_CHANNEL_ID environment variable is required")
 
-# -------------------------------------
-# Bot + Dispatcher
-# -------------------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# support numeric channel ID and username string like @channel
+try:
+    if UPLOAD_CHANNEL_ID.lstrip("-").isdigit():
+        UPLOAD_CHANNEL_ID_INT = int(UPLOAD_CHANNEL_ID)
+    else:
+        UPLOAD_CHANNEL_ID_INT = UPLOAD_CHANNEL_ID
+except Exception:
+    UPLOAD_CHANNEL_ID_INT = UPLOAD_CHANNEL_ID
+
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # preferred for webhook
+PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")  # will be combined with token
+WEBHOOK_URL = (RENDER_EXTERNAL_URL.rstrip("/") + WEBHOOK_PATH + f"/{BOT_TOKEN}") if RENDER_EXTERNAL_URL else None
+
+# Skip updates (useful on startup)
+SKIP_UPDATES = os.getenv("SKIP_UPDATES", "1") == "1"
+
+# deep link TTL default (30 days)
+DEEP_LINK_TTL_SECONDS = int(os.getenv("DEEP_LINK_TTL_SECONDS", 60 * 60 * 24 * 30))
+
+# -------------------------
+# Bot & Dispatcher
+# -------------------------
+bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# -------------------------------------
-# Database Layer
-# -------------------------------------
+# -------------------------
+# FSM States (define all that will be used in later blocks)
+# -------------------------
+class UploadStates(StatesGroup):
+    WAITING_FOR_FILES = State()
+    WAITING_FOR_PROTECT = State()
+    WAITING_FOR_AUTODELETE = State()
+    CONFIRMATION = State()
+
+class BroadcastStates(StatesGroup):
+    WAITING_FOR_BROADCAST = State()
+
+class SetMessageStates(StatesGroup):
+    WAITING_FOR_MESSAGE_TEXT = State()
+
+class SetImageStates(StatesGroup):
+    WAITING_FOR_IMAGE_FILE = State()
+
+class SetImageChoiceStates(StatesGroup):
+    WAITING_FOR_CHOICE = State()
+
+class GenericConfirmStates(StatesGroup):
+    WAITING_CONFIRM = State()
+
+# -------------------------
+# Database wrapper (asyncpg)
+# -------------------------
 class Database:
+    """
+    Async wrapper around an asyncpg pool. Creates/initializes schema on connect.
+    Schema includes:
+      - users
+      - messages (start/help text + images)
+      - sessions (session_token as TEXT primary key)
+      - session_files
+      - stats
+    """
+
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: Optional[asyncpg.pool.Pool] = None
 
     async def connect(self):
         logger.info("Connecting to database...")
-        self.pool = await asyncpg.create_pool(dsn=self.dsn)
+        self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=10)
         logger.info("Connected to database")
         await self._init_schema()
-
-    async def _init_schema(self):
-        async with self.pool.acquire() as conn:
-            # Users table
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined TIMESTAMP DEFAULT NOW(),
-                last_active TIMESTAMP DEFAULT NOW()
-            )
-            """)
-            # Files table
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS files (
-                file_id TEXT PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
-                file_unique_id TEXT,
-                file_type TEXT,
-                caption TEXT,
-                created TIMESTAMP DEFAULT NOW()
-            )
-            """)
-            # Broadcast sessions
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS broadcasts (
-                id SERIAL PRIMARY KEY,
-                started TIMESTAMP DEFAULT NOW(),
-                finished TIMESTAMP,
-                total_users INT,
-                success INT,
-                failed INT
-            )
-            """)
-            # Settings table
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """)
-
-    async def add_or_update_user(self, user: types.User):
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-            INSERT INTO users (user_id, username, first_name, last_name, joined, last_active)
-            VALUES ($1, $2, $3, $4, NOW(), NOW())
-            ON CONFLICT (user_id) DO UPDATE
-            SET username=EXCLUDED.username,
-                first_name=EXCLUDED.first_name,
-                last_name=EXCLUDED.last_name,
-                last_active=NOW()
-            """, user.id, user.username, user.first_name, user.last_name)
-
-    async def add_file(self, file_id: str, file_unique_id: str, file_type: str, user_id: int, caption: Optional[str]):
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-            INSERT INTO files (file_id, user_id, file_unique_id, file_type, caption)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (file_id) DO NOTHING
-            """, file_id, user_id, file_unique_id, file_type, caption)
-
-    async def get_user_count(self) -> int:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT COUNT(*) AS c FROM users")
-            return row["c"]
-
-    async def get_file_count(self) -> int:
-        assert self.pool is not None
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT COUNT(*) AS c FROM files")
-            return row["c"]
 
     async def close(self):
         if self.pool:
             await self.pool.close()
             self.pool = None
+            logger.info("Database pool closed")
 
+    async def _init_schema(self):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # users table
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+                    last_active TIMESTAMP WITH TIME ZONE NOT NULL
+                );
+                """)
+                # messages table
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    name TEXT PRIMARY KEY,  -- 'start_text', 'help_text', 'start_image', 'help_image'
+                    text TEXT,
+                    file_id TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+                );
+                """)
+                # sessions table (string token as primary key)
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_token TEXT PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    protect_content BOOLEAN DEFAULT FALSE,
+                    auto_delete_minutes INT DEFAULT 0,
+                    title TEXT,
+                    expires_at TIMESTAMP WITH TIME ZONE
+                );
+                """)
+                # session_files table referencing sessions(session_token)
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS session_files (
+                    id SERIAL PRIMARY KEY,
+                    session_token TEXT REFERENCES sessions(session_token) ON DELETE CASCADE,
+                    file_type TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    orig_file_name TEXT,
+                    caption TEXT,
+                    position INT DEFAULT 0
+                );
+                """)
+                # stats
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS stats (
+                    key TEXT PRIMARY KEY,
+                    value BIGINT DEFAULT 0
+                );
+                """)
+                # initialize stats keys
+                await conn.execute("""
+                INSERT INTO stats(key, value)
+                VALUES
+                  ('total_upload_sessions', 0),
+                  ('total_files', 0)
+                ON CONFLICT (key) DO NOTHING;
+                """)
+                # index for session_files
+                await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_session_files_session ON session_files(session_token);
+                """)
 
-# Global DB instance
+        logger.info("Database schema initialized")
+
+    # -----------------------
+    # Users
+    # -----------------------
+    async def add_or_update_user(self, user_id: int, username: Optional[str] = None):
+        assert self.pool is not None
+        ts = datetime.utcnow()
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            INSERT INTO users(user_id, username, first_seen, last_active)
+            VALUES($1, $2, $3, $3)
+            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, last_active = EXCLUDED.last_active;
+            """, user_id, username, ts)
+
+    async def count_total_users(self) -> int:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT count(*) AS cnt FROM users;")
+            return rec["cnt"] if rec else 0
+
+    async def count_active_users_since(self, since_dt: datetime) -> int:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT count(*) AS cnt FROM users WHERE last_active >= $1;", since_dt)
+            return rec["cnt"] if rec else 0
+
+    # -----------------------
+    # Messages (start/help text and files)
+    # -----------------------
+    async def set_message_text(self, name: str, text: str):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            INSERT INTO messages(name, text, updated_at)
+            VALUES($1, $2, $3)
+            ON CONFLICT(name) DO UPDATE SET text = EXCLUDED.text, updated_at = EXCLUDED.updated_at;
+            """, name, text, datetime.utcnow())
+
+    async def get_message_text(self, name: str) -> Optional[str]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT text FROM messages WHERE name = $1;", name)
+            return rec["text"] if rec else None
+
+    async def set_message_file(self, name: str, file_id: str):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            INSERT INTO messages(name, file_id, updated_at)
+            VALUES($1, $2, $3)
+            ON CONFLICT(name) DO UPDATE SET file_id = EXCLUDED.file_id, updated_at = EXCLUDED.updated_at;
+            """, name, file_id, datetime.utcnow())
+
+    async def get_message_file(self, name: str) -> Optional[str]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT file_id FROM messages WHERE name = $1;", name)
+            return rec["file_id"] if rec else None
+
+    # -----------------------
+    # Sessions & files
+    # -----------------------
+    async def create_session(self, session_token: str, owner_id: int, protect: bool, auto_delete_minutes: int, title: Optional[str], expires_at: Optional[datetime] = None):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            INSERT INTO sessions(session_token, owner_id, created_at, protect_content, auto_delete_minutes, title, expires_at)
+            VALUES($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (session_token) DO NOTHING;
+            """, session_token, owner_id, datetime.utcnow(), protect, auto_delete_minutes, title, expires_at)
+
+    async def add_session_file(self, session_token: str, file_type: str, file_id: str, orig_file_name: Optional[str], caption: Optional[str], position: int = 0):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+            INSERT INTO session_files(session_token, file_type, file_id, orig_file_name, caption, position)
+            VALUES($1, $2, $3, $4, $5, $6)
+            """, session_token, file_type, file_id, orig_file_name, caption, position)
+            # increment total_files stat
+            await conn.execute("""
+            UPDATE stats SET value = value + 1 WHERE key = 'total_files';
+            """)
+
+    async def get_session(self, session_token: str) -> Optional[asyncpg.Record]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT * FROM sessions WHERE session_token = $1;", session_token)
+            return rec
+
+    async def get_session_files(self, session_token: str) -> List[asyncpg.Record]:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+            SELECT * FROM session_files WHERE session_token = $1 ORDER BY position ASC, id ASC;
+            """, session_token)
+            return rows
+
+    async def increment_upload_sessions(self):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_upload_sessions';")
+
+    async def get_stat(self, key: str) -> int:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            rec = await conn.fetchrow("SELECT value FROM stats WHERE key = $1;", key)
+            return rec["value"] if rec else 0
+
+    # generic helper
+    async def execute(self, query: str, *args):
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+# global DB instance
 db = Database(DATABASE_URL)
 
-# -------------------------------------
-# Utility Functions
-# -------------------------------------
+# -------------------------
+# Utility helpers
+# -------------------------
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-def build_channel_buttons(optional_list: List[Dict[str, str]], forced_list: List[Dict[str, str]]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    for ch in forced_list + optional_list:
-        kb.add(InlineKeyboardButton(text=ch["title"], url=ch["url"]))
-    return kb
+def generate_session_token(length_bytes: int = 8) -> str:
+    """
+    Use URL-safe token for deep link session id
+    """
+    return secrets.token_urlsafe(length_bytes)
 
-def generate_token(length: int = 8) -> str:
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
+async def build_start_deep_link(session_token: str) -> str:
+    """
+    Create a t.me deep link for the bot
+    """
+    try:
+        me = await bot.get_me()
+        username = getattr(me, "username", None)
+    except Exception:
+        username = None
+    if username:
+        return f"https://t.me/{username}?start={session_token}"
+    else:
+        bot_id_prefix = BOT_TOKEN.split(":")[0]
+        return f"https://t.me/{bot_id_prefix}?start={session_token}"
 
-# -------------------------------------
-# FSM States (will be expanded later)
-# -------------------------------------
-class BroadcastStates(StatesGroup):
-    waiting_for_message = State()
-    confirm = State()
+def pretty_minutes(minutes: int) -> str:
+    if minutes <= 0:
+        return "forever (no auto-delete)"
+    if minutes < 60:
+        return f"{minutes} minute(s)"
+    if minutes < 60 * 24:
+        hrs = minutes // 60
+        return f"{hrs} hour(s)"
+    days = minutes // (60 * 24)
+    return f"{days} day(s)"
 
-class UploadStates(StatesGroup):
-    waiting_for_file = State()
-    waiting_for_caption = State()
+# safe send wrapper
+async def safe_send(chat_id: int, **kwargs) -> Optional[types.Message]:
+    try:
+        return await bot.send_message(chat_id=chat_id, **kwargs)
+    except Exception as e:
+        logger.exception("Failed to send message to %s: %s", chat_id, e)
+        return None
 
+# -------------------------
+# End of Block 1/3
+# -------------------------
 # =========================
-# BLOCK 2: Handlers & Flows
-# (paste after BLOCK 1)
+# BLOCK 2/3: Handlers & Flows
+# (paste after BLOCK 1/3)
 # =========================
 
 from functools import partial
@@ -198,16 +384,18 @@ from functools import partial
 async def db_get_setting(key: str) -> Optional[str]:
     assert db.pool is not None
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
-        return row["value"] if row else None
+        row = await conn.fetchrow("SELECT value FROM messages WHERE name=$1", key)
+        # Note: using the messages table for small key/value entries (start_text/help_text etc.)
+        return row["value"] if row and "value" in row else row["text"] if row and "text" in row else None
 
 async def db_set_setting(key: str, value: str):
     assert db.pool is not None
     async with db.pool.acquire() as conn:
+        # messages table used as key/value store for now
         await conn.execute("""
-        INSERT INTO settings(key, value) VALUES ($1, $2)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, key, value)
+        INSERT INTO messages(name, text, updated_at) VALUES ($1, $2, $3)
+        ON CONFLICT (name) DO UPDATE SET text = EXCLUDED.text, updated_at = EXCLUDED.updated_at
+        """, key, value, datetime.utcnow())
 
 # Ensure sessions tables exist (lazy-init helper used by upload flow)
 async def ensure_sessions_tables():
@@ -263,7 +451,10 @@ def extract_file_id_from_msg(msg: types.Message) -> Tuple[Optional[str], Optiona
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     # store user
-    await db.add_or_update_user(message.from_user)
+    try:
+        await db.add_or_update_user(message.from_user.id, getattr(message.from_user, "username", None))
+    except Exception as e:
+        logger.debug("add_or_update_user failed: %s", e)
 
     # check payload (deep link)
     parts = message.get_args().strip() if hasattr(message, "get_args") else ""
@@ -272,8 +463,8 @@ async def cmd_start(message: types.Message):
         return
 
     # no payload: show start message from settings (if any)
-    start_text = await db_get_setting("start_text")
-    start_image = await db_get_setting("start_image_file_id")
+    start_text = await db.get_message_text("start_text")
+    start_image = await db.get_message_file("start_image")
     try:
         if start_image:
             if start_text:
@@ -358,9 +549,12 @@ async def schedule_deletions(chat_id: int, messages: List[Message], minutes: int
 # -------------------------
 @dp.callback_query_handler(lambda c: c.data == "show_help")
 async def cb_show_help(callback_query: types.CallbackQuery):
-    await db.add_or_update_user(callback_query.from_user)
-    help_text = await db_get_setting("help_text")
-    help_img = await db_get_setting("help_image_file_id")
+    try:
+        await db.add_or_update_user(callback_query.from_user.id, getattr(callback_query.from_user, "username", None))
+    except Exception as e:
+        logger.debug("add_or_update_user failed: %s", e)
+    help_text = await db.get_message_text("help_text")
+    help_img = await db.get_message_file("help_image")
     try:
         if help_img:
             if help_text:
@@ -378,9 +572,12 @@ async def cb_show_help(callback_query: types.CallbackQuery):
 
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
-    await db.add_or_update_user(message.from_user)
-    help_text = await db_get_setting("help_text")
-    help_img = await db_get_setting("help_image_file_id")
+    try:
+        await db.add_or_update_user(message.from_user.id, getattr(message.from_user, "username", None))
+    except Exception as e:
+        logger.debug("add_or_update_user failed: %s", e)
+    help_text = await db.get_message_text("help_text")
+    help_img = await db.get_message_file("help_image")
     try:
         if help_img:
             if help_text:
@@ -464,8 +661,8 @@ async def cb_setimg(callback_query: types.CallbackQuery):
         kind = kind.split("_",1)[1]
     except Exception:
         return await callback_query.answer("Invalid payload", show_alert=True)
-    key = "start_image_file_id" if kind == "start" else "help_image_file_id"
-    await db_set_setting(key, file_id)
+    key = "start_image" if kind == "start" else "help_image"
+    await db.set_message_file(key, file_id)
     await callback_query.answer()
     await bot.send_message(callback_query.from_user.id, f"{kind.capitalize()} image saved.")
 
@@ -516,23 +713,23 @@ async def capture_upload_files(message: types.Message, state: FSMContext):
     try:
         copied = None
         try:
-            copied = await bot.copy_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+            copied = await bot.copy_message(chat_id=UPLOAD_CHANNEL_ID_INT, from_chat_id=message.chat.id, message_id=message.message_id)
         except Exception:
             # fallback send
             if ftype == "photo":
-                copied = await bot.send_photo(chat_id=UPLOAD_CHANNEL_ID, photo=file_id, caption=caption)
+                copied = await bot.send_photo(chat_id=UPLOAD_CHANNEL_ID_INT, photo=file_id, caption=caption)
             elif ftype == "video":
-                copied = await bot.send_video(chat_id=UPLOAD_CHANNEL_ID, video=file_id, caption=caption)
+                copied = await bot.send_video(chat_id=UPLOAD_CHANNEL_ID_INT, video=file_id, caption=caption)
             elif ftype == "audio":
-                copied = await bot.send_audio(chat_id=UPLOAD_CHANNEL_ID, audio=file_id, caption=caption)
+                copied = await bot.send_audio(chat_id=UPLOAD_CHANNEL_ID_INT, audio=file_id, caption=caption)
             elif ftype == "document":
-                copied = await bot.send_document(chat_id=UPLOAD_CHANNEL_ID, document=file_id, caption=caption)
+                copied = await bot.send_document(chat_id=UPLOAD_CHANNEL_ID_INT, document=file_id, caption=caption)
             elif ftype == "animation":
-                copied = await bot.send_animation(chat_id=UPLOAD_CHANNEL_ID, animation=file_id, caption=caption)
+                copied = await bot.send_animation(chat_id=UPLOAD_CHANNEL_ID_INT, animation=file_id, caption=caption)
             elif ftype == "voice":
-                copied = await bot.send_voice(chat_id=UPLOAD_CHANNEL_ID, voice=file_id)
+                copied = await bot.send_voice(chat_id=UPLOAD_CHANNEL_ID_INT, voice=file_id)
             else:
-                copied = await bot.send_document(chat_id=UPLOAD_CHANNEL_ID, document=file_id, caption=caption)
+                copied = await bot.send_document(chat_id=UPLOAD_CHANNEL_ID_INT, document=file_id, caption=caption)
         data = await state.get_data()
         upload_files = data.get("upload_files", [])
         upload_files.append({
@@ -595,7 +792,7 @@ async def finalize_upload_session(message: types.Message, state: FSMContext, tit
         return
 
     await ensure_sessions_tables()
-    token = generate_token(12)
+    token = generate_session_token(12)
     expires_at = datetime.utcnow() + timedelta(seconds=DEEP_LINK_TTL_SECONDS)
     # insert session
     assert db.pool is not None
@@ -615,7 +812,7 @@ async def finalize_upload_session(message: types.Message, state: FSMContext, tit
         await conn.execute("UPDATE stats SET value = value + 1 WHERE key='total_upload_sessions'")
 
     await db.increment_upload_sessions()
-    deep_link = f"https://t.me/{(await bot.get_me()).username}?start={token}"
+    deep_link = await build_start_deep_link(token)
     await message.reply(
         f"Session created ✅\n\nSession token: <code>{token}</code>\nFiles: {len(files)}\nProtect: {'Yes' if protect else 'No'}\nAuto-delete: {pretty_minutes(auto_delete_minutes)}\nLink: {deep_link}",
         parse_mode=ParseMode.HTML
@@ -630,14 +827,14 @@ async def cmd_broadcast(message: types.Message):
     if not is_owner(message.from_user.id):
         return await message.reply("Not authorized.")
     await message.reply("Send the message/media to broadcast to all users. /cancel to abort.")
-    await BroadcastStates.waiting_for_message.set()
+    await BroadcastStates.WAITING_FOR_BROADCAST.set()
 
-@dp.message_handler(state=BroadcastStates.waiting_for_message, commands=["cancel"])
+@dp.message_handler(state=BroadcastStates.WAITING_FOR_BROADCAST, commands=["cancel"])
 async def cancel_broadcast(message: types.Message, state: FSMContext):
     await state.finish()
     await message.reply("Broadcast cancelled.")
 
-@dp.message_handler(state=BroadcastStates.waiting_for_message, content_types=types.ContentTypes.ANY)
+@dp.message_handler(state=BroadcastStates.WAITING_FOR_BROADCAST, content_types=types.ContentTypes.ANY)
 async def handle_broadcast(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         await state.finish()
@@ -686,14 +883,19 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
 async def cmd_stats(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    users = await db.get_user_count()
-    files = await db.get_file_count()
+    users = await db.count_total_users()
+    files = await db.get_stat("total_files")
+    upload_sessions = await db.get_stat("total_upload_sessions")
+    since = datetime.utcnow() - timedelta(days=2)
+    active_users = await db.count_active_users_since(since)
     text = (
         f"📊 <b>Bot Stats</b>\n\n"
         f"• Total users: <b>{users}</b>\n"
-        f"• Total files: <b>{files}</b>\n"
+        f"• Active in last 48h: <b>{active_users}</b>\n"
+        f"• Upload sessions completed: <b>{upload_sessions}</b>\n"
+        f"• Total files stored: <b>{files}</b>\n"
     )
-    await bot.send_message(message.chat.id, text, parse_mode=ParseMode.HTML)
+    await bot.send_message(chat_id=message.from_user.id, text=text, parse_mode=ParseMode.HTML)
 
 # -------------------------
 # listsession (owner)
@@ -717,173 +919,72 @@ async def cmd_list_session(message: types.Message):
     for f in files:
         await message.reply(f"{f['position']}: {f['file_type']} - {f['file_id']} caption:{f['caption']}")
 
-# =========================
-# BLOCK 3: Startup, webhook wiring, utilities, and entrypoint
-# (paste this after BLOCK 2)
-# =========================
-
-import signal
-from aiohttp import web_exceptions
-
-# A safety default for skipping updates
-SKIP_UPDATES = True
-
-# -------------------------
-# Misc helpers & fallback handlers
-# -------------------------
-@dp.message_handler(commands=["cancel"])
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    try:
-        await state.finish()
-    except Exception:
-        pass
-    await message.reply("Operation cancelled.")
+# -------------------------------------------------------------------
+# Fallback Handlers & Error Logging
+# -------------------------------------------------------------------
 
 @dp.message_handler()
-async def fallback_all(message: types.Message):
-    """
-    Minimal fallback: update/insert user into DB last_active and do not spam replies.
-    """
-    try:
-        await db.add_or_update_user(message.from_user)
-    except Exception as e:
-        logger.debug("Failed updating user last_active: %s", e)
-    # do not reply to ordinary messages to avoid loops
-    return
+async def fallback_handler(message: types.Message):
+    """Catch-all fallback for unknown messages."""
+    await message.answer("⚠️ Unknown command. Use /help to see available options.")
 
-# Error logger for unhandled exceptions in handlers
+
 @dp.errors_handler()
-async def global_error_handler(update, exception):
-    logger.exception("Unhandled error: %s", exception)
-    # Returning True tells aiogram exceptions have been handled
+async def errors_handler(update, exception):
+    logging.error(f"Update: {update} caused error: {exception}")
     return True
 
-# -------------------------
-# Health endpoint for UptimeRobot / Render
-# -------------------------
-async def health(request: web.Request):
-    # lightweight DB check optional
-    try:
-        if db.pool:
-            async with db.pool.acquire() as conn:
-                await conn.fetchrow("SELECT 1")
-    except Exception as e:
-        logger.warning("DB healthcheck failed: %s", e)
-        # still respond 200 so Render/UptimeRobot sees service alive; change if you want stricter
+
+# -------------------------------------------------------------------
+# Health Check Endpoint for Render + UptimeRobot
+# -------------------------------------------------------------------
+
+async def healthcheck(request):
     return web.Response(text="ok")
 
-# -------------------------
-# Startup & Shutdown for webhook + DB
-# -------------------------
-async def on_startup(app: web.Application):
-    logger.info("on_startup: connecting to DB...")
+
+async def on_startup_app(app: web.Application):
+    """Executed on app startup: DB connect + webhook set."""
+    logging.info("Starting up...")
     try:
         await db.connect()
     except Exception as e:
-        logger.exception("Failed to initialize DB on startup: %s", e)
-        # If DB init fails, we still continue to try to set webhook (optional)
-    # Ensure sessions tables exist (safe no-op if already created)
-    try:
-        await ensure_sessions_tables()
-    except Exception:
-        logger.debug("ensure_sessions_tables skipped or failed (maybe already exist).")
-    # set webhook if RENDER_EXTERNAL_URL provided
-    try:
-        if WEBHOOK_URL:
-            await bot.set_webhook(WEBHOOK_URL)
-            logger.info("Webhook set to %s", WEBHOOK_URL)
-        else:
-            logger.warning("WEBHOOK_URL not configured; webhook not set.")
-    except Exception as e:
-        logger.exception("Failed to set webhook: %s", e)
+        logging.error(f"Database init failed: {e}")
 
-async def on_shutdown(app: web.Application):
-    logger.info("on_shutdown: cleaning up.")
+    webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL')}/webhook/{API_TOKEN}"
+    await bot.set_webhook(webhook_url)
+    logging.info(f"Webhook set to {webhook_url}")
+
+
+async def on_shutdown_app(app: web.Application):
+    """Executed on app shutdown: close DB + drop webhook."""
+    logging.info("Shutting down...")
     try:
-        # try deleting webhook
-        try:
-            await bot.delete_webhook()
-            logger.info("Webhook deleted.")
-        except Exception as e:
-            logger.debug("Failed to delete webhook: %s", e)
-        # close DB
+        await bot.delete_webhook()
         await db.close()
     except Exception as e:
-        logger.exception("Error during shutdown: %s", e)
-    # close dispatcher storage
-    try:
-        await dp.storage.close()
-        await dp.storage.wait_closed()
-    except Exception:
-        pass
-    # close bot session
-    try:
-        await bot.close()
-    except Exception:
-        pass
-    logger.info("Shutdown complete.")
+        logging.error(f"Shutdown error: {e}")
 
-# -------------------------
-# Graceful stop helper (for local dev)
-# -------------------------
-def _register_signal_handlers(loop):
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(s, lambda s=s: asyncio.create_task(_shutdown_signal(s)))
-        except NotImplementedError:
-            # Windows or environment may not support signal handlers
-            pass
 
-async def _shutdown_signal(sig):
-    logger.info("Received exit signal %s", sig)
-    # Stop webhook server by stopping the event loop gracefully
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    logger.info("Cancelled %d tasks", len(tasks))
-
-# -------------------------
-# App creation using aiogram.start_webhook + aiohttp web_app injection
-# -------------------------
-def build_web_app() -> web.Application:
-    app = web.Application()
-    # Attach health endpoints
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    # Hook aiogram dispatcher into aiohttp app by providing web_app to start_webhook
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    return app
-
-# -------------------------
+# -------------------------------------------------------------------
 # Entrypoint
-# -------------------------
+# -------------------------------------------------------------------
+
 def main():
-    # Build the aiohttp web app with health endpoints
-    web_app = build_web_app()
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
 
-    # register signal handlers for graceful shutdown where supported
-    loop = asyncio.get_event_loop()
-    _register_signal_handlers(loop)
+    # Webhook route
+    app.router.add_post(f"/webhook/{API_TOKEN}", dp.middleware(WebhookRequestHandler(dp)))
 
-    # Use aiogram's start_webhook which will run aiohttp under the hood
-    # and mount our web_app by passing it into start_webhook's web_app parameter.
-    try:
-        logger.info("Starting webhook (host=%s port=%s path=%s)...", WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH)
-        start_webhook(
-            dispatcher=dp,
-            webhook_path=WEBHOOK_PATH,
-            skip_updates=SKIP_UPDATES,
-            host=WEBAPP_HOST,
-            port=WEBAPP_PORT,
-            on_startup=[on_startup],
-            on_shutdown=[on_shutdown],
-            webhook_url=WEBHOOK_URL,
-            web_app=web_app
-        )
-    except web_exceptions.HTTPException as e:
-        logger.exception("HTTP exception while starting webhook: %s", e)
-    except Exception as e:
-        logger.exception("Failed to start webhook: %s", e)
+    # Startup & shutdown
+    app.on_startup.append(on_startup_app)
+    app.on_shutdown.append(on_shutdown_app)
+
+    logging.info(f"Starting bot on port {PORT}...")
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
