@@ -1,25 +1,28 @@
-# Use official slim Python image
-FROM python:3.11-slim
+FROM python:3.9-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies needed for asyncpg & building wheels
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
     gcc \
-    libpq-dev \
-    build-essential \
+    postgresql-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies first (cache layer)
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
-COPY . /app
+# Copy application code
+COPY bot.py .
 
-# Expose port (Render will provide PORT env)
+# Create non-root user
+RUN useradd -m -u 1000 botuser
+USER botuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+
 EXPOSE 8080
 
-# Default command to run your bot
 CMD ["python", "bot.py"]
