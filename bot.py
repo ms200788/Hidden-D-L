@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete Telegram File Sharing Bot
+Complete Telegram File Sharing Bot - FIXED FOR RENDER
 100% Working Code - Single File Implementation
 """
 
@@ -262,8 +262,6 @@ async def send_message_with_image(chat_id: int, msg_type: str):
 async def save_file_to_channel(file: types.Document or types.PhotoSize or types.Video) -> str:
     """Save file to upload channel and return file_id"""
     try:
-        # In a real scenario, you'd forward to channel
-        # For now, we'll use the original file_id
         if hasattr(file, 'file_id'):
             return file.file_id
         return str(file)
@@ -707,25 +705,7 @@ async def cmd_ping(message: types.Message):
     latency = (end_time - start_time).total_seconds() * 1000
     await msg.edit_text(f"🏓 Pong! Latency: {latency:.2f}ms")
 
-# ==================== SCHEDULED TASKS ====================
-async def scheduled_tasks():
-    """Run scheduled maintenance tasks"""
-    while True:
-        try:
-            # Update statistics every hour
-            await db.update_statistics()
-            
-            # Cleanup old sessions every 6 hours
-            await db.cleanup_old_sessions(30)
-            
-            logging.info("Scheduled tasks completed successfully")
-            
-        except Exception as e:
-            logging.error(f"Scheduled task error: {e}")
-        
-        await asyncio.sleep(3600)  # Run every hour
-
-# ==================== WEB SERVER ====================
+# ==================== WEB SERVER ENDPOINTS ====================
 async def health_check(request):
     """Health check endpoint"""
     return web.Response(text="OK")
@@ -753,9 +733,6 @@ async def on_startup(dp):
     # Update statistics
     await db.update_statistics()
     
-    # Start scheduled tasks
-    asyncio.create_task(scheduled_tasks())
-    
     logging.info(f"Bot started successfully with webhook: {webhook_url}")
 
 async def on_shutdown(dp):
@@ -767,17 +744,27 @@ async def on_shutdown(dp):
         await db.pool.close()
     logging.info("Bot shutdown completed")
 
-# ==================== MAIN APPLICATION ====================
-def create_web_app():
-    """Create aiohttp web application"""
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    app.router.add_post('/webhook', webhook_handler)
-    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
-    return app
+# ==================== SCHEDULED TASKS ====================
+async def scheduled_tasks():
+    """Run scheduled maintenance tasks"""
+    while True:
+        try:
+            # Update statistics every hour
+            await db.update_statistics()
+            
+            # Cleanup old sessions every 6 hours
+            await db.cleanup_old_sessions(30)
+            
+            logging.info("Scheduled tasks completed successfully")
+            
+        except Exception as e:
+            logging.error(f"Scheduled task error: {e}")
+        
+        await asyncio.sleep(3600)  # Run every hour
 
+# ==================== MAIN APPLICATION ====================
 def main():
-    """Main application entry point"""
+    """Main application entry point - FIXED FOR RENDER"""
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
@@ -791,10 +778,16 @@ def main():
     if Config.OWNER_ID == 123456789:
         raise ValueError("Please set OWNER_ID environment variable")
     
-    # Create web application
-    app = create_web_app()
+    # Start scheduled tasks
+    asyncio.create_task(scheduled_tasks())
     
-    # Start the bot
+    # For Render deployment - use webhook with custom web app
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    app.router.add_post('/webhook', webhook_handler)
+    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
+    
+    # Start the bot using executor with the custom app
     executor.start_webhook(
         dispatcher=dp,
         webhook_path='/webhook',
