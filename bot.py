@@ -24,6 +24,7 @@ from aiogram.types import (
     InputMediaPhoto, InputMediaDocument,
     ReplyKeyboardMarkup, ReplyKeyboardRemove
 )
+from aiogram.dispatcher.middlewares import BaseMiddleware
 
 # Configure logging
 logging.basicConfig(
@@ -253,6 +254,18 @@ class BroadcastStates(StatesGroup):
     """State machine for broadcast"""
     waiting_for_broadcast = State()
 
+# Middleware for user activity tracking
+class UserActivityMiddleware(BaseMiddleware):
+    async def on_pre_process_message(self, message: types.Message, data: dict):
+        """Update user activity for every message"""
+        if message.from_user:
+            await Database.update_user_activity(message.from_user.id)
+
+    async def on_pre_process_callback_query(self, callback_query: types.CallbackQuery, data: dict):
+        """Update user activity for every callback query"""
+        if callback_query.from_user:
+            await Database.update_user_activity(callback_query.from_user.id)
+
 # Global variables for temporary storage
 upload_sessions: Dict[int, List[types.Message]] = {}
 
@@ -296,9 +309,6 @@ async def setup_bot_commands():
     ]
     
     await bot.set_my_commands(commands)
-    
-    # Set owner commands separately if needed
-    # Note: Bot commands are global, so we'll handle permission in handlers
 
 # =============================================================================
 # HANDLERS - START & HELP
@@ -841,7 +851,7 @@ async def delete_messages_after_delay(messages: List[types.Message], delay: int)
             logger.error(f"Error deleting message: {e}")
 
 # =============================================================================
-# ERROR HANDLER AND MIDDLEWARE
+# ERROR HANDLER
 # =============================================================================
 
 @dp.errors_handler()
@@ -849,12 +859,6 @@ async def errors_handler(update: types.Update, exception: Exception):
     """Handle errors"""
     logger.error(f"Update {update} caused error {exception}")
     return True
-
-async def user_activity_middleware(handler, event, data):
-    """Middleware to update user activity"""
-    if hasattr(event, 'from_user') and event.from_user:
-        await Database.update_user_activity(event.from_user.id)
-    return await handler(event, data)
 
 # =============================================================================
 # WEBHOOK SETUP AND HEALTH CHECK
@@ -900,7 +904,7 @@ async def webhook_handler(request):
 def main():
     """Main function"""
     # Register middleware
-    dp.middleware.setup(user_activity_middleware)
+    dp.middleware.setup(UserActivityMiddleware())
     
     if os.getenv('RENDER'):
         # Webhook mode for Render
