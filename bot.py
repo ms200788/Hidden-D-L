@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 
-#-- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
-""" Webhook-only Telegram bot built with aiogram v2 Features:
+import os
+import logging
+import asyncio
+import secrets
 
-Neon (Postgres) for persistence via asyncpg
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Tuple, Any
 
-Upload channel copy storage
-
-Owner-only uploads & broadcast
-
-Deep-link sharing for sessions
-
-Auto-delete scheduling
-
-Protect content option
-
-Health endpoint for UptimeRobot
-
-Webhook startup optimized for Render (sets webhook to RENDER_EXTERNAL_URL + /webhook/<BOT_TOKEN>)
-
-
-This file includes a fixed DB schema where sessions are identified by a text session_token (unique) and session_files reference that token. This avoids UndefinedColumn errors while keeping the application logic using string tokens. """
-
-import os import logging import asyncio import secrets from datetime import datetime, timedelta from typing import Optional, List, Dict, Tuple, Any
-
-import asyncpg from aiohttp import web
+import asyncpg
+from aiohttp import web
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils.executor import start_webhook
 
 from aiogram import Bot, Dispatcher, types from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ParseMode from aiogram.dispatcher import FSMContext from aiogram.dispatcher.filters.state import State, StatesGroup from aiogram.contrib.fsm_storage.memory import MemoryStorage from aiogram.dispatcher.webhook import get_new_configured_app
 
