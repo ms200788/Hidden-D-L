@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
--- coding: utf-8 --
+#-- coding: utf-8 --
 
 """ Webhook-only Telegram bot built with aiogram v2 Features:
 
