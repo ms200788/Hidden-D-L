@@ -976,8 +976,8 @@ def main():
     app.router.add_get("/", healthcheck)
     app.router.add_get("/health", healthcheck)
 
-    # Webhook route
-    app.router.add_post(f"/webhook/{BOT_TOKEN}", WebhookRequestHandler(dp))
+    # Webhook route (must use .post)
+    app.router.add_post(f"/webhook/{BOT_TOKEN}", WebhookRequestHandler(dp).post)
 
     # Startup & shutdown
     app.on_startup.append(on_startup_app)
