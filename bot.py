@@ -7,12 +7,14 @@
 #  blocking interaction with a Neon (PostgreSQL) database. It includes a        #
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
-#                                                                              #
-#  FIX 1-3 (Previous): Database schema repair and initial setup.                
-#  FIX 4 (Current): Refactored webhook setup by removing the conflicting        
-#       `web_app` argument from `executor.start_webhook` and injecting the      
-#       `/health` endpoint via the `dp.on_startup` signal handler, resolving    
-#       the "unexpected keyword argument 'web_app'" error.                      
+#                                                                              
+#  FIX 4 (Previous): Attempted to fix the 'web_app' argument error by using     
+#       dp.on_startup.add_handler(), which failed because that method does      
+#       not exist on aiogram v2 Dispatchers.                                    
+#  FIX 5 (Current): Corrected the V2 pattern for adding routes. The custom      
+#       route registration is now moved directly into the on_startup handler,   
+#       using the `dp.web_app` property (which the executor creates) to access  
+#       the underlying aiohttp application, resolving the 'on_startup' error.   
 ################################################################################
 """
 
@@ -605,17 +607,12 @@ async def health_handler(request):
     """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
     return web.Response(text="ok")
 
-async def setup_web_routes(app: web.Application):
-    """
-    Registers the /health route on the aiohttp web application instance.
-    This function is called by the executor's on_startup signal.
-    """
-    app.router.add_get('/health', health_handler)
-    logger.info("Healthcheck route '/health' registered successfully via setup_web_routes.")
 
-
-async def on_startup(dp):
-    """Executed on bot startup. Sets webhook and connects to DB."""
+async def on_startup(dp: Dispatcher):
+    """
+    Executed on bot startup. Sets webhook, connects to DB, and registers 
+    the custom healthcheck route to the aiohttp web application.
+    """
     logger.info(f"Bot starting up in {'WEBHOOK' if WEBHOOK_URL else 'POLLING'} mode.")
     
     # 1. Database Connection (CRITICAL for reliability)
@@ -623,12 +620,10 @@ async def on_startup(dp):
         await db_manager.connect()
     except Exception as e:
         logger.critical(f"Database connection failed during startup: {e}")
-        # Rely on the host environment to handle the crash/restart
         raise 
         
     # 2. Webhook Setup
     if WEBHOOK_URL:
-        # Note: Webhook is set here to ensure the latest URL is used if it changes
         try:
             webhook_info = await dp.bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
@@ -639,7 +634,13 @@ async def on_startup(dp):
         except Exception as e:
             logger.critical(f"Failed to set webhook: {e}")
 
-    # 3. Final Check and confirmation
+    # 3. Register Healthcheck Route using dp.web_app (CORRECT AIOGRAM V2 PATTERN)
+    # The executor guarantees dp.web_app is available here in webhook mode.
+    if WEBHOOK_URL and hasattr(dp, 'web_app') and dp.web_app is not None:
+        dp.web_app.router.add_get('/health', health_handler)
+        logger.info("Healthcheck route '/health' registered successfully via dp.web_app.")
+
+    # 4. Final Check and confirmation
     me = await dp.bot.get_me()
     logger.info(f"Bot '{me.username}' is ready. Owner ID: {OWNER_ID}. Channel ID: {UPLOAD_CHANNEL_ID}.")
 
@@ -657,8 +658,6 @@ async def on_shutdown(dp):
     if WEBHOOK_URL:
         logger.info("Clearing webhook...")
         await dp.bot.delete_webhook()
-
-    # 3. Stop Aiohttp Runner (Handled by executor since we pass 'app')
         
     await dp.storage.close()
     await dp.storage.wait_closed()
@@ -673,22 +672,18 @@ def main():
     
     if is_webhook_mode:
         
-        # CRITICAL FIX: Inject the custom /health route using the dispatcher's 
-        # on_startup signal BEFORE calling the executor. The executor calls 
-        # these signals when the aiohttp app is available.
-        dp.on_startup.add_handler(setup_web_routes)
+        # REMOVED: dp.on_startup.add_handler(setup_web_routes) -- This caused the 'on_startup' error.
 
         logger.info("Starting bot in Webhook Mode (Render Hosting).")
         
         executor.start_webhook(
             dispatcher=dp,
             webhook_path=WEBHOOK_PATH,
-            on_startup=on_startup,
+            on_startup=on_startup, # The on_startup function now handles route injection
             on_shutdown=on_shutdown,
             skip_updates=True,
             host='0.0.0.0',
             port=HEALTHCHECK_PORT, 
-            # REMOVED: web_app=app -- This caused the unexpected keyword argument error.
         )
     else:
         # Polling fallback (disabled per request but useful for local testing)
