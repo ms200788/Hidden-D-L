@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Sharing Bot - FINAL FIXED VERSION
+Telegram File Sharing Bot - FINAL WORKING VERSION
 A robust file sharing bot with deep links, auto-delete, and admin features.
 """
 
@@ -24,6 +24,7 @@ from aiogram.types import (
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
+from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter
 
 # Configuration
 class Config:
@@ -45,6 +46,9 @@ bot = Bot(token=Config.BOT_TOKEN, parse_mode='HTML')
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
+
+# Set bot instance for context
+Bot.set_current(bot)
 
 # Database connection
 db_pool = None
@@ -122,7 +126,7 @@ class Database:
                     INSERT INTO messages (message_type, text) 
                     VALUES 
                         ('start', '👋 Welcome to File Sharing Bot!\\n\\nUse deep links to access shared files.'),
-                        ('help', '📖 Help Guide:\\n\\n• Use /start to begin\\n• Contact owner for file access')
+                        ('help', '📖 Help Guide:\\n\\n• Use /upload to share files\\n• Contact owner for file access')
                 ''')
                 
                 await conn.execute('''
@@ -266,17 +270,6 @@ class Database:
             logger.error(f"Stats error: {e}")
             return {'total_users': 0, 'active_users': 0, 'files_uploaded': 0, 'sessions_completed': 0}
 
-    @staticmethod
-    async def get_users() -> List[int]:
-        """Get all users"""
-        try:
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch('SELECT user_id FROM users WHERE is_banned = FALSE')
-                return [row['user_id'] for row in rows]
-        except Exception as e:
-            logger.error(f"Get users error: {e}")
-            return []
-
 # Utility functions
 def is_owner(user_id: int) -> bool:
     return user_id == Config.OWNER_ID
@@ -294,13 +287,20 @@ def create_session_keyboard():
     )
     return keyboard
 
-def create_msg_type_keyboard():
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("Start Message", callback_data="msg_start"),
-        InlineKeyboardButton("Help Message", callback_data="msg_help")
-    )
-    return keyboard
+async def safe_send_message(chat_id: int, text: str, **kwargs):
+    """Safely send message with error handling"""
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+    except BotBlocked:
+        logger.warning(f"Bot blocked by user {chat_id}")
+    except ChatNotFound:
+        logger.warning(f"Chat not found: {chat_id}")
+    except RetryAfter as e:
+        logger.warning(f"Rate limit. Retry after {e.timeout} seconds")
+        await asyncio.sleep(e.timeout)
+        return await safe_send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        logger.error(f"Send message error: {e}")
 
 # Basic command handlers
 @dp.message_handler(commands=['start'])
@@ -314,31 +314,16 @@ async def cmd_start(message: Message):
         # Check for deep link
         args = message.get_args()
         if args:
-            await handle_deep_link(user.id, args)
+            await handle_deep_link(user.id, args, message.bot)
             return
         
         # Send welcome
         msg_data = await Database.get_message('start')
-        text = msg_data['text'] if msg_data else "Welcome!"
+        text = msg_data['text'] if msg_data else "Welcome to File Sharing Bot!"
         
-        if msg_data and msg_data.get('image_file_id'):
-            try:
-                await message.answer_photo(
-                    msg_data['image_file_id'], text,
-                    reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("Help", callback_data="help_btn")
-                    )
-                )
-                return
-            except Exception as e:
-                logger.error(f"Photo error: {e}")
+        # Remove inline buttons as requested - send plain message
+        await message.answer(text)
         
-        await message.answer(
-            text,
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("Help", callback_data="help_btn")
-            )
-        )
     except Exception as e:
         logger.error(f"Start error: {e}")
         await message.answer("Error occurred. Try again.")
@@ -351,74 +336,16 @@ async def cmd_help(message: Message):
         await Database.update_activity(user.id)
         
         msg_data = await Database.get_message('help')
-        text = msg_data['text'] if msg_data else "Help info"
+        text = msg_data['text'] if msg_data else "Help information"
         
-        if msg_data and msg_data.get('image_file_id'):
-            try:
-                await message.answer_photo(
-                    msg_data['image_file_id'], text,
-                    reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("Back", callback_data="back_btn")
-                    )
-                )
-                return
-            except Exception as e:
-                logger.error(f"Photo error: {e}")
+        # Remove inline buttons as requested - send plain message
+        await message.answer(text)
         
-        await message.answer(
-            text,
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("Back", callback_data="back_btn")
-            )
-        )
     except Exception as e:
         logger.error(f"Help error: {e}")
         await message.answer("Error occurred.")
 
-# Callback query handlers - MUST BE REGISTERED BEFORE OTHER HANDLERS
-@dp.callback_query_handler(lambda c: c.data == 'help_btn')
-async def help_callback(callback_query: CallbackQuery):
-    """Handle help button callback"""
-    try:
-        await cmd_help(callback_query.message)
-        await callback_query.answer()
-    except Exception as e:
-        logger.error(f"Help callback error: {e}")
-        await callback_query.answer("Error")
-
-@dp.callback_query_handler(lambda c: c.data == 'back_btn')
-async def back_callback(callback_query: CallbackQuery):
-    """Handle back button callback"""
-    try:
-        await cmd_start(callback_query.message)
-        await callback_query.answer()
-    except Exception as e:
-        logger.error(f"Back callback error: {e}")
-        await callback_query.answer("Error")
-
-@dp.callback_query_handler(lambda c: c.data in ['msg_start', 'msg_help'], state=MessageStates.waiting_for_message_type)
-async def msg_type_callback(callback_query: CallbackQuery, state: FSMContext):
-    """Handle message type selection"""
-    try:
-        msg_type = 'start' if callback_query.data == 'msg_start' else 'help'
-        await state.update_data(msg_type=msg_type)
-        
-        # Check if image or text
-        msg = callback_query.message
-        if msg.reply_to_message and msg.reply_to_message.photo:
-            file_id = msg.reply_to_message.photo[-1].file_id
-            await Database.update_message(msg_type, image_file_id=file_id)
-            await msg.answer(f"✅ {msg_type} image updated!")
-            await state.finish()
-        else:
-            await MessageStates.waiting_for_text.set()
-            await msg.answer(f"Send new text for {msg_type} message:")
-        
-        await callback_query.answer()
-    except Exception as e:
-        logger.error(f"Msg type callback error: {e}")
-        await callback_query.answer("Error")
-
+# Callback query handlers for session creation
 @dp.callback_query_handler(lambda c: c.data.startswith('protect_') or c.data.startswith('delete_'), state=UploadStates.waiting_for_options)
 async def options_callback(callback_query: CallbackQuery, state: FSMContext):
     """Handle session options"""
@@ -466,11 +393,12 @@ async def create_session_callback(callback_query: CallbackQuery, state: FSMConte
             text = f"""
 ✅ Session Created!
 
-Files: {len(data['files'])}
-Protect: {'Yes' if data.get('protect_content', True) else 'No'}
-Auto-delete: {data.get('auto_delete', 0)} min
+• Files: {len(data['files'])}
+• Protect: {'Yes' if data.get('protect_content', True) else 'No'}
+• Auto-delete: {data.get('auto_delete', 0)} min
 
-Link: {link}
+🔗 Share this link:
+{link}
             """
             await callback_query.message.answer(text)
         else:
@@ -483,64 +411,45 @@ Link: {link}
         await callback_query.answer("Error")
         await state.finish()
 
-# Owner commands with proper state management
-@dp.message_handler(commands=['setmessage'], user_id=Config.OWNER_ID)
-async def setmessage_cmd(message: Message):
-    """Set message command"""
-    try:
-        await MessageStates.waiting_for_message_type.set()
-        await message.answer("Select message type:", reply_markup=create_msg_type_keyboard())
-    except Exception as e:
-        logger.error(f"Setmessage error: {e}")
-        await message.answer("Error")
-
-@dp.message_handler(commands=['setimage'], user_id=Config.OWNER_ID)
-async def setimage_cmd(message: Message):
-    """Set image command"""
-    try:
-        if not message.reply_to_message or not message.reply_to_message.photo:
-            await message.answer("Reply to an image")
-            return
-        
-        await MessageStates.waiting_for_message_type.set()
-        await message.answer("Select image type:", reply_markup=create_msg_type_keyboard())
-    except Exception as e:
-        logger.error(f"Setimage error: {e}")
-        await message.answer("Error")
-
+# Owner commands
 @dp.message_handler(commands=['stats'], user_id=Config.OWNER_ID)
 async def stats_cmd(message: Message):
     """Stats command"""
     try:
         stats = await Database.get_stats()
         text = f"""
-📊 Stats:
-Users: {stats['total_users']}
-Active: {stats['active_users']}
-Files: {stats['files_uploaded']}
-Sessions: {stats['sessions_completed']}
+📊 Bot Statistics:
+
+👥 Users: {stats['total_users']}
+🟢 Active: {stats['active_users']}
+📁 Files: {stats['files_uploaded']}
+🔗 Sessions: {stats['sessions_completed']}
         """
         await message.answer(text)
     except Exception as e:
         logger.error(f"Stats error: {e}")
-        await message.answer("Error")
+        await message.answer("Error getting statistics")
 
-@dp.message_handler(commands=['upload'], user_id=Config.OWNER_ID, state='*')
-async def upload_cmd(message: Message, state: FSMContext):
-    """Upload command"""
+@dp.message_handler(commands=['upload'], user_id=Config.OWNER_ID)
+async def upload_cmd(message: Message):
+    """Upload command - start file upload process"""
     try:
-        await state.finish()  # Clear any existing state
+        # Clear any existing state
+        current_state = dp.current_state(chat=message.chat.id, user=message.from_user.id)
+        if await current_state.get_state():
+            await current_state.finish()
+        
         await UploadStates.waiting_for_files.set()
-        await state.update_data(files=[], captions=[])
+        await current_state.update_data(files=[], captions=[])
         await message.answer(
             "📤 Upload started! Send files one by one.\n"
             "Use /done when finished or /cancel to abort."
         )
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        await message.answer("Error")
+        await message.answer("Error starting upload")
 
-@dp.message_handler(commands=['done', 'd'], state=UploadStates.waiting_for_files, user_id=Config.OWNER_ID)
+@dp.message_handler(commands=['done'], state=UploadStates.waiting_for_files, user_id=Config.OWNER_ID)
 async def done_cmd(message: Message, state: FSMContext):
     """Done command"""
     try:
@@ -554,7 +463,7 @@ async def done_cmd(message: Message, state: FSMContext):
         
         await UploadStates.waiting_for_options.set()
         await message.answer(
-            f"📁 Files: {len(files)}\nConfigure options:",
+            f"📁 Files received: {len(files)}\nConfigure sharing options:",
             reply_markup=create_session_keyboard()
         )
     except Exception as e:
@@ -562,14 +471,17 @@ async def done_cmd(message: Message, state: FSMContext):
         await state.finish()
         await message.answer("Error")
 
-@dp.message_handler(commands=['cancel', 'c'], state='*', user_id=Config.OWNER_ID)
+@dp.message_handler(commands=['cancel'], state='*', user_id=Config.OWNER_ID)
 async def cancel_cmd(message: Message, state: FSMContext):
     """Cancel command"""
     try:
-        await state.finish()
-        await message.answer("Cancelled.")
+        current_state = await state.get_state()
+        if current_state:
+            await state.finish()
+        await message.answer("✅ Operation cancelled.")
     except Exception as e:
         logger.error(f"Cancel error: {e}")
+        await message.answer("Error")
 
 # File handler
 @dp.message_handler(content_types=[ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT], 
@@ -593,33 +505,21 @@ async def file_handler(message: Message, state: FSMContext):
             files.append(file_id)
             captions.append(message.caption or "")
             await state.update_data(files=files, captions=captions)
-            await message.answer(f"✅ File {len(files)} stored.")
+            await message.answer(f"✅ File {len(files)} stored. Send more or use /done when finished.")
     except Exception as e:
         logger.error(f"File handler error: {e}")
         await message.answer("Error storing file.")
 
-# Text handler for message setting
-@dp.message_handler(state=MessageStates.waiting_for_text)
-async def text_handler(message: Message, state: FSMContext):
-    """Handle message text"""
-    try:
-        data = await state.get_data()
-        msg_type = data.get('msg_type')
-        if msg_type:
-            await Database.update_message(msg_type, text=message.text)
-            await message.answer(f"✅ {msg_type} message updated!")
-        await state.finish()
-    except Exception as e:
-        logger.error(f"Text handler error: {e}")
-        await state.finish()
+# Message update handlers (removed setmessage/setimage commands as requested)
+# Users will set these via BotFather
 
 # Deep link handler
-async def handle_deep_link(user_id: int, session_id: str):
+async def handle_deep_link(user_id: int, session_id: str, bot_instance: Bot):
     """Handle deep link access"""
     try:
         session = await Database.get_session(session_id)
         if not session:
-            await bot.send_message(user_id, "❌ Session not found")
+            await safe_send_message(user_id, "❌ Session not found or expired")
             return
         
         file_ids = json.loads(session['file_ids'])
@@ -636,12 +536,13 @@ async def handle_deep_link(user_id: int, session_id: str):
             caption = captions[i] if i < len(captions) else ""
             
             try:
-                if file_id.startswith('AgAC'):
-                    msg = await bot.send_photo(user_id, file_id, caption=caption, protect_content=protect)
-                elif file_id.startswith('BAAC'):
-                    msg = await bot.send_video(user_id, file_id, caption=caption, protect_content=protect)
+                # Try to detect file type and send appropriately
+                if file_id.startswith('AgAC'):  # Photo file ID pattern
+                    msg = await bot_instance.send_photo(user_id, file_id, caption=caption, protect_content=protect)
+                elif file_id.startswith('BAAC'):  # Video file ID pattern  
+                    msg = await bot_instance.send_video(user_id, file_id, caption=caption, protect_content=protect)
                 else:
-                    msg = await bot.send_document(user_id, file_id, caption=caption, protect_content=protect)
+                    msg = await bot_instance.send_document(user_id, file_id, caption=caption, protect_content=protect)
                 
                 # Schedule deletion if needed
                 if auto_delete > 0 and user_id != Config.OWNER_ID:
@@ -660,12 +561,12 @@ async def handle_deep_link(user_id: int, session_id: str):
             else:
                 time_str = f"{auto_delete} minute(s)"
             
-            notice = await bot.send_message(user_id, f"⚠️ Files will auto-delete in {time_str}")
+            notice = await bot_instance.send_message(user_id, f"⚠️ Files will auto-delete in {time_str}")
             if auto_delete > 0:
                 asyncio.create_task(delete_after(notice.chat.id, notice.message_id, auto_delete * 60))
     except Exception as e:
         logger.error(f"Deep link error: {e}")
-        await bot.send_message(user_id, "Error accessing files.")
+        await safe_send_message(user_id, "Error accessing files.")
 
 async def delete_after(chat_id: int, message_id: int, delay: int):
     """Delete message after delay"""
@@ -679,7 +580,7 @@ async def delete_after(chat_id: int, message_id: int, delay: int):
 @dp.errors_handler()
 async def error_handler(update, exception):
     """Global error handler"""
-    logger.error(f"Error: {exception}")
+    logger.error(f"Update: {update} caused error: {exception}")
     return True
 
 # Web server for Render
@@ -705,11 +606,24 @@ async def on_startup(app):
     """Initialize on startup"""
     global db_pool
     try:
-        # Database
-        db_pool = await asyncpg.create_pool(Config.DATABASE_URL, min_size=1, max_size=10)
-        await Database.init_db()
+        # Database connection with retry
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                db_pool = await asyncpg.create_pool(Config.DATABASE_URL, min_size=1, max_size=10)
+                if await Database.init_db():
+                    logger.info("Database initialized successfully")
+                    break
+                else:
+                    raise Exception("Database initialization failed")
+            except Exception as e:
+                if i < max_retries - 1:
+                    logger.warning(f"Database connection attempt {i+1} failed, retrying...")
+                    await asyncio.sleep(2)
+                else:
+                    raise e
         
-        # Webhook
+        # Webhook setup
         if Config.RENDER_EXTERNAL_URL:
             webhook_url = f"{Config.RENDER_EXTERNAL_URL}/webhook/{Config.BOT_TOKEN}"
             await bot.set_webhook(webhook_url)
@@ -728,12 +642,20 @@ async def on_shutdown(app):
 
 def main():
     """Main function"""
-    if not Config.BOT_TOKEN or not Config.OWNER_ID or not Config.DATABASE_URL:
-        logger.error("Missing required environment variables")
+    # Validate required environment variables
+    if not Config.BOT_TOKEN:
+        logger.error("Missing BOT_TOKEN environment variable")
+        return
+    if not Config.OWNER_ID:
+        logger.error("Missing OWNER_ID environment variable")
+        return
+    if not Config.DATABASE_URL:
+        logger.error("Missing DATABASE_URL environment variable")
         return
     
     # Create web app
     app = web.Application()
+    app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
     app.router.add_post(f'/webhook/{Config.BOT_TOKEN}', webhook_handler)
     app.on_startup.append(on_startup)
