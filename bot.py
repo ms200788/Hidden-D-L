@@ -9,9 +9,10 @@
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
 #  FIX 1 (Previous): Corrected filter registration syntax.                      #
-#  FIX 2 (Current): Added schema integrity check for 'messages' table to handle #
-#       existing corrupted or mismatched table definitions by dropping and      #
-#       recreating the table if 'key' column is missing.                        #
+#  FIX 2 (Previous): Added schema integrity check for 'messages' table.         #
+#  FIX 3 (Current): Removed outer transaction block in setup_schema. This       #
+#       prevents the "aborted transaction" error when schema repair is needed   #
+#       by allowing DDL/recovery commands to run in autocommit mode.            #
 ################################################################################
 """
 
@@ -130,6 +131,11 @@ class Database:
         """
         Sets up all necessary tables if they do not already exist, and performs 
         a reliable check to ensure the 'messages' table schema is correct.
+        
+        FIX: Removed the outer conn.transaction() block. DDL commands run in 
+        autocommit mode, preventing the entire connection from being aborted
+        if a schema integrity check fails, allowing the recovery logic (DROP/CREATE)
+        to execute successfully.
         """
         logger.info("Database: Checking/setting up schema...")
         schema_queries = [
@@ -170,44 +176,44 @@ class Database:
         ]
 
         async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                # Step 1: Attempt to create all tables (will skip if IF NOT EXISTS applies)
-                for query in schema_queries:
-                    try:
-                        await conn.execute(query)
-                    except DuplicateTableError:
-                        pass 
-
-                logger.info("Database: Schema setup complete (initial creation attempts).")
-
-                # Step 2: Ensure initial default messages and stats keys exist
+            # Step 1: Attempt to create all tables (will skip if IF NOT EXISTS applies)
+            for query in schema_queries:
                 try:
-                    await self._insert_default_messages(conn)
-                except UndefinedColumnError as e:
-                    # CRITICAL FIX: Handle schema corruption for 'messages' table
-                    if 'column "key" of relation "messages" does not exist' in str(e):
-                        logger.warning("Database: messages table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
-                        
-                        # 2a. Drop the existing corrupted table
-                        await conn.execute("DROP TABLE IF EXISTS messages;")
-                        
-                        # 2b. Re-run the creation query specifically for messages (without IF NOT EXISTS)
-                        await conn.execute("""
-                            CREATE TABLE messages (
-                                key VARCHAR(10) PRIMARY KEY,
-                                text TEXT NOT NULL,
-                                image_id VARCHAR(255) NULL
-                            );
-                        """)
-                        
-                        # 2c. Try inserting defaults again
-                        await self._insert_default_messages(conn) 
-                        logger.info("Database: messages table successfully reset and populated.")
-                    else:
-                        raise # Re-raise if it's another UndefinedColumnError
-                
-                # Step 3: Ensure stats are initialized
-                await self._insert_default_stats(conn)
+                    await conn.execute(query)
+                except DuplicateTableError:
+                    pass 
+
+            logger.info("Database: Schema setup complete (initial creation attempts).")
+
+            # Step 2: Ensure initial default messages and stats keys exist
+            try:
+                await self._insert_default_messages(conn)
+            except UndefinedColumnError as e:
+                # CRITICAL FIX: Handle schema corruption for 'messages' table
+                if 'column "key" of relation "messages" does not exist' in str(e):
+                    logger.warning("Database: messages table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
+                    
+                    # 2a. Drop the existing corrupted table (runs in autocommit mode)
+                    await conn.execute("DROP TABLE IF EXISTS messages;")
+                    
+                    # 2b. Re-run the creation query (runs in autocommit mode)
+                    await conn.execute("""
+                        CREATE TABLE messages (
+                            key VARCHAR(10) PRIMARY KEY,
+                            text TEXT NOT NULL,
+                            image_id VARCHAR(255) NULL
+                        );
+                    """)
+                    
+                    # 2c. Try inserting defaults again (runs successfully now)
+                    await self._insert_default_messages(conn) 
+                    logger.info("Database: messages table successfully reset and populated.")
+                else:
+                    raise # Re-raise if it's another UndefinedColumnError
+            
+            # Step 3: Ensure stats are initialized
+            await self._insert_default_stats(conn)
+
 
     async def _insert_default_messages(self, conn):
         """Inserts default start/help messages if not already present (3. /start, 4. /help)."""
@@ -230,7 +236,9 @@ class Database:
             INSERT INTO statistics (key, value) VALUES ($1, $2)
             ON CONFLICT (key) DO UPDATE SET value = statistics.value + EXCLUDED.value;
             """
-            await conn.execute(query, key, 0) # Use 0 here for initial insertion
+            # Note: We use 0 for the initial insertion or when updating via conflict, 
+            # ensuring the key exists without changing the value if it already does.
+            await conn.execute(query, key, 0) 
         logger.debug("Database: Default statistics keys ensured.")
 
     # --- USER METHODS ---
