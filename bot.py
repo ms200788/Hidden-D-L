@@ -8,11 +8,13 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX 1 (Previous): Corrected filter registration syntax.                      #
-#  FIX 2 (Previous): Added schema integrity check for 'messages' table.         #
-#  FIX 3 (Current): Removed outer transaction block in setup_schema. This       #
-#       prevents the "aborted transaction" error when schema repair is needed   #
-#       by allowing DDL/recovery commands to run in autocommit mode.            #
+#  FIX 1 (Previous): Corrected filter registration syntax.                      
+#  FIX 2 (Previous): Removed outer transaction block in setup_schema.           
+#  FIX 3 (Current): Added schema repair logic for the corrupted 'statistics'    
+#       table to prevent startup failures.                                     
+#  FIX 4 (Current): Refactored webhook setup in main() and on_startup() to      
+#       integrate the /health endpoint correctly by explicitly passing the      
+#       aiohttp app to the executor, resolving the AttributeError.               
 ################################################################################
 """
 
@@ -31,14 +33,12 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher.middlewares import BaseMiddleware 
-# CRITICAL FIX: Import CallbackData from its correct utility location
 from aiogram.utils.callback_data import CallbackData 
 from aiogram.utils.deep_linking import get_start_link
 from aiogram.utils.executor import start_webhook, start_polling
 
 # --- EXTERNAL DEPENDENCY (ASYNCPG for PostgreSQL) ---
 import asyncpg
-# FIX: Import UndefinedColumnError to specifically catch schema corruption
 from asyncpg.exceptions import UniqueViolationError, DuplicateTableError, UndefinedColumnError
 
 # --- CONFIGURATION AND ENVIRONMENT SETUP ---
@@ -69,7 +69,6 @@ MAX_AUTO_DELETE_MINUTES = 10080
 # Check for critical configuration
 if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
     logger.error("CRITICAL: One or more essential environment variables are missing (BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID). Exiting.")
-    # In a real setup, this would exit immediately
     # exit(1)
 
 
@@ -78,7 +77,6 @@ if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
 class Database:
     """
     Manages the connection pool and all CRUD operations for the PostgreSQL database (Neon).
-    Uses asyncpg for high-performance, non-blocking I/O, guaranteeing reliability.
     """
     def __init__(self, dsn):
         self.dsn = dsn
@@ -98,7 +96,7 @@ class Database:
             logger.info("Database: Connection pool established successfully.")
             await self.setup_schema()
         except Exception as e:
-            logger.critical(f"Database: Failed to connect or set up schema: {e}")
+            logger.critical(f"Database connection failed during startup: {e}")
             raise
 
     async def close(self):
@@ -129,17 +127,12 @@ class Database:
 
     async def setup_schema(self):
         """
-        Sets up all necessary tables if they do not already exist, and performs 
-        a reliable check to ensure the 'messages' table schema is correct.
-        
-        FIX: Removed the outer conn.transaction() block. DDL commands run in 
-        autocommit mode, preventing the entire connection from being aborted
-        if a schema integrity check fails, allowing the recovery logic (DROP/CREATE)
-        to execute successfully.
+        Sets up all necessary tables and performs reliable checks to ensure
+        the schema is correct, implementing repair logic for common corruption.
         """
         logger.info("Database: Checking/setting up schema...")
         schema_queries = [
-            # 1. Users Table: (11. DATABASE - Users) Tracks user activity and join dates.
+            # 1. Users Table
             """
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -147,7 +140,7 @@ class Database:
                 last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 2. Messages Table: (11. DATABASE - Messages) Stores customizable /start and /help content.
+            # 2. Messages Table
             """
             CREATE TABLE IF NOT EXISTS messages (
                 key VARCHAR(10) PRIMARY KEY, -- 'start' or 'help'
@@ -155,7 +148,7 @@ class Database:
                 image_id VARCHAR(255) NULL
             );
             """,
-            # 3. Upload Sessions Table: (11. DATABASE - Upload sessions) Stores all file metadata for deep-link access.
+            # 3. Upload Sessions Table
             """
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id VARCHAR(50) PRIMARY KEY,
@@ -166,7 +159,7 @@ class Database:
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             """,
-            # 4. Statistics Table: (11. DATABASE - Statistics) Simple key/value store for global counters.
+            # 4. Statistics Table
             """
             CREATE TABLE IF NOT EXISTS statistics (
                 key VARCHAR(50) PRIMARY KEY,
@@ -176,27 +169,24 @@ class Database:
         ]
 
         async with self._pool.acquire() as conn:
-            # Step 1: Attempt to create all tables (will skip if IF NOT EXISTS applies)
+            # Step 1: Attempt to create all tables
             for query in schema_queries:
                 try:
+                    # Execute DDL in autocommit mode
                     await conn.execute(query)
                 except DuplicateTableError:
                     pass 
 
             logger.info("Database: Schema setup complete (initial creation attempts).")
 
-            # Step 2: Ensure initial default messages and stats keys exist
+            # Step 2: Ensure initial default messages exist and fix corruption if found
             try:
                 await self._insert_default_messages(conn)
             except UndefinedColumnError as e:
-                # CRITICAL FIX: Handle schema corruption for 'messages' table
+                # Fix for corrupted 'messages' table
                 if 'column "key" of relation "messages" does not exist' in str(e):
                     logger.warning("Database: messages table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
-                    
-                    # 2a. Drop the existing corrupted table (runs in autocommit mode)
                     await conn.execute("DROP TABLE IF EXISTS messages;")
-                    
-                    # 2b. Re-run the creation query (runs in autocommit mode)
                     await conn.execute("""
                         CREATE TABLE messages (
                             key VARCHAR(10) PRIMARY KEY,
@@ -204,19 +194,33 @@ class Database:
                             image_id VARCHAR(255) NULL
                         );
                     """)
-                    
-                    # 2c. Try inserting defaults again (runs successfully now)
                     await self._insert_default_messages(conn) 
                     logger.info("Database: messages table successfully reset and populated.")
                 else:
+                    raise 
+
+            # Step 3: Ensure stats are initialized and fix corruption if found
+            try:
+                await self._insert_default_stats(conn)
+            except UndefinedColumnError as e:
+                # NEW FIX: Fix for corrupted 'statistics' table
+                if 'column "key" of relation "statistics" does not exist' in str(e):
+                    logger.warning("Database: statistics table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
+                    await conn.execute("DROP TABLE IF EXISTS statistics;")
+                    await conn.execute("""
+                        CREATE TABLE statistics (
+                            key VARCHAR(50) PRIMARY KEY,
+                            value BIGINT DEFAULT 0
+                        );
+                    """)
+                    await self._insert_default_stats(conn) 
+                    logger.info("Database: statistics table successfully reset and populated.")
+                else:
                     raise # Re-raise if it's another UndefinedColumnError
-            
-            # Step 3: Ensure stats are initialized
-            await self._insert_default_stats(conn)
 
 
     async def _insert_default_messages(self, conn):
-        """Inserts default start/help messages if not already present (3. /start, 4. /help)."""
+        """Inserts default start/help messages if not already present."""
         default_start = "👋 Welcome to the Deep-Link File Bot! I securely deliver files via unique links. Reliability is guaranteed by my Neon database persistence."
         default_help = "📚 Help: Only the owner has upload access. Files are permanent storage in a private channel (12. UPLOAD CHANNEL). Access is granted via unique deep links. Use /start to go to the welcome message."
 
@@ -229,15 +233,13 @@ class Database:
         logger.debug("Database: Default messages ensured.")
 
     async def _insert_default_stats(self, conn):
-        """Inserts default statistics keys if not already present (8. /stats)."""
+        """Inserts default statistics keys if not already present."""
         default_keys = ['total_sessions', 'files_uploaded']
         for key in default_keys:
             query = """
             INSERT INTO statistics (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE SET value = statistics.value + EXCLUDED.value;
+            ON CONFLICT (key) DO NOTHING;
             """
-            # Note: We use 0 for the initial insertion or when updating via conflict, 
-            # ensuring the key exists without changing the value if it already does.
             await conn.execute(query, key, 0) 
         logger.debug("Database: Default statistics keys ensured.")
 
@@ -313,7 +315,7 @@ class Database:
         """Increments a statistic counter."""
         query = """
         INSERT INTO statistics (key, value) VALUES ($1, $2)
-        ON CONFLICT (key) DO UPDATE SET value = statistics.value + EXCLUDED.value;
+        ON CONFLICT (key) DO UPDATE SET value = statistics.value + $2;
         """
         await self.execute(query, key, amount)
 
@@ -352,19 +354,17 @@ def is_owner_filter(message: types.Message):
     return message.from_user.id == OWNER_ID
 
 
-# --- MIDDLEWARE CLASS (FIXED: 317) ---
+# --- MIDDLEWARE CLASS ---
 
 class UserActivityMiddleware(BaseMiddleware):
     """
     Middleware to ensure every interaction updates the user's last_active time
-    and creates a user record if one doesn't exist. This is the reliable aiogram v2
-    way to implement a global pre-processor.
+    and creates a user record if one doesn't exist.
     """
     def __init__(self, db_manager):
         super().__init__()
         self.db = db_manager
 
-    # The correct method for pre-processing the update object in aiogram v2
     async def on_pre_process_update(self, update: types.Update, data: dict):
         """Executed before any handlers or filters."""
         user_id = None
@@ -380,7 +380,7 @@ class UserActivityMiddleware(BaseMiddleware):
             asyncio.create_task(self.db.get_or_create_user(user_id))
             data['user_id'] = user_id
 
-# --- MIDDLEWARE SETUP (CORRECTED) ---
+# --- MIDDLEWARE SETUP ---
 # Apply the middleware globally before starting the bot
 dp.middleware.setup(UserActivityMiddleware(db_manager))
 
@@ -395,17 +395,11 @@ class UploadFSM(StatesGroup):
 
 # --- CALLBACK DATA ---
 
-# CRITICAL FIX: Use the functional definition of CallbackData
-# This avoids the TypeError: __init_subclass__() takes no keyword arguments
 ImageTypeCallback = CallbackData("img_type", "key")
-
-# CRITICAL FIX: Use the functional definition of CallbackData
-# This avoids the TypeError: __init_subclass__() takes no keyword arguments
 ProtectionCallback = CallbackData("prot", "is_protected")
 
 # --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
 
-# FIX APPLIED HERE: Changed filter to positional argument (retained from last change)
 @dp.message_handler(is_owner_filter, commands=['start', 'help']) 
 async def cmd_owner_start_help(message: types.Message):
     """Owner's /start and /help (full access to all commands)."""
@@ -789,7 +783,7 @@ async def cmd_stats(message: types.Message):
             f"💾 **Uploads & Files**\n"
             f"• Total Upload Sessions: `{total_sessions:,}`\n"
             f"• Total Files Uploaded: `{files_uploaded:,}`\n\n"
-            f"Note: Stats are reliably pulled from the Neon database (8. /stats)."
+            "Note: Stats are reliably pulled from the Neon database (8. /stats)."
         )
         
         await message.answer(stats_report, parse_mode=types.ParseMode.MARKDOWN)
@@ -1021,54 +1015,26 @@ async def on_startup(dp):
         await db_manager.connect()
     except Exception as e:
         logger.critical(f"Database connection failed during startup: {e}")
-        # We rely on the Render environment to handle the crash/restart after a CRITICAL failure
-        # exit(2) 
+        # Rely on the host environment to handle the crash/restart
+        raise 
         
-    # 2. Webhook Setup (16. WEBHOOK ONLY)
+    # 2. Webhook Setup
     if WEBHOOK_URL:
+        # Note: Webhook is set here to ensure the latest URL is used if it changes
         try:
             webhook_info = await dp.bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-                # The 'drop_pending_updates=True' ensures a clean start
                 await dp.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
             else:
                 logger.info("Webhook already set correctly.")
         except Exception as e:
             logger.critical(f"Failed to set webhook: {e}")
-            # exit(3) # Uncomment for strict production environment
 
     # 3. Final Check and confirmation
     me = await dp.bot.get_me()
     logger.info(f"Bot '{me.username}' is ready. Owner ID: {OWNER_ID}. Channel ID: {UPLOAD_CHANNEL_ID}.")
 
-    # --- KEEP-ALIVE: Start the simple HTTP server for /health endpoint (15. HEALTHCHECK ENDPOINT) ---
-    if WEBHOOK_URL:
-        # Import aiohttp dynamically only when in webhook mode
-        from aiohttp import web
-        
-        async def health_handler(request):
-            """Returns 'ok' for UptimeRobot pings."""
-            return web.Response(text="ok")
-
-        app = web.Application()
-        app.router.add_get('/health', health_handler) # 15. HEALTHCHECK ENDPOINT
-        
-        # Add the Telegram webhook handler
-        app.router.add_post(WEBHOOK_PATH, dp.web_app.handle_request)
-        
-        # Configure and start the web server runner
-        dp['web_app'] = app
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', HEALTHCHECK_PORT)
-        
-        # Start the background task to serve the HTTP requests
-        dp['runner'] = runner
-        dp['site'] = site
-        asyncio.create_task(site.start())
-        logger.info(f"Healthcheck and Webhook server started on port {HEALTHCHECK_PORT}.")
-    
     logger.info("Bot startup completed successfully.")
 
 
@@ -1084,10 +1050,7 @@ async def on_shutdown(dp):
         logger.info("Clearing webhook...")
         await dp.bot.delete_webhook()
 
-    # 3. Stop Aiohttp Runner
-    if 'runner' in dp:
-        logger.info("Stopping web server runner...")
-        await dp['runner'].cleanup()
+    # 3. Stop Aiohttp Runner (Handled by executor since we pass 'app')
         
     await dp.storage.close()
     await dp.storage.wait_closed()
@@ -1101,7 +1064,18 @@ def main():
     is_webhook_mode = bool(WEBHOOK_URL)
     
     if is_webhook_mode:
-        # 16. WEBHOOK ONLY: Use start_webhook executor
+        # NEW FIX: Import aiohttp and create the app here to register the healthcheck route
+        from aiohttp import web
+
+        async def health_handler(request):
+            """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
+            return web.Response(text="ok")
+
+        # Create the aiohttp application instance
+        app = web.Application()
+        # Register the custom /health route onto our app
+        app.router.add_get('/health', health_handler)
+
         logger.info("Starting bot in Webhook Mode (Render Hosting).")
         
         executor.start_webhook(
@@ -1112,6 +1086,7 @@ def main():
             skip_updates=True,
             host='0.0.0.0',
             port=HEALTHCHECK_PORT, # aiogram listens on this port
+            web_app=app # CRITICAL: Pass the custom app to the executor
         )
     else:
         # Polling fallback (disabled per request but useful for local testing)
@@ -1133,5 +1108,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.critical(f"An unhandled error occurred in main execution: {e}")
         time.sleep(1) # Pause before final exit
-
-# --- END OF FILE ---
