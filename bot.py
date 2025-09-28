@@ -8,7 +8,8 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  Total Lines of Code: 1000+ (Including extensive comments and documentation)  #
+#  FIX: Refactored user activity update into a stable BaseMiddleware class      #
+#       to resolve the 'pre_process' AttributeError.                           #
 ################################################################################
 """
 
@@ -26,12 +27,12 @@ from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+# NEW IMPORT: Necessary for robust middleware implementation
+from aiogram.dispatcher.middlewares import BaseMiddleware 
 from aiogram.utils.deep_linking import get_start_link
 from aiogram.utils.executor import start_webhook, start_polling
 
 # --- EXTERNAL DEPENDENCY (ASYNCPG for PostgreSQL) ---
-# Note: For maximum reliability and native async operation, asyncpg is preferred
-# over older wrappers like aiopg.
 import asyncpg
 from asyncpg.exceptions import UniqueViolationError, DuplicateTableError
 
@@ -196,10 +197,10 @@ class Database:
         default_keys = ['total_sessions', 'files_uploaded']
         for key in default_keys:
             query = """
-            INSERT INTO statistics (key, value) VALUES ($1, 0)
-            ON CONFLICT (key) DO NOTHING;
+            INSERT INTO statistics (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = statistics.value + EXCLUDED.value;
             """
-            await conn.execute(query, key)
+            await conn.execute(query, key, 0) # Use 0 here for initial insertion
         logger.debug("Database: Default statistics keys ensured.")
 
     # --- USER METHODS ---
@@ -312,24 +313,38 @@ def is_owner_filter(message: types.Message):
     """Filter to check if the user is the bot owner (defined by OWNER_ID)."""
     return message.from_user.id == OWNER_ID
 
-# --- MIDDLEWARE/HOOKS ---
 
-@dp.middleware.pre_process(update=types.Update)
-async def update_user_activity(update: types.Update, data: dict):
+# --- MIDDLEWARE CLASS (FIXED: 317) ---
+
+class UserActivityMiddleware(BaseMiddleware):
     """
     Middleware to ensure every interaction updates the user's last_active time
-    and creates a user record if one doesn't exist. This ensures reliability for /stats.
+    and creates a user record if one doesn't exist. This is the reliable aiogram v2
+    way to implement a global pre-processor.
     """
-    if update.message:
-        user_id = update.message.from_user.id
-    elif update.callback_query:
-        user_id = update.callback_query.from_user.id
-    else:
-        return # Ignore non-message/callback updates
+    def __init__(self, db_manager):
+        super().__init__()
+        self.db = db_manager
 
-    # Non-blocking update to avoid delaying user response
-    asyncio.create_task(db_manager.get_or_create_user(user_id))
-    data['user_id'] = user_id
+    # The correct method for pre-processing the update object in aiogram v2
+    async def on_pre_process_update(self, update: types.Update, data: dict):
+        """Executed before any handlers or filters."""
+        user_id = None
+        if update.message:
+            user_id = update.message.from_user.id
+        elif update.callback_query:
+            user_id = update.callback_query.from_user.id
+        else:
+            return # Ignore non-message/callback updates
+
+        if user_id:
+            # Non-blocking update to avoid delaying user response
+            asyncio.create_task(self.db.get_or_create_user(user_id))
+            data['user_id'] = user_id
+
+# --- MIDDLEWARE SETUP (CORRECTED) ---
+# Apply the middleware globally before starting the bot
+dp.middleware.setup(UserActivityMiddleware(db_manager))
 
 
 # --- FSM FOR UPLOAD PROCESS (9. /upload Multi-Step Flow) ---
@@ -447,14 +462,15 @@ async def handle_deep_link(message: types.Message, session_id: str):
 
     if send_protected:
         # Owner Bypass: Protect Content ignored (can forward/save)
-        info_message += "\n\n⚠️ **Content is Protected**\. Forwarding and saving are disabled\."
+        # Note: MarkdownV2 requires escaping periods
+        info_message += "\n\n⚠️ **Content is Protected**\\. Forwarding and saving are disabled\\."
     
     # Auto-delete not applied to owner (14. OWNER BYPASS)
     if auto_delete_minutes > 0 and not is_owner_access:
         delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
         delete_time_str = delete_time.strftime("%H:%M:%S on %Y-%m-%d UTC")
         # 13. AUTO DELETE LOGIC: Only user’s chat is cleaned
-        info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\."
+        info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\\."
 
     # Use a direct response without parse_mode if no Markdown is needed to avoid escaping issues
     await message.answer(info_message, parse_mode=parse_mode)
@@ -480,20 +496,28 @@ async def handle_deep_link(message: types.Message, session_id: str):
                 send_method = bot.send_audio
             else:
                 logger.warning(f"Unhandled file type '{file_type}' for session {session_id}")
-                send_method = bot.send_document
+                send_method = bot.send_document # Default to document
 
             # Execute the send command
-            sent_msg = await send_method(
-                chat_id=user_id,
-                caption=caption,
-                # Pass file_id to the correct argument
-                photo=file_id if file_type == 'photo' else None,
-                video=file_id if file_type == 'video' else None,
-                document=file_id if file_type == 'document' else None,
-                audio=file_id if file_type == 'audio' else None,
-                disable_notification=True,
-                protect_content=send_protected
-            )
+            # Prepare arguments dynamically based on file type
+            send_kwargs = {
+                'chat_id': user_id,
+                'caption': caption,
+                'disable_notification': True,
+                'protect_content': send_protected
+            }
+            if file_type == 'photo':
+                send_kwargs['photo'] = file_id
+            elif file_type == 'video':
+                send_kwargs['video'] = file_id
+            elif file_type == 'document':
+                send_kwargs['document'] = file_id
+            elif file_type == 'audio':
+                send_kwargs['audio'] = file_id
+            else:
+                send_kwargs['document'] = file_id # Fallback
+
+            sent_msg = await send_method(**send_kwargs)
             sent_message_ids.append(sent_msg.message_id)
             await asyncio.sleep(0.5) # Throttle to prevent flooding/API limits
 
@@ -845,7 +869,13 @@ async def cmd_upload_step1_collect_files(message: types.Message, state: FSMConte
                  final_file_id = sent_msg.audio.file_id
             
             if not final_file_id:
-                raise Exception("Failed to get file_id from channel message after copy.")
+                # Fallback check, sometimes document/video is directly available without index
+                if not final_file_id and sent_msg.document and sent_msg.document.file_id:
+                     final_file_id = sent_msg.document.file_id
+                elif not final_file_id and sent_msg.video and sent_msg.video.file_id:
+                     final_file_id = sent_msg.video.file_id
+                else:
+                    raise Exception("Failed to get file_id from channel message after copy.")
 
             # Append the stored file data
             new_file_data = {
@@ -960,7 +990,8 @@ async def on_startup(dp):
             webhook_info = await dp.bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-                await dp.bot.set_webhook(WEBHOOK_URL)
+                # The 'drop_pending_updates=True' ensures a clean start
+                await dp.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
             else:
                 logger.info("Webhook already set correctly.")
         except Exception as e:
@@ -973,6 +1004,7 @@ async def on_startup(dp):
 
     # --- KEEP-ALIVE: Start the simple HTTP server for /health endpoint (15. HEALTHCHECK ENDPOINT) ---
     if WEBHOOK_URL:
+        # Import aiohttp dynamically only when in webhook mode
         from aiohttp import web
         
         async def health_handler(request):
