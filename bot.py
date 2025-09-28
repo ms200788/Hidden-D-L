@@ -8,8 +8,8 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX: Refactored user activity update into a stable BaseMiddleware class      #
-#       to resolve the 'pre_process' AttributeError.                           #
+#  FIX: Imported 'CallbackData' from 'aiogram.utils.callback_data' to resolve   #
+#       'AttributeError: module 'aiogram.types' has no attribute 'CallbackData''.
 ################################################################################
 """
 
@@ -27,8 +27,9 @@ from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-# NEW IMPORT: Necessary for robust middleware implementation
 from aiogram.dispatcher.middlewares import BaseMiddleware 
+# CRITICAL FIX: Import CallbackData from its correct utility location
+from aiogram.utils.callback_data import CallbackData 
 from aiogram.utils.deep_linking import get_start_link
 from aiogram.utils.executor import start_webhook, start_polling
 
@@ -358,11 +359,13 @@ class UploadFSM(StatesGroup):
 # --- CALLBACK DATA ---
 
 # Callback data for setting image type (5. /setimage)
-class ImageTypeCallback(types.CallbackData, prefix="img_type"):
+# FIX: Use the correctly imported CallbackData class
+class ImageTypeCallback(CallbackData, prefix="img_type"):
     key: str # 'start' or 'help'
 
 # Callback data for protection confirmation (9. Step 5)
-class ProtectionCallback(types.CallbackData, prefix="prot"):
+# FIX: Use the correctly imported CallbackData class
+class ProtectionCallback(CallbackData, prefix="prot"):
     is_protected: str # 'yes' or 'no'
 
 # --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
