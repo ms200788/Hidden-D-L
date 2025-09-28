@@ -8,13 +8,11 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX 1 (Previous): Corrected filter registration syntax.                      
-#  FIX 2 (Previous): Removed outer transaction block in setup_schema.           
-#  FIX 3 (Current): Added schema repair logic for the corrupted 'statistics'    
-#       table to prevent startup failures.                                     
-#  FIX 4 (Current): Refactored webhook setup in main() and on_startup() to      
-#       integrate the /health endpoint correctly by explicitly passing the      
-#       aiohttp app to the executor, resolving the AttributeError.               
+#  FIX 1-3 (Previous): Database schema repair and initial setup.                
+#  FIX 4 (Current): Refactored webhook setup by removing the conflicting        
+#       `web_app` argument from `executor.start_webhook` and injecting the      
+#       `/health` endpoint via the `dp.on_startup` signal handler, resolving    
+#       the "unexpected keyword argument 'web_app'" error.                      
 ################################################################################
 """
 
@@ -40,6 +38,10 @@ from aiogram.utils.executor import start_webhook, start_polling
 # --- EXTERNAL DEPENDENCY (ASYNCPG for PostgreSQL) ---
 import asyncpg
 from asyncpg.exceptions import UniqueViolationError, DuplicateTableError, UndefinedColumnError
+
+# --- AIOHTTP IMPORTS (CRITICAL for Webhook Fix) ---
+import aiohttp
+from aiohttp import web # Used for the healthcheck response and application type
 
 # --- CONFIGURATION AND ENVIRONMENT SETUP ---
 
@@ -596,415 +598,21 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
         logger.error(f"CRITICAL: Error during scheduled deletion for chat {chat_id}: {e}")
 
 
-# --- HANDLERS: OWNER CUSTOMIZATION COMMANDS (5. /setimage, 6. /setmessage) ---
-
-@dp.message_handler(is_owner_filter, commands=['setmessage'])
-async def cmd_setmessage_step1(message: types.Message):
-    """Owner command to initiate setting new start/help text."""
-    await message.answer(
-        "📝 **Set Message Text**\n\nWhich message do you want to set? Select an option below and then reply to my next message with the *new text*."
-        "The text will be saved to the database for persistence (6. /setmessage).",
-        reply_markup=types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [types.InlineKeyboardButton("Start Message (3. /start)", callback_data="setmsg:start")],
-                [types.InlineKeyboardButton("Help Message (4. /help)", callback_data="setmsg:help")]
-            ]
-        )
-    )
-
-@dp.callback_query_handler(is_owner_filter, lambda c: c.data.startswith('setmsg:'))
-async def cmd_setmessage_step2(call: types.CallbackQuery, state: FSMContext):
-    """Owner selects which message key to set and enters a temporary state."""
-    await call.answer()
-    key = call.data.split(':')[1]
-    
-    # Store the key in FSM context
-    await state.update_data(message_key=key)
-    
-    # Enter a temporary state to wait for the reply
-    await call.message.edit_text(
-        f"You chose: **{key.capitalize()} Message**.\n\nNow, send me the *full text* you want to use for this message."
-    )
-    await state.set_state("waiting_for_new_message_text")
-
-
-@dp.message_handler(is_owner_filter, state="waiting_for_new_message_text", content_types=types.ContentTypes.TEXT)
-async def cmd_setmessage_step3_process(message: types.Message, state: FSMContext):
-    """Owner sends the new text, which is saved to the database (6. /setmessage)."""
-    data = await state.get_data()
-    key = data.get('message_key')
-    new_text = message.text.strip()
-    
-    if key and new_text:
-        await db_manager.set_message_text(key, new_text)
-        await message.answer(f"✅ Success! The **{key.capitalize()}** message text has been reliably updated in the database.")
-    else:
-        await message.answer("❌ Error: Missing key or empty text. Please try `/setmessage` again.")
-
-    await state.finish()
-
-
-@dp.message_handler(is_owner_filter, commands=['setimage'], content_types=types.ContentTypes.ANY)
-async def cmd_setimage_step1(message: types.Message):
-    """Owner replies to an image with /setimage to start the flow (5. /setimage)."""
-    if not message.reply_to_message:
-        await message.answer("❌ Error: You must use `/setimage` as a **reply** to an image, video, or document (5. /setimage).")
-        return
-
-    reply = message.reply_to_message
-    file_id = None
-    
-    # Reliably extract file_id from different media types
-    if reply.photo:
-        file_id = reply.photo[-1].file_id
-    elif reply.video:
-        file_id = reply.video.file_id
-    elif reply.document:
-        file_id = reply.document.file_id
-    
-    if not file_id:
-        await message.answer("❌ Error: The message you replied to does not contain a usable photo, video, or document file.")
-        return
-
-    # Save file_id to FSM and ask for type
-    await dp.current_state().update_data(image_file_id=file_id)
-    
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton("Start Image (3. /start)", callback_data=ImageTypeCallback.new(key='start'))],
-            [types.InlineKeyboardButton("Help Image (4. /help)", callback_data=ImageTypeCallback.new(key='help'))]
-        ]
-    )
-    
-    await message.answer("🖼️ **Set Image**\n\nWhich message should use this image? (5. /setimage)", reply_markup=keyboard)
-
-
-@dp.callback_query_handler(is_owner_filter, ImageTypeCallback.filter())
-async def cmd_setimage_step2_process(call: types.CallbackQuery, callback_data: dict, state: FSMContext):
-    """Owner selects the message type and the image's file_id is saved to the DB."""
-    await call.answer()
-    data = await state.get_data()
-    file_id = data.get('image_file_id')
-    key = callback_data['key']
-
-    if not file_id:
-        await call.message.edit_text("❌ Error: The file ID was lost. Please use `/setimage` again by replying to the media.")
-        await state.finish()
-        return
-
-    # Save file_id to DB for persistence
-    await db_manager.set_message_image(key, file_id)
-
-    await call.message.edit_text(f"✅ Success! The new image has been reliably saved as the **{key.capitalize()}** message media.")
-    await state.finish()
-
-
-# --- HANDLERS: OWNER BROADCAST COMMAND (7. /broadcast) ---
-
-@dp.message_handler(is_owner_filter, commands=['broadcast'])
-async def cmd_broadcast_step1(message: types.Message):
-    """Owner initiates the broadcast process (7. /broadcast)."""
-    await dp.current_state().set_state("waiting_for_broadcast_message")
-    await message.answer("📣 **Broadcast Initiated**\n\nSend me the message (text or media with caption) that you want to broadcast to ALL users. I will **copy** the message (no forward tag, 7. /broadcast).")
-
-
-@dp.message_handler(is_owner_filter, state="waiting_for_broadcast_message", content_types=types.ContentTypes.ANY)
-async def cmd_broadcast_step2_execute(message: types.Message, state: FSMContext):
-    """Owner sends the message, and the reliable broadcast is executed."""
-    await state.finish()
-    await message.answer("⏳ Broadcast is starting... This may take a while for large user bases.")
-    
-    # Get all user IDs (reliable, direct query)
-    user_ids_records = await db_manager.fetch("SELECT id FROM users;")
-    target_users = [user['id'] for user in user_ids_records]
-    
-    success_count = 0
-    fail_count = 0
-
-    source_chat_id = message.chat.id
-    source_message_id = message.message_id
-
-    # Execute the broadcast asynchronously
-    for user_id in target_users:
-        if user_id == OWNER_ID: # Skip owner
-            continue
-
-        try:
-            # Use copy_message for reliable, non-forwarded message delivery (7. /broadcast)
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=source_chat_id,
-                message_id=source_message_id,
-                disable_notification=True
-            )
-            success_count += 1
-        except Exception as e:
-            # Handle user blocking gracefully
-            if 'bot was blocked by the user' in str(e) or 'user is deactivated' in str(e):
-                logger.warning(f"User {user_id} blocked bot, skipping.")
-            else:
-                logger.error(f"Failed to send broadcast to user {user_id}: {e}")
-            fail_count += 1
-
-        await asyncio.sleep(0.05) # Throttle to respect Telegram API limits
-
-    # Final report to the owner
-    await bot.send_message(
-        OWNER_ID,
-        f"✅ **Broadcast Completed**\n\n"
-        f"👥 Total Users Targeted: {len(target_users)}\n"
-        f"🟢 Successful Deliveries: {success_count}\n"
-        f"🔴 Failed Deliveries (Blocked/Error): {fail_count}"
-    )
-
-
-# --- HANDLERS: OWNER STATS COMMAND (8. /stats) ---
-
-@dp.message_handler(is_owner_filter, commands=['stats'])
-async def cmd_stats(message: types.Message):
-    """Owner command to display real-time usage statistics."""
-    await message.answer("📊 **Fetching Real-Time Statistics...**")
-
-    try:
-        stats = await db_manager.get_all_stats()
-        
-        # Data is reliably fetched from DB methods
-        total_users = stats.get('total_users', 0)
-        active_users = stats.get('active_users', 0)
-        files_uploaded = stats.get('files_uploaded', 0)
-        total_sessions = stats.get('total_sessions', 0)
-        
-        # Prepare the reliable, formatted output (8. /stats)
-        stats_report = (
-            "📈 **Bot Usage & Reliability Statistics**\n\n"
-            f"👤 **Users**\n"
-            f"• Total Users Registered: `{total_users:,}`\n"
-            f"• Active Users (last 48h): `{active_users:,}`\n\n"
-            f"💾 **Uploads & Files**\n"
-            f"• Total Upload Sessions: `{total_sessions:,}`\n"
-            f"• Total Files Uploaded: `{files_uploaded:,}`\n\n"
-            "Note: Stats are reliably pulled from the Neon database (8. /stats)."
-        )
-        
-        await message.answer(stats_report, parse_mode=types.ParseMode.MARKDOWN)
-
-    except Exception as e:
-        logger.error(f"Error fetching statistics: {e}")
-        await message.answer("❌ CRITICAL: Failed to retrieve statistics from the database. Check connection.")
-
-
-# --- HANDLERS: OWNER UPLOAD FLOW (9. /upload Multi-Step Flow) ---
-
-@dp.message_handler(is_owner_filter, commands=['upload'])
-async def cmd_upload_step1(message: types.Message, state: FSMContext):
-    """9. Step 1: Owner runs /upload. Initialize session data and request files."""
-    if await state.get_state() is not None:
-         await state.finish()
-
-    # Initialize a clean data structure for the session
-    await state.update_data(
-        files=[],
-        is_protected=False,
-        auto_delete_minutes=0
-    )
-
-    await UploadFSM.waiting_for_files.set()
-    await message.answer(
-        "📂 **Upload Session Started**\n\n"
-        "**Step 1/3: Send Files**\n"
-        "Send me any documents, photos, or videos you want to link (9. Step 3). "
-        "When finished, send: `/d` (Done) or `/c` (Cancel) (9. Step 4)."
-    )
-
-
-@dp.message_handler(is_owner_filter, commands=['d', 'c'], state=UploadFSM.waiting_for_files)
-async def cmd_upload_step2_control(message: types.Message, state: FSMContext):
-    """9. Step 4: Owner sends /d (done) or /c (cancel) to control the file collection."""
-    command = message.get_command()
-    data = await state.get_data()
-    files_collected = data.get('files', [])
-
-    if command == '/c':
-        await state.finish()
-        await message.answer("❌ Upload session cancelled. No files were saved.")
-        return
-
-    # Process /d (Done)
-    if not files_collected:
-        await message.answer("⚠️ You must send at least one file before sending `/d`.")
-        return
-
-    # Proceed to protection settings (9. Step 5)
-    await UploadFSM.waiting_for_protection.set()
-
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton("🔒 Yes, Protect Content", callback_data=ProtectionCallback.new(is_protected='yes'))],
-            [types.InlineKeyboardButton("🔓 No, Allow Saving/Forwarding", callback_data=ProtectionCallback.new(is_protected='no'))]
-        ]
-    )
-
-    await message.answer(
-        f"**Step 2/3: Protection Settings**\n"
-        f"Collected **{len(files_collected)}** file(s).\n\n"
-        "Do you want to enable content protection? (9. Step 5)" ,
-        reply_markup=keyboard
-    )
-
-
-@dp.message_handler(is_owner_filter, state=UploadFSM.waiting_for_files, content_types=types.ContentTypes.ANY)
-async def cmd_upload_step1_collect_files(message: types.Message, state: FSMContext):
-    """9. Step 3: Collects file_ids and captions from incoming media."""
-    file_id = None
-    file_type = None
-
-    # Determine file_id and type reliably
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = 'photo'
-    elif message.video:
-        file_id = message.video.file_id
-        file_type = 'video'
-    elif message.document:
-        file_id = message.document.file_id
-        file_type = 'document'
-    elif message.audio:
-        file_id = message.audio.file_id
-        file_type = 'audio'
-    else:
-        # Ignore non-essential media types/text that is not a command
-        if message.text not in ['/d', '/c']:
-            await message.reply("⚠️ Only documents, photos, or videos are supported. Use `/d` to finish.")
-        return
-
-    if file_id and file_type:
-        caption = message.caption or ""
-        
-        # CRITICAL: Save file to the permanent channel (12. UPLOAD CHANNEL)
-        try:
-            # Copy message to the private channel
-            sent_msg = await bot.copy_message(
-                chat_id=UPLOAD_CHANNEL_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-                disable_notification=True
-            )
-
-            # Extract the new, persistent file_id from the channel message
-            final_file_id = None
-            if sent_msg.photo:
-                 final_file_id = sent_msg.photo[-1].file_id
-            elif sent_msg.video:
-                 final_file_id = sent_msg.video.file_id
-            elif sent_msg.document:
-                 final_file_id = sent_msg.document.file_id
-            elif sent_msg.audio:
-                 final_file_id = sent_msg.audio.file_id
-            
-            if not final_file_id:
-                # Fallback check, sometimes document/video is directly available without index
-                if not final_file_id and sent_msg.document and sent_msg.document.file_id:
-                     final_file_id = sent_msg.document.file_id
-                elif not final_file_id and sent_msg.video and sent_msg.video.file_id:
-                     final_file_id = sent_msg.video.file_id
-                else:
-                    raise Exception("Failed to get file_id from channel message after copy.")
-
-            # Append the stored file data
-            new_file_data = {
-                'file_id': final_file_id,
-                'caption': caption,
-                'type': file_type,
-            }
-
-            async with state.proxy() as data:
-                data['files'].append(new_file_data)
-            
-            await message.reply(f"✅ File **{len(data['files'])}** (`{file_type.capitalize()}`) saved to permanent storage channel.", disable_notification=True)
-
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to copy file to upload channel {UPLOAD_CHANNEL_ID}: {e}")
-            await message.answer("❌ CRITICAL ERROR: Failed to permanently store the file. Check channel ID/permissions.")
-
-
-@dp.callback_query_handler(is_owner_filter, ProtectionCallback.filter(), state=UploadFSM.waiting_for_protection)
-async def cmd_upload_step3_set_protection(call: types.CallbackQuery, callback_data: dict, state: FSMContext):
-    """9. Step 5: Owner sets content protection preference."""
-    await call.answer()
-    
-    is_protected = callback_data['is_protected'] == 'yes'
-    
-    # Save protection setting
-    await state.update_data(is_protected=is_protected)
-    
-    protection_status = "Enabled" if is_protected else "Disabled"
-    
-    # Proceed to auto-delete timer setting
-    await UploadFSM.waiting_for_auto_delete_time.set()
-    
-    await call.message.edit_text(
-        f"**Step 3/3: Auto-Delete Timer**\n"
-        f"Protection Status: **{protection_status}**\n\n"
-        f"Enter the auto-delete time in **minutes** (0–{MAX_AUTO_DELETE_MINUTES}).\n"
-        f"• Send `0` to keep files in the user's chat forever (13. AUTO DELETE LOGIC).\n"
-        f"• Send a number (e.g., `10080` for 7 days) to clean the user's chat automatically."
-    )
-
-
-@dp.message_handler(is_owner_filter, state=UploadFSM.waiting_for_auto_delete_time, content_types=types.ContentTypes.TEXT)
-async def cmd_upload_step4_finalise(message: types.Message, state: FSMContext):
-    """9. Step 6: Owner sets the auto-delete timer and finalises the session."""
-    
-    try:
-        auto_delete_minutes = int(message.text.strip())
-        
-        if not (0 <= auto_delete_minutes <= MAX_AUTO_DELETE_MINUTES):
-            await message.answer(f"❌ Invalid input. Please enter a number between 0 and {MAX_AUTO_DELETE_MINUTES} minutes.")
-            return
-
-        # 1. Retrieve final data
-        final_data = await state.get_data()
-        
-        files = final_data['files']
-        is_protected = final_data['is_protected']
-        
-        # 2. Create reliable DB entry (11. DATABASE)
-        session_id = await db_manager.create_upload_session(
-            owner_id=message.from_user.id,
-            file_data=files,
-            is_protected=is_protected,
-            auto_delete_minutes=auto_delete_minutes
-        )
-
-        # 3. Generate Deep Link (9. Step 6, 10. DEEP LINK ACCESS)
-        deep_link = await get_start_link(session_id, encode=True)
-        
-        # 4. Final summary and success message
-        delete_info = f"Cleanup: **{auto_delete_minutes} minutes**" if auto_delete_minutes > 0 else "**No auto-delete**"
-        
-        final_report = (
-            "🎉 **Upload Session Complete**\n\n"
-            f"🔗 **Deep Link (9. Step 6):**\n"
-            f"`{deep_link}`\n\n"
-            f"🆔 **Session ID:** `{session_id}`\n"
-            f"📦 **Files:** {len(files)} file(s)\n"
-            f"🔒 **Protected:** {'Yes' if is_protected else 'No'}\n"
-            f"⏰ **Auto-Delete:** {delete_info}\n\n"
-            "This link can now be shared. File persistence is guaranteed by the Neon database and permanent upload channel."
-        )
-
-        await message.answer(final_report, parse_mode=types.ParseMode.MARKDOWN)
-
-    except ValueError:
-        await message.answer("❌ Invalid input. Please enter a valid *number* of minutes.")
-    except Exception as e:
-        logger.error(f"CRITICAL: Failed to finalise upload session for owner {message.from_user.id}: {e}")
-        await message.answer("❌ CRITICAL ERROR: Failed to save session to database or generate link. Please check DB connection.")
-    finally:
-        await state.finish()
-
-
 # --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (15. HEALTHCHECK, 16. WEBHOOK ONLY) ---
+
+# Handler for the health check
+async def health_handler(request):
+    """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
+    return web.Response(text="ok")
+
+async def setup_web_routes(app: web.Application):
+    """
+    Registers the /health route on the aiohttp web application instance.
+    This function is called by the executor's on_startup signal.
+    """
+    app.router.add_get('/health', health_handler)
+    logger.info("Healthcheck route '/health' registered successfully via setup_web_routes.")
+
 
 async def on_startup(dp):
     """Executed on bot startup. Sets webhook and connects to DB."""
@@ -1064,17 +672,11 @@ def main():
     is_webhook_mode = bool(WEBHOOK_URL)
     
     if is_webhook_mode:
-        # NEW FIX: Import aiohttp and create the app here to register the healthcheck route
-        from aiohttp import web
-
-        async def health_handler(request):
-            """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
-            return web.Response(text="ok")
-
-        # Create the aiohttp application instance
-        app = web.Application()
-        # Register the custom /health route onto our app
-        app.router.add_get('/health', health_handler)
+        
+        # CRITICAL FIX: Inject the custom /health route using the dispatcher's 
+        # on_startup signal BEFORE calling the executor. The executor calls 
+        # these signals when the aiohttp app is available.
+        dp.on_startup.add_handler(setup_web_routes)
 
         logger.info("Starting bot in Webhook Mode (Render Hosting).")
         
@@ -1085,8 +687,8 @@ def main():
             on_shutdown=on_shutdown,
             skip_updates=True,
             host='0.0.0.0',
-            port=HEALTHCHECK_PORT, # aiogram listens on this port
-            web_app=app # CRITICAL: Pass the custom app to the executor
+            port=HEALTHCHECK_PORT, 
+            # REMOVED: web_app=app -- This caused the unexpected keyword argument error.
         )
     else:
         # Polling fallback (disabled per request but useful for local testing)
