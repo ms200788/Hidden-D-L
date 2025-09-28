@@ -8,9 +8,10 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX: Changed the custom filter registration from keyword argument to a       #
-#       positional argument to resolve 'NameError: Invalid filter name(s):      #
-#       'is_owner_filter'' in aiogram v2.                                      #
+#  FIX 1 (Previous): Corrected filter registration syntax.                      #
+#  FIX 2 (Current): Added schema integrity check for 'messages' table to handle #
+#       existing corrupted or mismatched table definitions by dropping and      #
+#       recreating the table if 'key' column is missing.                        #
 ################################################################################
 """
 
@@ -36,7 +37,8 @@ from aiogram.utils.executor import start_webhook, start_polling
 
 # --- EXTERNAL DEPENDENCY (ASYNCPG for PostgreSQL) ---
 import asyncpg
-from asyncpg.exceptions import UniqueViolationError, DuplicateTableError
+# FIX: Import UndefinedColumnError to specifically catch schema corruption
+from asyncpg.exceptions import UniqueViolationError, DuplicateTableError, UndefinedColumnError
 
 # --- CONFIGURATION AND ENVIRONMENT SETUP ---
 
@@ -126,8 +128,8 @@ class Database:
 
     async def setup_schema(self):
         """
-        Sets up all necessary tables (Users, Messages, Sessions, Statistics)
-        if they do not already exist, ensuring permanent storage.
+        Sets up all necessary tables if they do not already exist, and performs 
+        a reliable check to ensure the 'messages' table schema is correct.
         """
         logger.info("Database: Checking/setting up schema...")
         schema_queries = [
@@ -169,16 +171,42 @@ class Database:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                # Step 1: Attempt to create all tables (will skip if IF NOT EXISTS applies)
                 for query in schema_queries:
                     try:
                         await conn.execute(query)
                     except DuplicateTableError:
-                        pass # Ignore if already exists
+                        pass 
 
-                logger.info("Database: Schema setup complete.")
+                logger.info("Database: Schema setup complete (initial creation attempts).")
 
-                # Ensure initial default messages and stats keys exist
-                await self._insert_default_messages(conn)
+                # Step 2: Ensure initial default messages and stats keys exist
+                try:
+                    await self._insert_default_messages(conn)
+                except UndefinedColumnError as e:
+                    # CRITICAL FIX: Handle schema corruption for 'messages' table
+                    if 'column "key" of relation "messages" does not exist' in str(e):
+                        logger.warning("Database: messages table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
+                        
+                        # 2a. Drop the existing corrupted table
+                        await conn.execute("DROP TABLE IF EXISTS messages;")
+                        
+                        # 2b. Re-run the creation query specifically for messages (without IF NOT EXISTS)
+                        await conn.execute("""
+                            CREATE TABLE messages (
+                                key VARCHAR(10) PRIMARY KEY,
+                                text TEXT NOT NULL,
+                                image_id VARCHAR(255) NULL
+                            );
+                        """)
+                        
+                        # 2c. Try inserting defaults again
+                        await self._insert_default_messages(conn) 
+                        logger.info("Database: messages table successfully reset and populated.")
+                    else:
+                        raise # Re-raise if it's another UndefinedColumnError
+                
+                # Step 3: Ensure stats are initialized
                 await self._insert_default_stats(conn)
 
     async def _insert_default_messages(self, conn):
@@ -369,7 +397,8 @@ ProtectionCallback = CallbackData("prot", "is_protected")
 
 # --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
 
-@dp.message_handler(is_owner_filter, commands=['start', 'help']) # FIX APPLIED HERE: Changed filter to positional argument
+# FIX APPLIED HERE: Changed filter to positional argument (retained from last change)
+@dp.message_handler(is_owner_filter, commands=['start', 'help']) 
 async def cmd_owner_start_help(message: types.Message):
     """Owner's /start and /help (full access to all commands)."""
     await cmd_user_start_help(message)
@@ -984,7 +1013,8 @@ async def on_startup(dp):
         await db_manager.connect()
     except Exception as e:
         logger.critical(f"Database connection failed during startup: {e}")
-        # exit(2) # Uncomment for strict production environment
+        # We rely on the Render environment to handle the crash/restart after a CRITICAL failure
+        # exit(2) 
         
     # 2. Webhook Setup (16. WEBHOOK ONLY)
     if WEBHOOK_URL:
