@@ -8,8 +8,8 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX: Imported 'CallbackData' from 'aiogram.utils.callback_data' to resolve   #
-#       'AttributeError: module 'aiogram.types' has no attribute 'CallbackData''.
+#  FIX: Changed CallbackData definition to functional style (CallbackData(...)) #
+#       to resolve 'TypeError: CallbackData.__init_subclass__() takes no kwargs'.
 ################################################################################
 """
 
@@ -358,15 +358,13 @@ class UploadFSM(StatesGroup):
 
 # --- CALLBACK DATA ---
 
-# Callback data for setting image type (5. /setimage)
-# FIX: Use the correctly imported CallbackData class
-class ImageTypeCallback(CallbackData, prefix="img_type"):
-    key: str # 'start' or 'help'
+# CRITICAL FIX: Use the functional definition of CallbackData
+# This avoids the TypeError: __init_subclass__() takes no keyword arguments
+ImageTypeCallback = CallbackData("img_type", "key")
 
-# Callback data for protection confirmation (9. Step 5)
-# FIX: Use the correctly imported CallbackData class
-class ProtectionCallback(CallbackData, prefix="prot"):
-    is_protected: str # 'yes' or 'no'
+# CRITICAL FIX: Use the functional definition of CallbackData
+# This avoids the TypeError: __init_subclass__() takes no keyword arguments
+ProtectionCallback = CallbackData("prot", "is_protected")
 
 # --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
 
@@ -641,8 +639,8 @@ async def cmd_setimage_step1(message: types.Message):
     
     keyboard = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton("Start Image (3. /start)", callback_data=ImageTypeCallback(key='start').pack())],
-            [types.InlineKeyboardButton("Help Image (4. /help)", callback_data=ImageTypeCallback(key='help').pack())]
+            [types.InlineKeyboardButton("Start Image (3. /start)", callback_data=ImageTypeCallback.new(key='start'))],
+            [types.InlineKeyboardButton("Help Image (4. /help)", callback_data=ImageTypeCallback.new(key='help'))]
         ]
     )
     
@@ -809,8 +807,8 @@ async def cmd_upload_step2_control(message: types.Message, state: FSMContext):
 
     keyboard = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton("🔒 Yes, Protect Content", callback_data=ProtectionCallback(is_protected='yes').pack())],
-            [types.InlineKeyboardButton("🔓 No, Allow Saving/Forwarding", callback_data=ProtectionCallback(is_protected='no').pack())]
+            [types.InlineKeyboardButton("🔒 Yes, Protect Content", callback_data=ProtectionCallback.new(is_protected='yes'))],
+            [types.InlineKeyboardButton("🔓 No, Allow Saving/Forwarding", callback_data=ProtectionCallback.new(is_protected='no'))]
         ]
     )
 
