@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Sharing Bot - FINAL WORKING VERSION
+Telegram File Sharing Bot - FULLY WORKING VERSION
 A robust file sharing bot with deep links, auto-delete, and admin features.
 """
 
@@ -61,6 +61,9 @@ class UploadStates(StatesGroup):
 class MessageStates(StatesGroup):
     waiting_for_message_type = State()
     waiting_for_text = State()
+
+class BroadcastStates(StatesGroup):
+    waiting_for_broadcast = State()
 
 # Database class
 class Database:
@@ -270,6 +273,17 @@ class Database:
             logger.error(f"Stats error: {e}")
             return {'total_users': 0, 'active_users': 0, 'files_uploaded': 0, 'sessions_completed': 0}
 
+    @staticmethod
+    async def get_all_users() -> List[int]:
+        """Get all user IDs"""
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch('SELECT user_id FROM users WHERE is_banned = FALSE')
+                return [row['user_id'] for row in rows]
+        except Exception as e:
+            logger.error(f"Get users error: {e}")
+            return []
+
 # Utility functions
 def is_owner(user_id: int) -> bool:
     return user_id == Config.OWNER_ID
@@ -287,20 +301,32 @@ def create_session_keyboard():
     )
     return keyboard
 
+def create_msg_type_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(
+        InlineKeyboardButton("Start Message", callback_data="msg_start"),
+        InlineKeyboardButton("Help Message", callback_data="msg_help")
+    )
+    return keyboard
+
 async def safe_send_message(chat_id: int, text: str, **kwargs):
     """Safely send message with error handling"""
     try:
         await bot.send_message(chat_id, text, **kwargs)
+        return True
     except BotBlocked:
         logger.warning(f"Bot blocked by user {chat_id}")
+        return False
     except ChatNotFound:
         logger.warning(f"Chat not found: {chat_id}")
+        return False
     except RetryAfter as e:
         logger.warning(f"Rate limit. Retry after {e.timeout} seconds")
         await asyncio.sleep(e.timeout)
         return await safe_send_message(chat_id, text, **kwargs)
     except Exception as e:
         logger.error(f"Send message error: {e}")
+        return False
 
 # Basic command handlers
 @dp.message_handler(commands=['start'])
@@ -314,14 +340,23 @@ async def cmd_start(message: Message):
         # Check for deep link
         args = message.get_args()
         if args:
-            await handle_deep_link(user.id, args, message.bot)
+            await handle_deep_link(user.id, args, bot)
             return
         
         # Send welcome
         msg_data = await Database.get_message('start')
         text = msg_data['text'] if msg_data else "Welcome to File Sharing Bot!"
         
-        # Remove inline buttons as requested - send plain message
+        if msg_data and msg_data.get('image_file_id'):
+            try:
+                await message.answer_photo(
+                    msg_data['image_file_id'], 
+                    caption=text
+                )
+                return
+            except Exception as e:
+                logger.error(f"Photo error: {e}")
+        
         await message.answer(text)
         
     except Exception as e:
@@ -338,7 +373,16 @@ async def cmd_help(message: Message):
         msg_data = await Database.get_message('help')
         text = msg_data['text'] if msg_data else "Help information"
         
-        # Remove inline buttons as requested - send plain message
+        if msg_data and msg_data.get('image_file_id'):
+            try:
+                await message.answer_photo(
+                    msg_data['image_file_id'], 
+                    caption=text
+                )
+                return
+            except Exception as e:
+                logger.error(f"Photo error: {e}")
+        
         await message.answer(text)
         
     except Exception as e:
@@ -411,6 +455,36 @@ async def create_session_callback(callback_query: CallbackQuery, state: FSMConte
         await callback_query.answer("Error")
         await state.finish()
 
+# Message type callback for setmessage/setimage
+@dp.callback_query_handler(lambda c: c.data in ['msg_start', 'msg_help'], state=MessageStates.waiting_for_message_type)
+async def msg_type_callback(callback_query: CallbackQuery, state: FSMContext):
+    """Handle message type selection"""
+    try:
+        msg_type = 'start' if callback_query.data == 'msg_start' else 'help'
+        await state.update_data(msg_type=msg_type)
+        
+        # Check if we're setting image or text
+        data = await state.get_data()
+        if data.get('setting_image'):
+            # For image setting, the image should be in the replied message
+            if callback_query.message.reply_to_message and callback_query.message.reply_to_message.photo:
+                file_id = callback_query.message.reply_to_message.photo[-1].file_id
+                await Database.update_message(msg_type, image_file_id=file_id)
+                await callback_query.message.answer(f"✅ {msg_type} image updated successfully!")
+            else:
+                await callback_query.message.answer("❌ Please reply to an image when using /setimage")
+        else:
+            # For text setting, wait for text input
+            await MessageStates.waiting_for_text.set()
+            await callback_query.message.answer(f"📝 Please send the new text for {msg_type} message:")
+        
+        await state.finish()
+        await callback_query.answer()
+    except Exception as e:
+        logger.error(f"Msg type callback error: {e}")
+        await callback_query.answer("Error")
+        await state.finish()
+
 # Owner commands
 @dp.message_handler(commands=['stats'], user_id=Config.OWNER_ID)
 async def stats_cmd(message: Message):
@@ -434,13 +508,10 @@ async def stats_cmd(message: Message):
 async def upload_cmd(message: Message):
     """Upload command - start file upload process"""
     try:
-        # Clear any existing state
-        current_state = dp.current_state(chat=message.chat.id, user=message.from_user.id)
-        if await current_state.get_state():
-            await current_state.finish()
-        
-        await UploadStates.waiting_for_files.set()
-        await current_state.update_data(files=[], captions=[])
+        # Use FSMContext properly
+        state = dp.current_state(chat=message.chat.id, user=message.from_user.id)
+        await state.set_state(UploadStates.waiting_for_files)
+        await state.update_data(files=[], captions=[])
         await message.answer(
             "📤 Upload started! Send files one by one.\n"
             "Use /done when finished or /cancel to abort."
@@ -510,8 +581,107 @@ async def file_handler(message: Message, state: FSMContext):
         logger.error(f"File handler error: {e}")
         await message.answer("Error storing file.")
 
-# Message update handlers (removed setmessage/setimage commands as requested)
-# Users will set these via BotFather
+# Setmessage command
+@dp.message_handler(commands=['setmessage'], user_id=Config.OWNER_ID)
+async def setmessage_cmd(message: Message):
+    """Set message text command"""
+    try:
+        await MessageStates.waiting_for_message_type.set()
+        await message.answer("Select which message to update:", reply_markup=create_msg_type_keyboard())
+    except Exception as e:
+        logger.error(f"Setmessage error: {e}")
+        await message.answer("Error setting message")
+
+# Setimage command
+@dp.message_handler(commands=['setimage'], user_id=Config.OWNER_ID)
+async def setimage_cmd(message: Message):
+    """Set message image command"""
+    try:
+        if not message.reply_to_message or not message.reply_to_message.photo:
+            await message.answer("❌ Please reply to an image message when using /setimage")
+            return
+        
+        await MessageStates.waiting_for_message_type.set()
+        state = dp.current_state(chat=message.chat.id, user=message.from_user.id)
+        await state.update_data(setting_image=True)
+        await message.answer("Select which message image to update:", reply_markup=create_msg_type_keyboard())
+    except Exception as e:
+        logger.error(f"Setimage error: {e}")
+        await message.answer("Error setting image")
+
+# Text handler for message setting
+@dp.message_handler(state=MessageStates.waiting_for_text, user_id=Config.OWNER_ID)
+async def text_handler(message: Message, state: FSMContext):
+    """Handle message text input"""
+    try:
+        data = await state.get_data()
+        msg_type = data.get('msg_type')
+        if msg_type and message.text:
+            await Database.update_message(msg_type, text=message.text)
+            await message.answer(f"✅ {msg_type} message updated successfully!")
+        else:
+            await message.answer("❌ Error updating message")
+        await state.finish()
+    except Exception as e:
+        logger.error(f"Text handler error: {e}")
+        await state.finish()
+        await message.answer("Error updating message")
+
+# Broadcast command
+@dp.message_handler(commands=['broadcast'], user_id=Config.OWNER_ID)
+async def broadcast_cmd(message: Message):
+    """Broadcast message to all users"""
+    try:
+        if not message.reply_to_message:
+            await message.answer("❌ Please reply to a message that you want to broadcast")
+            return
+        
+        await BroadcastStates.waiting_for_broadcast.set()
+        await message.answer(
+            "⚠️ Are you sure you want to broadcast this message to all users?\n"
+            "Type 'YES' to confirm or /cancel to abort."
+        )
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}")
+        await message.answer("Error starting broadcast")
+
+@dp.message_handler(state=BroadcastStates.waiting_for_broadcast, user_id=Config.OWNER_ID)
+async def broadcast_confirmation(message: Message, state: FSMContext):
+    """Handle broadcast confirmation"""
+    try:
+        if message.text.upper() != 'YES':
+            await message.answer("Broadcast cancelled.")
+            await state.finish()
+            return
+        
+        original_message = message.reply_to_message
+        users = await Database.get_all_users()
+        total = len(users)
+        success = 0
+        failed = 0
+        
+        status_msg = await message.answer(f"📤 Broadcasting to {total} users...")
+        
+        for user_id in users:
+            try:
+                # Forward the original message
+                await bot.forward_message(user_id, original_message.chat.id, original_message.message_id)
+                success += 1
+            except Exception as e:
+                failed += 1
+                logger.error(f"Broadcast to {user_id} failed: {e}")
+            
+            # Update status every 10 sends
+            if (success + failed) % 10 == 0:
+                await status_msg.edit_text(f"📤 Broadcasting... {success + failed}/{total}")
+        
+        await status_msg.edit_text(f"✅ Broadcast completed!\nSuccess: {success}\nFailed: {failed}")
+        await state.finish()
+        
+    except Exception as e:
+        logger.error(f"Broadcast confirmation error: {e}")
+        await message.answer("Error during broadcast")
+        await state.finish()
 
 # Deep link handler
 async def handle_deep_link(user_id: int, session_id: str, bot_instance: Bot):
