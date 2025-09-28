@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Sharing Bot
+Telegram File Sharing Bot - FIXED VERSION
 A robust file sharing bot with deep links, auto-delete, and admin features.
 Built with aiogram v2.25.1 for maximum stability.
 """
@@ -71,153 +71,214 @@ class MessageStates(StatesGroup):
     waiting_for_text = State()
     waiting_for_image = State()
 
-# Database models and utilities
+# Enhanced Database class with better error handling
 class Database:
     @staticmethod
     async def init_db():
-        """Initialize database tables"""
+        """Initialize database tables with proper error handling"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with db_pool.acquire() as conn:
+                    # First, check if tables exist and have correct structure
+                    tables = await conn.fetch('''
+                        SELECT table_name FROM information_schema.tables 
+                        WHERE table_schema = 'public'
+                    ''')
+                    
+                    existing_tables = [table['table_name'] for table in tables]
+                    logger.info(f"Existing tables: {existing_tables}")
+                    
+                    # Check if messages table exists and has correct structure
+                    if 'messages' in existing_tables:
+                        columns = await conn.fetch('''
+                            SELECT column_name FROM information_schema.columns 
+                            WHERE table_name = 'messages'
+                        ''')
+                        existing_columns = [col['column_name'] for col in columns]
+                        logger.info(f"Messages table columns: {existing_columns}")
+                        
+                        if 'message_type' not in existing_columns:
+                            logger.info("Recreating messages table with correct schema")
+                            await conn.execute('DROP TABLE IF EXISTS messages')
+                            existing_tables.remove('messages')
+                    
+                    # Create tables if they don't exist
+                    if 'users' not in existing_tables:
+                        await conn.execute('''
+                            CREATE TABLE users (
+                                id BIGSERIAL PRIMARY KEY,
+                                user_id BIGINT UNIQUE NOT NULL,
+                                username VARCHAR(255),
+                                first_name VARCHAR(255),
+                                last_name VARCHAR(255),
+                                join_date TIMESTAMP DEFAULT NOW(),
+                                last_active TIMESTAMP DEFAULT NOW(),
+                                is_banned BOOLEAN DEFAULT FALSE
+                            )
+                        ''')
+                        logger.info("Created users table")
+                    
+                    if 'messages' not in existing_tables:
+                        await conn.execute('''
+                            CREATE TABLE messages (
+                                id SERIAL PRIMARY KEY,
+                                message_type VARCHAR(50) UNIQUE NOT NULL,
+                                text TEXT,
+                                image_file_id VARCHAR(500),
+                                updated_at TIMESTAMP DEFAULT NOW()
+                            )
+                        ''')
+                        logger.info("Created messages table")
+                        
+                        # Insert default messages
+                        await conn.execute('''
+                            INSERT INTO messages (message_type, text) 
+                            VALUES 
+                                ('start', '👋 Welcome to File Sharing Bot!\\n\\nUse deep links to access shared files.'),
+                                ('help', '📖 Help Guide:\\n\\n• Use /start to begin\\n• Contact owner for file access')
+                        ''')
+                        logger.info("Inserted default messages")
+                    
+                    if 'upload_sessions' not in existing_tables:
+                        await conn.execute('''
+                            CREATE TABLE upload_sessions (
+                                id SERIAL PRIMARY KEY,
+                                session_id VARCHAR(100) UNIQUE NOT NULL,
+                                owner_id BIGINT NOT NULL,
+                                file_ids JSONB NOT NULL,
+                                captions JSONB,
+                                protect_content BOOLEAN DEFAULT TRUE,
+                                auto_delete_minutes INTEGER DEFAULT 0,
+                                created_at TIMESTAMP DEFAULT NOW(),
+                                access_count INTEGER DEFAULT 0,
+                                is_active BOOLEAN DEFAULT TRUE
+                            )
+                        ''')
+                        logger.info("Created upload_sessions table")
+                    
+                    if 'statistics' not in existing_tables:
+                        await conn.execute('''
+                            CREATE TABLE statistics (
+                                id SERIAL PRIMARY KEY,
+                                total_users INTEGER DEFAULT 0,
+                                active_users INTEGER DEFAULT 0,
+                                files_uploaded INTEGER DEFAULT 0,
+                                sessions_completed INTEGER DEFAULT 0,
+                                last_updated TIMESTAMP DEFAULT NOW()
+                            )
+                        ''')
+                        logger.info("Created statistics table")
+                        
+                        # Insert initial statistics
+                        await conn.execute('''
+                            INSERT INTO statistics (total_users, active_users, files_uploaded, sessions_completed) 
+                            VALUES (0, 0, 0, 0)
+                        ''')
+                        logger.info("Inserted initial statistics")
+                    
+                    logger.info("Database initialized successfully")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Database initialization attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error("All database initialization attempts failed")
+                    return False
+        return False
+
+    @staticmethod
+    async def safe_execute(query, *args):
+        """Safely execute database query with error handling"""
         try:
             async with db_pool.acquire() as conn:
-                # Users table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT UNIQUE NOT NULL,
-                        username VARCHAR(255),
-                        first_name VARCHAR(255),
-                        last_name VARCHAR(255),
-                        join_date TIMESTAMP DEFAULT NOW(),
-                        last_active TIMESTAMP DEFAULT NOW(),
-                        is_banned BOOLEAN DEFAULT FALSE
-                    )
-                ''')
-                
-                # Messages table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id SERIAL PRIMARY KEY,
-                        message_type VARCHAR(50) UNIQUE NOT NULL,
-                        text TEXT,
-                        image_file_id VARCHAR(500),
-                        updated_at TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                
-                # Upload sessions table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS upload_sessions (
-                        id SERIAL PRIMARY KEY,
-                        session_id VARCHAR(100) UNIQUE NOT NULL,
-                        owner_id BIGINT NOT NULL,
-                        file_ids JSONB NOT NULL,
-                        captions JSONB,
-                        protect_content BOOLEAN DEFAULT TRUE,
-                        auto_delete_minutes INTEGER DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT NOW(),
-                        access_count INTEGER DEFAULT 0,
-                        is_active BOOLEAN DEFAULT TRUE
-                    )
-                ''')
-                
-                # Statistics table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS statistics (
-                        id SERIAL PRIMARY KEY,
-                        total_users INTEGER DEFAULT 0,
-                        active_users INTEGER DEFAULT 0,
-                        files_uploaded INTEGER DEFAULT 0,
-                        sessions_completed INTEGER DEFAULT 0,
-                        last_updated TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                
-                # Insert default messages
-                await conn.execute('''
-                    INSERT INTO messages (message_type, text) 
-                    VALUES 
-                        ('start', '👋 Welcome to File Sharing Bot!\n\nUse deep links to access shared files.'),
-                        ('help', '📖 Help Guide:\n\n• Use /start to begin\n• Contact owner for file access')
-                    ON CONFLICT (message_type) DO NOTHING
-                ''')
-                
-                logger.info("Database initialized successfully")
-                
+                return await conn.execute(query, *args)
         except Exception as e:
-            logger.error(f"Database initialization error: {e}")
-            raise
+            logger.error(f"Database query error: {e}, Query: {query}")
+            return None
+
+    @staticmethod
+    async def safe_fetch(query, *args):
+        """Safely fetch database results with error handling"""
+        try:
+            async with db_pool.acquire() as conn:
+                return await conn.fetch(query, *args)
+        except Exception as e:
+            logger.error(f"Database fetch error: {e}, Query: {query}")
+            return []
+
+    @staticmethod
+    async def safe_fetchrow(query, *args):
+        """Safely fetch single database row with error handling"""
+        try:
+            async with db_pool.acquire() as conn:
+                return await conn.fetchrow(query, *args)
+        except Exception as e:
+            logger.error(f"Database fetchrow error: {e}, Query: {query}")
+            return None
+
+    @staticmethod
+    async def safe_fetchval(query, *args):
+        """Safely fetch single value from database with error handling"""
+        try:
+            async with db_pool.acquire() as conn:
+                return await conn.fetchval(query, *args)
+        except Exception as e:
+            logger.error(f"Database fetchval error: {e}, Query: {query}")
+            return None
 
     @staticmethod
     async def get_user(user_id: int) -> Optional[asyncpg.Record]:
         """Get user from database"""
-        try:
-            async with db_pool.acquire() as conn:
-                return await conn.fetchrow(
-                    'SELECT * FROM users WHERE user_id = $1', user_id
-                )
-        except Exception as e:
-            logger.error(f"Error getting user: {e}")
-            return None
+        return await Database.safe_fetchrow(
+            'SELECT * FROM users WHERE user_id = $1', user_id
+        )
 
     @staticmethod
     async def create_user(user: types.User):
         """Create new user in database"""
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO users (user_id, username, first_name, last_name) 
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                    last_active = NOW()
-                ''', user.id, user.username, user.first_name, user.last_name)
-        except Exception as e:
-            logger.error(f"Error creating user: {e}")
+        await Database.safe_execute('''
+            INSERT INTO users (user_id, username, first_name, last_name) 
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET
+            last_active = NOW()
+        ''', user.id, user.username, user.first_name, user.last_name)
 
     @staticmethod
     async def update_user_activity(user_id: int):
         """Update user's last activity timestamp"""
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    'UPDATE users SET last_active = NOW() WHERE user_id = $1',
-                    user_id
-                )
-        except Exception as e:
-            logger.error(f"Error updating user activity: {e}")
+        await Database.safe_execute(
+            'UPDATE users SET last_active = NOW() WHERE user_id = $1',
+            user_id
+        )
 
     @staticmethod
     async def get_message(message_type: str) -> Optional[asyncpg.Record]:
         """Get message content from database"""
-        try:
-            async with db_pool.acquire() as conn:
-                return await conn.fetchrow(
-                    'SELECT * FROM messages WHERE message_type = $1', message_type
-                )
-        except Exception as e:
-            logger.error(f"Error getting message: {e}")
-            return None
+        return await Database.safe_fetchrow(
+            'SELECT * FROM messages WHERE message_type = $1', message_type
+        )
 
     @staticmethod
     async def update_message(message_type: str, text: str = None, image_file_id: str = None):
         """Update message content in database"""
-        try:
-            async with db_pool.acquire() as conn:
-                if text and image_file_id:
-                    await conn.execute(
-                        'UPDATE messages SET text = $1, image_file_id = $2, updated_at = NOW() WHERE message_type = $3',
-                        text, image_file_id, message_type
-                    )
-                elif text:
-                    await conn.execute(
-                        'UPDATE messages SET text = $1, updated_at = NOW() WHERE message_type = $2',
-                        text, message_type
-                    )
-                elif image_file_id:
-                    await conn.execute(
-                        'UPDATE messages SET image_file_id = $1, updated_at = NOW() WHERE message_type = $2',
-                        image_file_id, message_type
-                    )
-        except Exception as e:
-            logger.error(f"Error updating message: {e}")
+        if text and image_file_id:
+            await Database.safe_execute(
+                'UPDATE messages SET text = $1, image_file_id = $2, updated_at = NOW() WHERE message_type = $3',
+                text, image_file_id, message_type
+            )
+        elif text:
+            await Database.safe_execute(
+                'UPDATE messages SET text = $1, updated_at = NOW() WHERE message_type = $2',
+                text, message_type
+            )
+        elif image_file_id:
+            await Database.safe_execute(
+                'UPDATE messages SET image_file_id = $1, updated_at = NOW() WHERE message_type = $2',
+                image_file_id, message_type
+            )
 
     @staticmethod
     async def create_upload_session(owner_id: int, file_ids: List[str], captions: List[str], 
@@ -225,24 +286,21 @@ class Database:
         """Create new upload session and return session ID"""
         try:
             session_id = str(uuid.uuid4())[:8]
-            async with db_pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO upload_sessions 
-                    (session_id, owner_id, file_ids, captions, protect_content, auto_delete_minutes)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                ''', session_id, owner_id, json.dumps(file_ids), 
-                   json.dumps(captions), protect_content, auto_delete_minutes)
-                
-                # Update statistics
-                await conn.execute('''
-                    INSERT INTO statistics (files_uploaded, sessions_completed) 
-                    VALUES ($1, 1)
-                    ON CONFLICT (id) DO UPDATE SET
-                    files_uploaded = statistics.files_uploaded + $1,
-                    sessions_completed = statistics.sessions_completed + 1,
-                    last_updated = NOW()
-                ''', len(file_ids))
-                
+            await Database.safe_execute('''
+                INSERT INTO upload_sessions 
+                (session_id, owner_id, file_ids, captions, protect_content, auto_delete_minutes)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            ''', session_id, owner_id, json.dumps(file_ids), 
+               json.dumps(captions), protect_content, auto_delete_minutes)
+            
+            # Update statistics
+            await Database.safe_execute('''
+                UPDATE statistics SET 
+                files_uploaded = files_uploaded + $1,
+                sessions_completed = sessions_completed + 1,
+                last_updated = NOW()
+            ''', len(file_ids))
+            
             return session_id
         except Exception as e:
             logger.error(f"Error creating upload session: {e}")
@@ -251,49 +309,40 @@ class Database:
     @staticmethod
     async def get_upload_session(session_id: str) -> Optional[asyncpg.Record]:
         """Get upload session by ID"""
-        try:
-            async with db_pool.acquire() as conn:
-                session = await conn.fetchrow(
-                    'SELECT * FROM upload_sessions WHERE session_id = $1 AND is_active = TRUE',
-                    session_id
-                )
-                if session:
-                    # Update access count
-                    await conn.execute(
-                        'UPDATE upload_sessions SET access_count = access_count + 1 WHERE id = $1',
-                        session['id']
-                    )
-                return session
-        except Exception as e:
-            logger.error(f"Error getting upload session: {e}")
-            return None
+        session = await Database.safe_fetchrow(
+            'SELECT * FROM upload_sessions WHERE session_id = $1 AND is_active = TRUE',
+            session_id
+        )
+        if session:
+            # Update access count
+            await Database.safe_execute(
+                'UPDATE upload_sessions SET access_count = access_count + 1 WHERE id = $1',
+                session['id']
+            )
+        return session
 
     @staticmethod
     async def get_statistics() -> Dict:
         """Get bot statistics"""
         try:
-            async with db_pool.acquire() as conn:
-                # Get total users
-                total_users = await conn.fetchval('SELECT COUNT(*) FROM users')
-                
-                # Get active users (last 48 hours)
-                active_users = await conn.fetchval('''
-                    SELECT COUNT(*) FROM users 
-                    WHERE last_active > NOW() - INTERVAL '48 hours'
-                ''')
-                
-                # Get files and sessions count
-                stats = await conn.fetchrow('''
-                    SELECT files_uploaded, sessions_completed FROM statistics 
-                    ORDER BY id DESC LIMIT 1
-                ''')
-                
-                return {
-                    'total_users': total_users or 0,
-                    'active_users': active_users or 0,
-                    'files_uploaded': stats['files_uploaded'] if stats else 0,
-                    'sessions_completed': stats['sessions_completed'] if stats else 0
-                }
+            total_users = await Database.safe_fetchval('SELECT COUNT(*) FROM users') or 0
+            
+            active_users = await Database.safe_fetchval('''
+                SELECT COUNT(*) FROM users 
+                WHERE last_active > NOW() - INTERVAL '48 hours'
+            ''') or 0
+            
+            stats = await Database.safe_fetchrow('''
+                SELECT files_uploaded, sessions_completed FROM statistics 
+                ORDER BY id DESC LIMIT 1
+            ''')
+            
+            return {
+                'total_users': total_users,
+                'active_users': active_users,
+                'files_uploaded': stats['files_uploaded'] if stats else 0,
+                'sessions_completed': stats['sessions_completed'] if stats else 0
+            }
         except Exception as e:
             logger.error(f"Error getting statistics: {e}")
             return {'total_users': 0, 'active_users': 0, 'files_uploaded': 0, 'sessions_completed': 0}
@@ -301,13 +350,8 @@ class Database:
     @staticmethod
     async def get_all_users() -> List[int]:
         """Get all user IDs for broadcasting"""
-        try:
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch('SELECT user_id FROM users WHERE is_banned = FALSE')
-                return [row['user_id'] for row in rows]
-        except Exception as e:
-            logger.error(f"Error getting users: {e}")
-            return []
+        rows = await Database.safe_fetch('SELECT user_id FROM users WHERE is_banned = FALSE')
+        return [row['user_id'] for row in rows] if rows else []
 
 # Utility functions
 class Utilities:
@@ -327,6 +371,9 @@ class Utilities:
     @staticmethod
     async def forward_to_channel(file_id: str, file_type: str, caption: str = "") -> str:
         """Forward file to upload channel and return new file_id"""
+        if not Config.UPLOAD_CHANNEL:
+            return file_id  # Return original if no channel configured
+            
         try:
             if file_type == 'photo':
                 message = await bot.send_photo(Config.UPLOAD_CHANNEL, file_id, caption=caption)
@@ -386,31 +433,28 @@ async def cmd_start(message: Message):
     
     # Send welcome message
     msg_data = await Database.get_message('start')
+    text = msg_data['text'] if msg_data else "Welcome to File Sharing Bot!"
     
-    if msg_data and msg_data['image_file_id']:
+    if msg_data and msg_data.get('image_file_id'):
         try:
             await message.answer_photo(
                 msg_data['image_file_id'],
-                msg_data['text'] or "Welcome!",
+                text,
                 reply_markup=InlineKeyboardMarkup().add(
                     InlineKeyboardButton("Help", callback_data="help_button")
                 )
             )
+            return
         except Exception as e:
             logger.error(f"Error sending start image: {e}")
-            await message.answer(
-                msg_data['text'] or "Welcome!",
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("Help", callback_data="help_button")
-                )
-            )
-    else:
-        await message.answer(
-            msg_data['text'] if msg_data else "Welcome to File Sharing Bot!",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("Help", callback_data="help_button")
-            )
+    
+    # Fallback to text message
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("Help", callback_data="help_button")
         )
+    )
 
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: Message):
@@ -419,31 +463,28 @@ async def cmd_help(message: Message):
     await Database.update_user_activity(user_id)
     
     msg_data = await Database.get_message('help')
+    text = msg_data['text'] if msg_data else "Help information"
     
-    if msg_data and msg_data['image_file_id']:
+    if msg_data and msg_data.get('image_file_id'):
         try:
             await message.answer_photo(
                 msg_data['image_file_id'],
-                msg_data['text'] or "Help information",
+                text,
                 reply_markup=InlineKeyboardMarkup().add(
                     InlineKeyboardButton("Back to Start", callback_data="back_start")
                 )
             )
+            return
         except Exception as e:
             logger.error(f"Error sending help image: {e}")
-            await message.answer(
-                msg_data['text'] or "Help information",
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("Back to Start", callback_data="back_start")
-                )
-            )
-    else:
-        await message.answer(
-            msg_data['text'] if msg_data else "Help information",
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("Back to Start", callback_data="back_start")
-            )
+    
+    # Fallback to text message
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("Back to Start", callback_data="back_start")
         )
+    )
 
 # Owner-only commands
 @dp.message_handler(commands=['setmessage'], user_id=Config.OWNER_ID)
@@ -576,10 +617,21 @@ async def process_message_type(callback_query: CallbackQuery, state: FSMContext)
     message_type = 'start' if callback_query.data == 'msg_start' else 'help'
     await state.update_data(message_type=message_type)
     
-    await MessageStates.waiting_for_text.set()
-    await callback_query.message.answer(
-        f"Please send the new text for the {message_type} message:"
-    )
+    # Check if we're setting text or image
+    message = callback_query.message
+    if message.reply_to_message and message.reply_to_message.photo:
+        # Setting image
+        file_id = message.reply_to_message.photo[-1].file_id
+        await Database.update_message(message_type, image_file_id=file_id)
+        await callback_query.message.answer(f"✅ {message_type.capitalize()} image updated successfully!")
+        await state.finish()
+    else:
+        # Setting text
+        await MessageStates.waiting_for_text.set()
+        await callback_query.message.answer(
+            f"Please send the new text for the {message_type} message:"
+        )
+    
     await callback_query.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('protect_') or c.data.startswith('delete_'), 
@@ -783,20 +835,6 @@ async def process_message_text(message: Message, state: FSMContext):
     
     await state.finish()
 
-# Image message handler for message setting
-@dp.message_handler(content_types=ContentType.PHOTO, state=MessageStates.waiting_for_message_type)
-async def process_message_image(message: Message, state: FSMContext):
-    """Process new message image"""
-    data = await state.get_data()
-    message_type = data.get('message_type')
-    
-    if message_type and message.photo:
-        file_id = message.photo[-1].file_id
-        await Database.update_message(message_type, image_file_id=file_id)
-        await message.answer(f"✅ {message_type.capitalize()} image updated successfully!")
-    
-    await state.finish()
-
 # Error handler
 @dp.errors_handler()
 async def errors_handler(update: types.Update, exception: Exception):
@@ -811,6 +849,23 @@ async def health_check(request):
     """Health check endpoint for Render"""
     return web.Response(text="OK")
 
+async def webhook_handler(request):
+    """Handle Telegram webhook requests"""
+    try:
+        url = str(request.url)
+        token = url.split('/')[-1]
+        
+        if token == Config.BOT_TOKEN:
+            update_data = await request.json()
+            update = types.Update(**update_data)
+            await dp.process_update(update)
+            return web.Response()
+        else:
+            return web.Response(status=403)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return web.Response(status=500)
+
 async def on_startup(app):
     """Initialize bot on startup"""
     global db_pool
@@ -820,22 +875,30 @@ async def on_startup(app):
         db_pool = await asyncpg.create_pool(
             Config.DATABASE_URL,
             min_size=Config.DB_POOL_MIN_SIZE,
-            max_size=Config.DB_POOL_MAX_SIZE
+            max_size=Config.DB_POOL_MAX_SIZE,
+            timeout=30
         )
         
-        await Database.init_db()
+        # Initialize database with retry logic
+        success = await Database.init_db()
+        if not success:
+            logger.error("Failed to initialize database after multiple attempts")
+            return
         
         # Set webhook for Render
         if Config.RENDER_EXTERNAL_URL:
-            webhook_url = f"{Config.RENDER_EXTERNAL_URL}/webhook"
+            webhook_url = f"{Config.RENDER_EXTERNAL_URL}/webhook/{Config.BOT_TOKEN}"
             await bot.set_webhook(webhook_url)
             logger.info(f"Webhook set to: {webhook_url}")
+        else:
+            logger.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
         
         logger.info("Bot started successfully")
         
     except Exception as e:
         logger.error(f"Startup error: {e}")
-        raise
+        # Don't raise to keep the server running for health checks
+        # The bot might still work if the database connection is established later
 
 async def on_shutdown(app):
     """Cleanup on shutdown"""
@@ -843,20 +906,6 @@ async def on_shutdown(app):
         await db_pool.close()
     await bot.session.close()
     logger.info("Bot shutdown complete")
-
-# Webhook handler for Render
-async def webhook_handler(request):
-    """Handle Telegram webhook requests"""
-    url = str(request.url)
-    index = url.rfind('/')
-    token = url[index+1:]
-    
-    if token == Config.BOT_TOKEN:
-        update = types.Update(**(await request.json()))
-        await dp.process_update(update)
-        return web.Response()
-    else:
-        return web.Response(status=403)
 
 def main():
     """Main application entry point"""
