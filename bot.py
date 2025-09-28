@@ -8,8 +8,9 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              #
-#  FIX: Changed CallbackData definition to functional style (CallbackData(...)) #
-#       to resolve 'TypeError: CallbackData.__init_subclass__() takes no kwargs'.
+#  FIX: Changed the custom filter registration from keyword argument to a       #
+#       positional argument to resolve 'NameError: Invalid filter name(s):      #
+#       'is_owner_filter'' in aiogram v2.                                      #
 ################################################################################
 """
 
@@ -368,7 +369,7 @@ ProtectionCallback = CallbackData("prot", "is_protected")
 
 # --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
 
-@dp.message_handler(commands=['start', 'help'], is_owner_filter=is_owner_filter)
+@dp.message_handler(is_owner_filter, commands=['start', 'help']) # FIX APPLIED HERE: Changed filter to positional argument
 async def cmd_owner_start_help(message: types.Message):
     """Owner's /start and /help (full access to all commands)."""
     await cmd_user_start_help(message)
