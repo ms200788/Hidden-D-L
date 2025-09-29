@@ -3,14 +3,14 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 7 (Previous): Enhanced middleware reliability to prevent silent failures.
-#  FIX 8 (Current):                                                             
-#   1. **Global Error Handler:** Added `@dp.errors_handler` to catch and log    
-#      any unhandled exceptions during the dispatch cycle (the most likely      
-#      cause of a bot not responding to *any* command). This prevents silent    
-#      crashes.                                                                 
-#   2. **Generic Text Handler:** Added a simple fallback handler to confirm     
-#      the dispatcher is running and processing non-command updates.            
+#  FIX 8 (Previous): Added global error handler and generic text handler.       
+#  FIX 9 (Current - CRITICAL FIX FOR SILENT STARTUP):                           
+#   1. **Isolated DB Connection in on_startup:** Removed the `raise` from the   
+#      `try...except` block around `db_manager.connect()` in `on_startup`.      
+#      This ensures that a database connection failure is logged but does not   
+#      crash the entire bot process, allowing the dispatcher to activate.       
+#   2. **Increased Logging Detail:** Added `exc_info=True` to the critical DB   
+#      failure log to ensure the full traceback is visible in the console.      
 ################################################################################
 """
 
@@ -85,6 +85,10 @@ class Database:
     async def connect(self):
         """Initializes the database connection pool and ensures schema exists."""
         logger.info("Database: Attempting to connect to PostgreSQL...")
+        # Check if DSN is clearly invalid early
+        if not self.dsn or 'postgres' not in self.dsn:
+            raise ValueError("Invalid DATABASE_URL provided.")
+
         try:
             self._pool = await asyncpg.create_pool(
                 self.dsn,
@@ -96,8 +100,8 @@ class Database:
             logger.info("Database: Connection pool established successfully.")
             await self.setup_schema()
         except Exception as e:
-            logger.critical(f"Database connection failed during startup: {e}")
-            raise
+            logger.critical(f"Database connection failed during pool creation/schema setup: {e}")
+            raise # Re-raise within this function to signal failure to the caller
 
     async def close(self):
         """Closes the database connection pool."""
@@ -380,7 +384,11 @@ async def safe_db_user_update(db_manager, user_id):
     This prevents potential DB errors from crashing the main dispatch loop.
     """
     try:
-        await db_manager.get_or_create_user(user_id)
+        # Check if pool is available before attempting acquisition
+        if db_manager._pool:
+            await db_manager.get_or_create_user(user_id)
+        else:
+            logger.debug(f"DB pool not initialized. Skipping user activity update for {user_id}.")
     except Exception as e:
         logger.error(f"CRITICAL ASYNC DB FAILURE: Failed to update user {user_id} activity: {e}", exc_info=True)
         # Crucial: Do NOT raise here. Allow the main update to proceed.
@@ -455,13 +463,19 @@ async def cmd_user_start_help(message: types.Message):
         return
 
     # 2. Handle Regular /start or /help
-    content = await db_manager.get_message_content(key)
-    if not content:
-        # Reliability Fallback
-        text = "Error: Content not found. Please contact the owner."
+    try:
+        content = await db_manager.get_message_content(key)
+        if not content:
+            text = "Error: Content not found. Please contact the owner."
+            image_id = None
+        else:
+            text, image_id = content['text'], content['image_id']
+    except Exception:
+        # DB is likely down or pool is broken, use hardcoded fallback
+        logger.error(f"DB access failed in /{key} handler. Using fallback message.")
+        text = "⚠️ **System Alert:** The database is currently unavailable. I cannot retrieve dynamic messages, but the core delivery system is active."
         image_id = None
-    else:
-        text, image_id = content['text'], content['image_id']
+
 
     # Inline Keyboard (3. /start - "Help" button)
     keyboard = types.InlineKeyboardMarkup()
@@ -485,7 +499,7 @@ async def cmd_user_start_help(message: types.Message):
         logger.info(f"User {message.from_user.id} received /{key} message.")
     except Exception as e:
         logger.error(f"Failed to send /{key} message to {message.from_user.id}: {e}")
-        await message.answer(f"Failed to send full message due to an error. Text:\n{text}")
+        await message.answer(f"Failed to send full message due to a Telegram API error. Text:\n{text}")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith('cmd:'))
@@ -513,7 +527,13 @@ async def handle_deep_link(message: types.Message, session_id: str):
     """
     logger.info(f"User {message.from_user.id} accessed deep link with session ID: {session_id[:8]}...")
     user_id = message.from_user.id
-    session = await db_manager.get_upload_session(session_id)
+    
+    try:
+        session = await db_manager.get_upload_session(session_id)
+    except Exception as e:
+        logger.error(f"DB read error during deep link access for {session_id}: {e}", exc_info=True)
+        await message.answer("❌ Error: The database is currently unreachable. Cannot verify or deliver the file.")
+        return
 
     if not session:
         await message.answer("❌ Error: The file session ID is invalid or has expired. Files remain in DB & channel.")
@@ -644,8 +664,13 @@ async def errors_handler(update: types.Update, exception: Exception):
     logger.error(f'An unhandled exception occurred during update processing. Update: {update.update_id}', 
                  exc_info=exception)
     
-    # Optional: Notify the user/owner if needed, but logging is the priority
-    # For now, just log and return False to let aiogram suppress the error.
+    # Owner notification on critical error
+    try:
+        if OWNER_ID:
+            await bot.send_message(OWNER_ID, f"🚨 **CRITICAL BOT ERROR** 🚨\n\nAn unhandled exception occurred during update processing:\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback.", parse_mode=types.ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Failed to notify owner of critical error: {e}")
+        
     return True # Returning True tells the dispatcher the error was handled.
 
 
@@ -676,11 +701,13 @@ async def on_startup(dp: Dispatcher):
     logger.info(f"Bot starting up in {'WEBHOOK' if WEBHOOK_URL else 'POLLING'} mode.")
     
     # 1. Database Connection (CRITICAL for reliability)
+    # CRITICAL FIX 9: We only log the failure but do NOT re-raise, ensuring the 
+    # bot process stays alive and the dispatcher can receive updates.
     try:
         await db_manager.connect()
     except Exception as e:
-        logger.critical(f"Database connection failed during startup: {e}")
-        raise 
+        logger.critical(f"Database connection failed during startup: {e}. ALL DB-dependent features will fail.", exc_info=True)
+        # We allow the function to return normally here.
         
     # 2. Webhook Setup
     if WEBHOOK_URL:
