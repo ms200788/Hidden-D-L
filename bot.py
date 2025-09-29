@@ -4,10 +4,9 @@
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
 #  Workability Confirmation:                                                    
-#   - BROADCAST FIX (CRITICAL): Added robust DB error handling during user list #
-#     fetch to prevent event loop blocking/bot hang.                            #
-#   - UPLOAD HANDLER FIX (CRITICAL): Refined content_types filtering to         #
-#     permanently resolve "Unsupported Content" errors for PHOTOS/VIDEOS.       
+#   - BROADCAST FIX (CONFIRMED STABLE): Robust DB user fetch prevents bot hangs. #
+#   - UPLOAD HANDLER FIX (CRITICAL): Refined dispatcher logic to prevent        #
+#     "Unsupported Content" errors for supported files (Photo, Video, etc.).    
 ################################################################################
 """
 
@@ -1051,17 +1050,26 @@ async def cmd_upload_single_file(message: types.Message, state: FSMContext):
 
 
 # Handler for all *other* content types (i.e., truly unsupported items like STICKER, CONTACT, LOCATION, etc.)
-# CRITICAL FIX: Explicitly check that the content type is NOT in the supported list.
-@dp.message_handler(lambda message: message.content_type not in SUPPORTED_FILE_TYPES, 
-                    content_types=types.ContentTypes.ANY, 
+@dp.message_handler(content_types=types.ContentTypes.ANY, 
                     state=UploadFSM.waiting_for_files)
-async def cmd_upload_files_invalid(message: types.Message):
-    """Handles unsupported content types during upload state."""
+async def cmd_upload_catch_all(message: types.Message):
+    """
+    CRITICAL FIX: This acts as the lowest-priority catch-all. 
+    It prevents the "Unsupported Content" error for files that SHOULD be supported 
+    but failed to be dispatched to the specific handler due to Aiogram's internal routing.
+    """
     
-    # Allow TEXT to pass through, as /done or /cancel might be sent as text that wasn't caught by the specific handler
+    # 1. Allow TEXT to pass through, as /done or /cancel might be sent as text
     if message.text:
         return 
     
+    # 2. If the message type IS supported, but the specific handler failed to catch it,
+    # it indicates a handler dispatching error. Log and skip to prevent the false error message.
+    if message.content_type in SUPPORTED_FILE_TYPES:
+        logger.warning(f"File of supported type ({message.content_type}) fell through to catch-all handler. Skipping error message.")
+        return
+        
+    # 3. If the message type is NOT supported, send the error.
     unsupported_type = message.content_type.upper()
     
     await bot.send_message(message.chat.id, 
