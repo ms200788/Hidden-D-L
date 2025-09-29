@@ -3,14 +3,13 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 13 (Previous): Fixed webhook 403 error.
-#  FIX 14 (Current - CRITICAL AIOGRAM CONTEXT FIX):                             
-#   1. **Bot Context Loss Fixed:** Replaced all instances of `message.answer()` 
-#      and `message.answer_photo()` in the `cmd_user_start_help` handler with   
-#      direct calls to the globally defined `bot.send_message()` and           
-#      `bot.send_photo()`, explicitly passing the `chat_id`. This prevents the  
-#      "Can't get bot instance from context" error that occurs during indirect  
-#      handler calls or in webhook mode.                                        
+#  FIX 14 (Previous): Fixed bot context loss in message handlers.
+#  FIX 15 (Current - CRITICAL AIOGRAM CONTEXT FIX):                             
+#   1. **Callback Context Loss Fixed:** Replaced `call.answer()` in the         
+#      `handle_cmd_callback` function with the explicit call to                  
+#      `bot.answer_callback_query(call.id)`. This resolves the final known      
+#      `RuntimeError: Can't get bot instance from context` when users click     
+#      inline buttons, ensuring the core start/help flow is fully robust.       
 ################################################################################
 """
 
@@ -492,11 +491,21 @@ async def handle_cmd_callback(call: types.CallbackQuery):
     """
     Handles inline button clicks for Start/Help navigation.
     """
-    await call.answer() 
+    # --- FIX 15: Replace call.answer() with explicit bot call for webhook reliability ---
+    try:
+        await bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.error(f"Failed to answer callback query {call.id}: {e}", exc_info=True)
+
     cmd = call.data.split(':')[1]
     
+    # We use a mock message to reuse the cmd_user_start_help logic
     mock_message = call.message.as_current()
+    # The call.message.as_current() often loses context, so we explicitly set the user/chat info
+    mock_message.from_user = call.from_user
+    mock_message.chat = call.message.chat
     mock_message.text = f'/{cmd}'
+    
     await cmd_user_start_help(mock_message)
 
 # --- DEEP LINK ACCESS LOGIC ---
@@ -528,14 +537,17 @@ async def handle_deep_link(message: types.Message, session_id: str):
     send_protected = (is_protected and not is_owner_access)
 
     info_message = "✅ Files retrieved successfully! The delivery system guarantees reliability."
+    # Use MARKDOWN_V2 only if protected content is requested, otherwise use HTML for simplicity
     parse_mode = types.ParseMode.MARKDOWN_V2 if send_protected else types.ParseMode.HTML
 
     if send_protected:
+        # Use Markdown V2 escapes for protected message
         info_message += "\n\n⚠️ **Content is Protected**\\. Forwarding and saving are disabled\\."
     
     if auto_delete_minutes > 0 and not is_owner_access:
         delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
         delete_time_str = delete_time.strftime("%H:%M:%S on %Y-%m-%d UTC")
+        # Use Markdown V2 escapes for scheduled deletion message
         info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\\."
 
     await bot.send_message(user_id, info_message, parse_mode=parse_mode)
@@ -624,8 +636,10 @@ async def errors_handler(update: types.Update, exception: Exception):
                  exc_info=exception)
     
     try:
-        if OWNER_ID:
-            await bot.send_message(OWNER_ID, f"🚨 **CRITICAL BOT ERROR** 🚨\n\nAn unhandled exception occurred during update processing:\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback.", parse_mode=types.ParseMode.MARKDOWN)
+        if OWNER_ID and hasattr(update, 'message') and update.message is not None:
+             await bot.send_message(OWNER_ID, f"🚨 **CRITICAL BOT ERROR** 🚨\n\nAn unhandled exception occurred during update processing:\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback.", parse_mode=types.ParseMode.MARKDOWN)
+        elif OWNER_ID and hasattr(update, 'callback_query') and update.callback_query is not None:
+             await bot.send_message(OWNER_ID, f"🚨 **CRITICAL BOT ERROR** 🚨\n\nAn unhandled exception occurred (Callback Query) during update processing:\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback.", parse_mode=types.ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Failed to notify owner of critical error: {e}")
         
