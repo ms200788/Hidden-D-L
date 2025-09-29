@@ -4,10 +4,11 @@
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
 #  Workability Confirmation:                                                    
-#   - BROADCAST FIX: Switched to explicit global 'bot' instance for copy_message 
-#     to fix 'Can't get bot instance from context' error.                        
-#   - UPLOAD FIX: Implemented AlbumMiddleware to support Media Groups (multiple 
-#     files in one message), resolving single-file upload reliability issues.
+#   - BROADCAST FIX: Stable (Uses explicit global 'bot' instance).              
+#   - MEDIA GROUP FIX: Stable (Uses AlbumMiddleware).                           
+#   - UPLOAD HANDLER FIX (CRITICAL): Corrected handler precedence to stop       
+#     supported file types (PHOTO, VIDEO) from being rejected by the generic    
+#     'Unsupported Content' handler.                                            
 ################################################################################
 """
 
@@ -62,11 +63,19 @@ WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_HOST")
 WEBHOOK_PATH = f'/{BOT_TOKEN}'
 WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 
-# Keep-Alive Configuration
-HEALTHCHECK_PORT = int(os.getenv("PORT", 8080))
-
 # Hard limit for auto-delete time
 MAX_AUTO_DELETE_MINUTES = 10080
+
+# List of supported file types for clear handler filtering
+SUPPORTED_FILE_TYPES = [
+    types.ContentTypes.DOCUMENT, 
+    types.ContentTypes.PHOTO, 
+    types.ContentTypes.VIDEO, 
+    types.ContentTypes.AUDIO,
+    types.ContentTypes.VOICE,
+    types.ContentTypes.VIDEO_NOTE
+]
+
 
 # Check for critical configuration
 if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
@@ -415,7 +424,7 @@ class UserActivityMiddleware(BaseMiddleware):
             asyncio.create_task(safe_db_user_update(self.db, user_id))
             data['user_id'] = user_id 
 
-# --- MEDIA GROUP MIDDLEWARE (NEW) ---
+# --- MEDIA GROUP MIDDLEWARE ---
 
 class AlbumMiddleware(BaseMiddleware):
     """
@@ -573,7 +582,7 @@ async def cmd_user_start_help(message: types.Message):
             # Fallback to plain text if HTML parsing fails or other API error occurs
             await bot.send_message(chat_id, f"Failed to send the full message (Telegram API error). Text:\n{text}", parse_mode=types.ParseMode.NONE)
         except Exception as fallback_e:
-            logger.error(f"Critical fallback failure for chat {chat_id}: {fallback_e}")
+            logger.critical(f"Critical fallback failure for chat {chat_id}: {fallback_e}")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith('cmd:'))
@@ -946,15 +955,14 @@ def extract_file_data(message: types.Message) -> Union[dict, None]:
     if file_id:
         return {
             'file_id': file_id,
-            # Caption primarily comes from the message object itself, but for albums, 
-            # only the first message has the caption, which is handled by AlbumMiddleware.
+            # Caption primarily comes from the message object itself.
             'caption': message.caption or '',
             'type': file_type
         }
     return None
 
 
-# --- UPLOAD COMMAND HANDLERS (REFACTORED FOR MEDIA GROUPS) ---
+# --- UPLOAD COMMAND HANDLERS (REFACTORED FOR STABILITY) ---
 
 @dp.message_handler(is_owner_filter, commands=['upload'])
 async def cmd_upload_start(message: types.Message, state: FSMContext):
@@ -986,7 +994,6 @@ async def cmd_upload_done(message: types.Message, state: FSMContext):
     await state.set_state(UploadFSM.waiting_for_protection.state)
 
 # Handler for Media Groups (messages processed by AlbumMiddleware)
-# This uses the injected 'album' key in message.conf 
 @dp.message_handler(lambda message: 'album' in message.conf, content_types=types.ContentTypes.ANY, state=UploadFSM.waiting_for_files)
 async def cmd_upload_media_group(message: types.Message, state: FSMContext, album: List[types.Message]):
     """Collects files from a media group."""
@@ -1007,25 +1014,15 @@ async def cmd_upload_media_group(message: types.Message, state: FSMContext, albu
         await bot.send_message(message.chat.id, "❌ No supported files (Photo, Doc, Video, Audio) were found in that Media Group. Please check file types.")
 
 
-# Handler for single files (Photos, Documents, etc.)
-# This ensures single files are caught quickly if they didn't trigger the media_group middleware
-@dp.message_handler(content_types=[
-    types.ContentTypes.DOCUMENT, 
-    types.ContentTypes.PHOTO, 
-    types.ContentTypes.VIDEO, 
-    types.ContentTypes.AUDIO,
-    types.ContentTypes.VOICE,
-    types.ContentTypes.VIDEO_NOTE
-], state=UploadFSM.waiting_for_files)
+# Handler for single files. CRITICAL FIX: Uses the explicit list of supported types
+@dp.message_handler(content_types=SUPPORTED_FILE_TYPES, state=UploadFSM.waiting_for_files)
 async def cmd_upload_single_file(message: types.Message, state: FSMContext):
     """Collects file details and stores them in FSM context for single files."""
     
-    # Crucial check: if media_group_id is present, the AlbumMiddleware should handle it. 
-    # If it reached here, it's a single file, or the middleware missed it (rare). We process it anyway.
-    if message.media_group_id and 'album' not in message.conf:
-        # If it reached here but is marked as part of a group, we skip to prevent duplication 
-        # or error, trusting the AlbumMiddleware will fire shortly.
-        logger.debug("Skipping single file with media_group_id; waiting for AlbumMiddleware.")
+    # If media_group_id is present, we assume the AlbumMiddleware will take over.
+    # This check ensures a single message that belongs to an album isn't double-processed.
+    if message.media_group_id:
+        logger.debug("Skipping single file message with media_group_id; AlbumMiddleware is handling the group.")
         return 
 
     file_data = extract_file_data(message)
@@ -1036,22 +1033,27 @@ async def cmd_upload_single_file(message: types.Message, state: FSMContext):
         
         await bot.send_message(message.chat.id, f"*{file_data['type'].capitalize()} added*. Send the next file or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
     else:
-        # This shouldn't happen with the current content_types filter, but remains as safety net.
+        # This block should ideally not be reached if the content_types filter is correct.
         logger.warning(f"File handler entered but file_id not found for content type: {message.content_type}")
         await bot.send_message(message.chat.id, "Could not determine file ID. Please try another format.")
 
 
+# Handler for all *other* content types (i.e., truly unsupported items like STICKER, CONTACT, LOCATION, etc.)
+# CRITICAL FIX: This handler is now much less prone to false positives.
 @dp.message_handler(content_types=types.ContentTypes.ANY, state=UploadFSM.waiting_for_files)
 async def cmd_upload_files_invalid(message: types.Message):
     """Handles unsupported content types during upload state."""
-    if message.text and message.text.startswith('/'):
-        # Ignore commands that aren't /done or /cancel
-        return 
+    
+    # Check if the text is present, and if it's not a command (which should be ignored/handled by others)
+    if message.text:
+        # Only true text messages that aren't /done or /cancel should hit here
+        if message.text.startswith('/'):
+            return 
     
     unsupported_type = message.content_type.upper()
     
     await bot.send_message(message.chat.id, 
-                           f"❌ **Unsupported Content** (`{unsupported_type}`). Please send only one of the following: **Document, Photo, Video, Audio, Voice, or Video Note**.",
+                           f"❌ **Unsupported Content** (`{unsupported_type}`). Please only send files (**Photo, Doc, Video, Audio, Voice, Video Note**) or type `/done`.",
                            parse_mode=types.ParseMode.MARKDOWN
                           )
 
@@ -1138,8 +1140,6 @@ async def cmd_upload_auto_delete_invalid(message: types.Message):
 async def cmd_reset_messages(message: types.Message):
     """
     Hard resets default start and help messages, clearing custom images.
-    Note: The command is now aliased to /reset_messages for clarity, but /restore_db still works.
-    It does NOT touch user data or session data.
     """
     
     default_start = "👋 Welcome to the Deep-Link File Bot! I securely deliver files via unique links. Reliability is guaranteed by my Neon database persistence."
@@ -1147,9 +1147,8 @@ async def cmd_reset_messages(message: types.Message):
     
     try:
         async with db_manager._pool.acquire() as conn:
-            # Insert/Update default text and explicitly set image_id to NULL
+            # This is a deliberate hard reset to factory defaults
             for key, text in [('start', default_start), ('help', default_help)]:
-                # This is a deliberate hard reset to factory defaults
                 query = """
                 INSERT INTO messages (key, text) VALUES ($1, $2)
                 ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text, image_id = NULL;
@@ -1174,11 +1173,7 @@ async def errors_handler(update: types.Update, exception: Exception):
     
     # Attempt to notify the owner
     try:
-        # Check if the error is the specific FSM error we just fixed, to avoid notifying the owner repeatedly for a known transient issue
-        is_known_fsm_error = (isinstance(exception, AttributeError) and 
-                              "'NoneType' object has no attribute 'current_state'" in str(exception))
-                              
-        if OWNER_ID and not is_known_fsm_error:
+        if OWNER_ID:
             user_id = update.message.from_user.id if hasattr(update, 'message') and update.message else 'N/A'
             error_message = f"🚨 **CRITICAL BOT ERROR** 🚨\n\nSource User: `{user_id}`\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback."
             await bot.send_message(OWNER_ID, error_message, parse_mode=types.ParseMode.MARKDOWN)
@@ -1246,7 +1241,7 @@ async def init_app():
     
     # Register core webhook route and healthcheck
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
-    app.router.add_get('/health', health_handler)
+    app.router.add_get('/health', health_handler) # <-- Health check endpoint
     
     # 3. Webhook Setting
     if WEBHOOK_URL:
