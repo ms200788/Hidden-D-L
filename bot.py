@@ -3,8 +3,9 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: RuntimeError: Can't get bot instance from context in webhook mode.    #
-#   - Added Bot.set_current(bot) in telegram_webhook for context reliability.   #
+#  FIXED: AttributeError: 'NoneType' object has no attribute 'current_state'    #
+#   - Added Dispatcher.set_current(dp) in telegram_webhook for FSM stability.   #
+#  FIXED: cmd_upload_message_collector now correctly handles all media types.   #
 ################################################################################
 """
 
@@ -21,6 +22,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher import Dispatcher as AiogramDispatcher # Alias for set_current fix
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher.middlewares import BaseMiddleware 
 from aiogram.utils.callback_data import CallbackData 
@@ -63,16 +65,16 @@ WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 MAX_AUTO_DELETE_MINUTES = 10080
 
 # List of supported file types for clear handler filtering
-SUPPORTED_FILE_TYPES = [
+# NOTE: Sticker/Animation/Text are handled explicitly in the collector logic
+SUPPORTED_MEDIA_TYPES = [
     types.ContentTypes.DOCUMENT, 
     types.ContentTypes.PHOTO, 
     types.ContentTypes.VIDEO, 
     types.ContentTypes.AUDIO,
     types.ContentTypes.VOICE,
     types.ContentTypes.VIDEO_NOTE,
-    types.ContentTypes.STICKER, # Adding sticker/animation for better collection, though they can't be protected
+    types.ContentTypes.STICKER,
     types.ContentTypes.ANIMATION,
-    types.ContentTypes.TEXT # Text is always collected unless excluded
 ]
 
 
@@ -348,7 +350,6 @@ active_uploads = {} # {owner_id: {messages: List[types.Message], exclude_text: b
 cb_choose_protect = CallbackData("prot", "session", "choice") 
 
 # --- MIDDLEWARE (UserActivity and Album - functional as before) ---
-# ... (UserActivityMiddleware and AlbumMiddleware code remains unchanged) ...
 async def safe_db_user_update(db_manager, user_id):
     """Wrapper function to safely perform DB updates in an async task."""
     try:
@@ -418,7 +419,7 @@ class AlbumMiddleware(BaseMiddleware):
 dp.middleware.setup(UserActivityMiddleware(db_manager))
 dp.middleware.setup(AlbumMiddleware()) 
 
-# --- FSM FOR ADMIN COMMANDS (non-upload FSM states remain functional) ---
+# --- FSM FOR ADMIN COMMANDS ---
 class AdminFSM(StatesGroup):
     waiting_for_message_key = State()
     waiting_for_new_message_text = State()
@@ -426,7 +427,7 @@ class AdminFSM(StatesGroup):
     waiting_for_new_image = State() 
     waiting_for_broadcast_text = State()
 
-# --- HANDLERS: UPLOAD COMMANDS (REPLACING FSM) ---
+# --- HANDLERS: UPLOAD COMMANDS ---
 
 def start_upload_session(owner_id: int, exclude_text: bool):
     """Initializes a new upload session in in-memory state."""
@@ -451,6 +452,8 @@ async def cmd_upload(message: types.Message):
     args = message.get_args().strip().lower()
     exclude_text = "exclude_text" in args
     
+    # Ensure any previous session is cancelled, just in case
+    cancel_upload_session(OWNER_ID) 
     start_upload_session(OWNER_ID, exclude_text)
     
     exclude_text_info = " (Text messages will be ignored)" if exclude_text else ""
@@ -525,17 +528,14 @@ async def _on_choose_protect(call: types.CallbackQuery, callback_data: dict):
 async def _process_messages_for_vaulting(messages: List[types.Message], exclude_text: bool) -> List[dict]:
     """
     Copies all collected messages to the UPLOAD_CHANNEL_ID and collects 
-    the resulting file data (file_id, type, caption) into a list.
+    the resulting file data (file_id/message_id, type, caption) into a list.
+    
+    CRUCIAL: This function only stores lightweight IDs after vaulting.
     """
     vaulted_file_data = []
     
     # Send a simple header message to the vault channel
     header = await bot.send_message(UPLOAD_CHANNEL_ID, "--- New Upload Session Vault ---")
-    vaulted_file_data.append({
-        'file_id': header.message_id, # Storing message ID of the header for reference (not for delivery)
-        'type': 'header',
-        'caption': 'Session Header',
-    })
     
     for m0 in messages:
         try:
@@ -550,11 +550,8 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
             caption = m0.caption or m0.text or ""
             file_type = m0.content_type
 
-            # Use copy_message for media types for better fidelity
-            if file_type in [types.ContentTypes.PHOTO, types.ContentTypes.VIDEO, types.ContentTypes.DOCUMENT, 
-                             types.ContentTypes.AUDIO, types.ContentTypes.VOICE, types.ContentTypes.VIDEO_NOTE, 
-                             types.ContentTypes.STICKER, types.ContentTypes.ANIMATION, types.ContentTypes.CONTACT,
-                             types.ContentTypes.LOCATION]:
+            # Use copy_message for all content types for secure vaulting
+            if m0.content_type != types.ContentTypes.TEXT:
                 
                 sent_msg = await bot.copy_message(
                     chat_id=UPLOAD_CHANNEL_ID, 
@@ -562,7 +559,7 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
                     message_id=m0.message_id
                 )
                 
-                # Extract file_id from the copied message object for delivery later
+                # Extract file_id (or message_id) from the copied message object for delivery later
                 if sent_msg.photo:
                     file_id = sent_msg.photo[-1].file_id
                     file_type = 'photo'
@@ -572,7 +569,15 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
                 elif sent_msg.document:
                     file_id = sent_msg.document.file_id
                     file_type = 'document'
-                # ... (handle other media types to get file_id)
+                elif sent_msg.audio:
+                    file_id = sent_msg.audio.file_id
+                    file_type = 'audio'
+                elif sent_msg.voice:
+                    file_id = sent_msg.voice.file_id
+                    file_type = 'voice'
+                elif sent_msg.video_note:
+                    file_id = sent_msg.video_note.file_id
+                    file_type = 'video_note'
                 elif sent_msg.sticker:
                     file_id = sent_msg.sticker.file_id
                     file_type = 'sticker'
@@ -580,19 +585,20 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
                     file_id = sent_msg.animation.file_id
                     file_type = 'animation'
                 else:
-                    # For non-standard media or copies that don't expose a clean file_id (like location/contact)
-                    file_id = sent_msg.message_id # Use message_id as fallback ID for tracking
+                    # Fallback to message_id if file_id extraction fails (e.g., location/contact)
+                    file_id = sent_msg.message_id 
+                    file_type = 'unsupported_media'
                     
             elif m0.text:
                 # Text-only messages: send directly for vaulting
                 sent_msg = await bot.send_message(UPLOAD_CHANNEL_ID, m0.text)
-                file_id = sent_msg.message_id
+                file_id = sent_msg.message_id # Store the vault message ID for text delivery
                 file_type = 'text'
                 caption = m0.text
 
-            if file_id and file_type != 'header':
+            if file_id and sent_msg:
                 vaulted_file_data.append({
-                    'file_id': file_id, # This is the ID used for delivery
+                    'file_id': file_id, # This is the ID used for delivery (file_id or message_id)
                     'type': file_type,
                     'caption': caption,
                 })
@@ -616,7 +622,7 @@ async def _receive_minutes(m: types.Message):
     
     upload = active_uploads.get(OWNER_ID)
     if not upload or not upload.get("_finalize_requested"):
-        return # Session might have expired or not finalized yet
+        return
 
     try:
         mins = int(m.text.strip())
@@ -647,7 +653,7 @@ async def _receive_minutes(m: types.Message):
         cancel_upload_session(OWNER_ID)
         return
 
-    # Filter out the header before passing to create_upload_session
+    # Filter out any non-deliverable items (e.g., failed copies)
     final_file_data = [d for d in vaulted_file_data if d.get('type') != 'header']
     if not final_file_data:
         await bot.edit_message_text("❌ **Finalization Failed:** No valid files were successfully vaulted. Session cancelled.", 
@@ -706,16 +712,16 @@ async def _receive_minutes(m: types.Message):
                     content_types=types.ContentTypes.ANY)
 async def cmd_upload_message_collector(message: types.Message):
     """
-    Collects messages during an active session, handling both single messages 
-    and media groups passed via AlbumMiddleware.
+    Collects messages during an active session, correctly handling media, text, 
+    albums, and filtering unsupported content.
     """
     upload = active_uploads[OWNER_ID]
     
-    # If the user is trying to finalize/cancel, let the command handlers take over.
-    if message.text in ['/d', '/e', '/cancel']:
+    # 1. Skip commands and finalization triggers
+    if message.text and (message.text.startswith('/') or message.text in ['/d', '/e']):
         return
-
-    # Check if this is an album (passed by AlbumMiddleware)
+        
+    # 2. Handle Albums (passed by AlbumMiddleware)
     if 'album' in message.conf:
         album_messages = message.conf['album']
         
@@ -732,26 +738,32 @@ async def cmd_upload_message_collector(message: types.Message):
             await bot.send_message(message.chat.id, f"*{new_count} files from the Media Group added*. Total: {len(upload['messages'])}.", parse_mode=types.ParseMode.MARKDOWN)
         return
 
-    # Check if this is a single message
-    if message.content_type in SUPPORTED_FILE_TYPES or message.text:
-        # Apply exclude_text logic for single text messages
-        if message.content_type == types.ContentTypes.TEXT and upload["exclude_text"]:
+    # 3. Handle Single Message
+    is_media = message.content_type != types.ContentTypes.TEXT
+    
+    if is_media and message.content_type in SUPPORTED_MEDIA_TYPES:
+        # This is a photo, video, doc, etc. (with or without a caption)
+        upload["messages"].append(message)
+        # Send confirmation (avoiding spamming confirmation for every message)
+        if len(upload["messages"]) % 5 == 1 or len(upload["messages"]) == 1:
+             await bot.send_message(message.chat.id, f"*{message.content_type.capitalize()} added*. Total files collected: {len(upload['messages'])}.", parse_mode=types.ParseMode.MARKDOWN)
+        return
+        
+    elif message.content_type == types.ContentTypes.TEXT:
+        if upload["exclude_text"]:
             await bot.send_message(message.chat.id, "❌ Text messages are excluded in this session. Send media or use `/d`.", parse_mode=types.ParseMode.MARKDOWN)
             return
-            
-        # Add the message object to the list
-        upload["messages"].append(message)
-        
-        # Send confirmation (avoiding spamming confirmation for every message)
-        if len(upload["messages"]) % 5 == 1: # Confirm every 5 messages or the first one
-             await bot.send_message(message.chat.id, f"*{message.content_type.capitalize()} added*. Total files collected: {len(upload['messages'])}.", parse_mode=types.ParseMode.MARKDOWN)
-             
-        return
-    
-    # If it falls through, it's a truly unsupported message during an active session
+        else:
+            # Add text message
+            upload["messages"].append(message)
+            if len(upload["messages"]) % 5 == 1 or len(upload["messages"]) == 1:
+                 await bot.send_message(message.chat.id, f"*Text message added*. Total files collected: {len(upload['messages'])}.", parse_mode=types.ParseMode.MARKDOWN)
+            return
+
+    # 4. Fallback for truly unsupported content (e.g., location, poll, dice, etc.)
     unsupported_type = message.content_type.upper()
     await bot.send_message(message.chat.id, 
-                           f"❌ **Unsupported Content** (`{unsupported_type}`). Please only send files or type `/d`.",
+                           f"❌ **Unsupported Content** (`{unsupported_type}`). Please only send media or text (if not excluded) or type `/d`.",
                            parse_mode=types.ParseMode.MARKDOWN
                           )
 
@@ -826,10 +838,14 @@ async def handle_deep_link(message: types.Message, session_id: str):
     
     if auto_delete_minutes > 0 and not is_owner_access:
         delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
-        delete_time_str = delete_time.strftime("%Y-%m-%d %H:%M:%S UTC")
-        info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from _this chat_ at `{delete_time_str}`\\."
+        delete_time_str = delete_time.strftime("%Y\\-%m\\-%d %H\\:%M\\:%S UTC") # Escape for Markdown V2
+        info_message += f"\n\n⏰ **Auto\\-Delete Scheduled:** The files will be automatically deleted from _this chat_ at `{delete_time_str}`\\."
 
-    await bot.send_message(user_id, info_message, parse_mode=types.ParseMode.MARKDOWN_V2)
+    # Use a simpler message if Markdown V2 causes issues for the user's client
+    try:
+        await bot.send_message(user_id, info_message, parse_mode=types.ParseMode.MARKDOWN_V2)
+    except Exception:
+         await bot.send_message(user_id, info_message, parse_mode=types.ParseMode.MARKDOWN) # Fallback
 
     sent_message_ids = []
 
@@ -840,47 +856,52 @@ async def handle_deep_link(message: types.Message, session_id: str):
         file_type = file.get('type', 'document') 
 
         send_method = bot.send_document 
-        if file_type == 'photo':
-            send_method = bot.send_photo
-        elif file_type == 'video':
-            send_method = bot.send_video
-        elif file_type == 'audio':
-            send_method = bot.send_audio
-        elif file_type == 'voice': 
-            send_method = bot.send_voice
-        elif file_type == 'video_note':
-            send_method = bot.send_video_note
-        elif file_type == 'text': # Handle text messages directly
-            send_method = bot.send_message
-            
         send_kwargs = {
             'chat_id': user_id,
             'disable_notification': True,
             'protect_content': send_protected 
         }
         
+        # Determine the correct send method and payload
         if file_type == 'photo':
+            send_method = bot.send_photo
             send_kwargs['photo'] = file_id
-            if caption: send_kwargs['caption'] = caption 
         elif file_type == 'video':
+            send_method = bot.send_video
             send_kwargs['video'] = file_id
-            if caption: send_kwargs['caption'] = caption 
-        elif file_type == 'document':
-            send_kwargs['document'] = file_id
-            if caption: send_kwargs['caption'] = caption 
         elif file_type == 'audio':
+            send_method = bot.send_audio
             send_kwargs['audio'] = file_id
-            if caption: send_kwargs['caption'] = caption 
-        elif file_type == 'voice':
+        elif file_type == 'voice': 
+            send_method = bot.send_voice
             send_kwargs['voice'] = file_id
         elif file_type == 'video_note':
+            send_method = bot.send_video_note
             send_kwargs['video_note'] = file_id
+        elif file_type == 'document':
+            send_method = bot.send_document
+            send_kwargs['document'] = file_id
+        elif file_type == 'sticker':
+            send_method = bot.send_sticker
+            send_kwargs['sticker'] = file_id
+            caption = None # Stickers don't support captions
+        elif file_type == 'animation':
+            send_method = bot.send_animation
+            send_kwargs['animation'] = file_id
         elif file_type == 'text':
-            send_kwargs['text'] = file_id # For text, file_id holds the actual message text
+            send_method = bot.send_message
+            send_kwargs['text'] = caption # For text, 'caption' holds the actual message text
+            send_kwargs['protect_content'] = False # Text doesn't need protection flag
+            caption = None
         else:
-            # Skip unsupported types that were vaulted (e.g. sticker, animation, location, etc.)
+            # Skip unsupported types that were vaulted (e.g. location, contact, etc.)
             continue 
 
+        # Add caption if available and the method supports it
+        if caption and file_type != 'text':
+            send_kwargs['caption'] = caption
+            send_kwargs['parse_mode'] = types.ParseMode.HTML
+            
         try:
             sent_msg = await send_method(**send_kwargs)
             sent_message_ids.append(sent_msg.message_id)
@@ -900,7 +921,8 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
     try:
         await asyncio.sleep(delay_seconds)
         
-        for msg_id in message_ids:
+        # Reverse list to potentially delete message chains more cleanly
+        for msg_id in reversed(message_ids): 
             try:
                 await bot.delete_message(chat_id, msg_id)
                 await asyncio.sleep(0.1) 
@@ -917,26 +939,6 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
         logger.info(f"Deletion task for chat {chat_id} was cancelled.")
     except Exception as e:
         logger.error(f"CRITICAL: Error during scheduled deletion for chat {chat_id}: {e}")
-
-# --- OTHER HANDLERS (Remaining unchanged) ---
-@dp.message_handler(commands=['cancel'], state='*')
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    """Allows users to cancel any ongoing FSM state."""
-    if is_owner(message.from_user.id):
-        # Also check for active non-FSM upload session
-        if OWNER_ID in active_uploads:
-            cancel_upload_session(OWNER_ID)
-            await bot.send_message(message.chat.id, "✅ Upload session also cancelled.")
-
-    current_state = await state.get_state()
-    if current_state is None:
-        if OWNER_ID not in active_uploads:
-            await bot.send_message(message.chat.id, "Nothing to cancel.")
-        return
-
-    await state.finish()
-    await bot.send_message(message.chat.id, "✅ Operation cancelled.")
-
 
 # Handler implementations for AdminFSM methods (omitted for brevity)
 @dp.message_handler(is_owner_filter, commands=['setmessage'])
@@ -1090,7 +1092,7 @@ async def handle_all_text_messages(message: types.Message):
     await bot.send_message(message.chat.id, "I received your message, but I only understand commands like /start or /help.")
 
 
-# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (CRITICAL FIX APPLIED HERE) ---
+# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (CRITICAL FIXES APPLIED HERE) ---
 
 async def health_handler(request):
     """Returns 'ok' for UptimeRobot/Render health checks."""
@@ -1099,10 +1101,10 @@ async def health_handler(request):
 async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
-    Aiogram dispatcher using the safer request.json() method.
+    Aiogram dispatcher.
     
-    CRITICAL FIX: Bot.set_current(bot) ensures the Bot instance is in the context
-    for handlers like message.reply() to work correctly under aiohttp.
+    CRITICAL FIX: Explicitly sets both Bot and Dispatcher context for
+    reliable FSM/State and message methods (like .reply()).
     """
     
     try:
@@ -1114,8 +1116,11 @@ async def telegram_webhook(request):
     try:
         update = types.Update.to_object(update_data)
         
-        # --- THE CRITICAL FIX ---
+        # --- THE CRITICAL FIXES FOR CONTEXT ---
+        # Ensures message.reply() works:
         Bot.set_current(bot)
+        # Ensures FSM commands like AdminFSM.waiting_for_broadcast_text.set() work:
+        AiogramDispatcher.set_current(dp) 
         
         await dp.process_update(update)
     except Exception as e:
