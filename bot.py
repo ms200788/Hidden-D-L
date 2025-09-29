@@ -3,9 +3,9 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: AttributeError: 'NoneType' object has no attribute 'current_state'    #
-#   - Added Dispatcher.set_current(dp) in telegram_webhook for FSM stability.   #
-#  FIXED: cmd_upload_message_collector now correctly handles all media types.   #
+#  FIXED: Robust media collector. Checks for file attributes (photo, video, etc.)
+#         directly instead of relying solely on the content_type enum list.     #
+#  FIXED: Added filter to collector to stop listening once /d is requested.     #
 ################################################################################
 """
 
@@ -64,8 +64,8 @@ WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 # Hard limit for auto-delete time
 MAX_AUTO_DELETE_MINUTES = 10080
 
-# List of supported file types for clear handler filtering
-# NOTE: Sticker/Animation/Text are handled explicitly in the collector logic
+# Note: SUPPORTED_MEDIA_TYPES list is now used for documentation/reference only, 
+# not for the core check in the collector handler (which is now done via attributes).
 SUPPORTED_MEDIA_TYPES = [
     types.ContentTypes.DOCUMENT, 
     types.ContentTypes.PHOTO, 
@@ -708,17 +708,20 @@ async def _receive_minutes(m: types.Message):
 
 # --- FILE COLLECTION HANDLER (CATCH-ALL FOR ACTIVE SESSION) ---
 
-@dp.message_handler(lambda m: is_owner(m.from_user.id) and OWNER_ID in active_uploads,
+@dp.message_handler(lambda m: is_owner(m.from_user.id) and OWNER_ID in active_uploads and not active_uploads.get(OWNER_ID, {}).get("_finalize_requested"), # <-- ADDED finalize check
                     content_types=types.ContentTypes.ANY)
 async def cmd_upload_message_collector(message: types.Message):
     """
     Collects messages during an active session, correctly handling media, text, 
     albums, and filtering unsupported content.
+    
+    FIX: Now uses direct attribute checks (message.photo, message.video, etc.) 
+    for robust media detection in webhook mode.
     """
     upload = active_uploads[OWNER_ID]
     
-    # 1. Skip commands and finalization triggers
-    if message.text and (message.text.startswith('/') or message.text in ['/d', '/e']):
+    # 1. Skip commands 
+    if message.text and message.text.startswith("/"):
         return
         
     # 2. Handle Albums (passed by AlbumMiddleware)
@@ -739,16 +742,21 @@ async def cmd_upload_message_collector(message: types.Message):
         return
 
     # 3. Handle Single Message
-    is_media = message.content_type != types.ContentTypes.TEXT
     
-    if is_media and message.content_type in SUPPORTED_MEDIA_TYPES:
-        # This is a photo, video, doc, etc. (with or without a caption)
+    # A. Robust check for Media Types (checks attributes instead of just content_type string)
+    is_supported_media = message.photo or message.video or \
+                         message.document or message.audio or \
+                         message.voice or message.video_note or \
+                         message.sticker or message.animation
+    
+    if is_supported_media:
         upload["messages"].append(message)
         # Send confirmation (avoiding spamming confirmation for every message)
         if len(upload["messages"]) % 5 == 1 or len(upload["messages"]) == 1:
              await bot.send_message(message.chat.id, f"*{message.content_type.capitalize()} added*. Total files collected: {len(upload['messages'])}.", parse_mode=types.ParseMode.MARKDOWN)
         return
         
+    # B. Handle Text
     elif message.content_type == types.ContentTypes.TEXT:
         if upload["exclude_text"]:
             await bot.send_message(message.chat.id, "❌ Text messages are excluded in this session. Send media or use `/d`.", parse_mode=types.ParseMode.MARKDOWN)
