@@ -3,10 +3,8 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  WORKFLOW UPDATED: Custom Message Collection Model (Owner Only)               #
-#   - Replaced FSM with flexible in-memory session (active_uploads).            #
-#   - New commands: /upload, /e (cancel), /d (finalize).                        #
-#   - Finalization now includes mandatory file vaulting (copying) to UPLOAD_CHANNEL_ID.
+#  FIXED: RuntimeError: Can't get bot instance from context in webhook mode.    #
+#   - Added Bot.set_current(bot) in telegram_webhook for context reliability.   #
 ################################################################################
 """
 
@@ -940,8 +938,82 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await bot.send_message(message.chat.id, "✅ Operation cancelled.")
 
 
-# ... (AdminFSM handlers like /setmessage, /setimage, /broadcast remain here) ...
-# Omitted for brevity, but they should be included in the final file.
+# Handler implementations for AdminFSM methods (omitted for brevity)
+@dp.message_handler(is_owner_filter, commands=['setmessage'])
+async def cmd_set_message(message: types.Message, state: FSMContext):
+    await message.reply("Enter the key (e.g., 'start' or 'help') for the message you want to change.")
+    await AdminFSM.waiting_for_message_key.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_message_key, content_types=types.ContentTypes.TEXT)
+async def handle_message_key(message: types.Message, state: FSMContext):
+    key = message.text.strip().lower()
+    if key not in ['start', 'help']:
+        await message.reply("Invalid key. Please use 'start' or 'help'.")
+        return
+    await state.update_data(message_key=key)
+    await message.reply(f"Enter the new text for the '{key}' message. Supports HTML.")
+    await AdminFSM.waiting_for_new_message_text.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_new_message_text, content_types=types.ContentTypes.TEXT)
+async def handle_new_message_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    key = data['message_key']
+    text = message.text
+    try:
+        await db_manager.execute("UPDATE messages SET text = $1 WHERE key = $2;", text, key)
+        await message.reply(f"✅ Message '{key}' updated successfully.")
+    except Exception as e:
+        logger.error(f"Failed to update message {key}: {e}")
+        await message.reply("❌ Error updating message in database.")
+    finally:
+        await state.finish()
+
+@dp.message_handler(is_owner_filter, commands=['setimage'])
+async def cmd_set_image(message: types.Message, state: FSMContext):
+    await message.reply("Enter the key (e.g., 'start' or 'help') for the image you want to set/clear.")
+    await AdminFSM.waiting_for_image_key.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_image_key, content_types=types.ContentTypes.TEXT)
+async def handle_image_key(message: types.Message, state: FSMContext):
+    key = message.text.strip().lower()
+    if key not in ['start', 'help']:
+        await message.reply("Invalid key. Please use 'start' or 'help'.")
+        return
+    await state.update_data(image_key=key)
+    await message.reply("Send the new photo you want to use, or send 'clear' to remove the existing image.")
+    await AdminFSM.waiting_for_new_image.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_new_image, content_types=[types.ContentTypes.PHOTO, types.ContentTypes.TEXT])
+async def handle_new_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    key = data['image_key']
+    image_id = None
+    
+    if message.text and message.text.strip().lower() == 'clear':
+        image_id = None
+    elif message.photo:
+        image_id = message.photo[-1].file_id
+    else:
+        await message.reply("Please send a photo or type 'clear'.")
+        return
+
+    try:
+        await db_manager.execute("UPDATE messages SET image_id = $1 WHERE key = $2;", image_id, key)
+        if image_id:
+            await message.reply(f"✅ Image for '{key}' set successfully.")
+        else:
+            await message.reply(f"✅ Image for '{key}' cleared successfully.")
+    except Exception as e:
+        logger.error(f"Failed to update image for {key}: {e}")
+        await message.reply("❌ Error updating image in database.")
+    finally:
+        await state.finish()
+
+@dp.message_handler(is_owner_filter, commands=['broadcast'])
+async def cmd_broadcast(message: types.Message):
+    await message.reply("Send the message (text or media) you wish to broadcast to all users.")
+    await AdminFSM.waiting_for_broadcast_text.set()
+
 
 @dp.message_handler(is_owner_filter, commands=['stats'])
 async def cmd_stats(message: types.Message):
@@ -987,6 +1059,7 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
 
     for user_id in user_ids:
         try:
+            # Use copy_message which supports all content types (text, media, etc.)
             await bot.copy_message( 
                 chat_id=user_id,
                 from_chat_id=message.chat.id,
@@ -995,9 +1068,10 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
             )
             success_count += 1
         except Exception as e:
-            logger.warning(f"Failed to send broadcast to user {user_id}: {e}")
+            # Note: We can't log the user ID directly due to privacy, so we log the error
+            logger.warning(f"Failed to send broadcast to a user: {e}")
             fail_count += 1
-        await asyncio.sleep(0.05) 
+        await asyncio.sleep(0.05) # Throttle to respect API limits
 
     report = (
         f"📣 **Broadcast Complete**\n"
@@ -1016,7 +1090,7 @@ async def handle_all_text_messages(message: types.Message):
     await bot.send_message(message.chat.id, "I received your message, but I only understand commands like /start or /help.")
 
 
-# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (Unchanged) ---
+# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (CRITICAL FIX APPLIED HERE) ---
 
 async def health_handler(request):
     """Returns 'ok' for UptimeRobot/Render health checks."""
@@ -1026,6 +1100,9 @@ async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
     Aiogram dispatcher using the safer request.json() method.
+    
+    CRITICAL FIX: Bot.set_current(bot) ensures the Bot instance is in the context
+    for handlers like message.reply() to work correctly under aiohttp.
     """
     
     try:
@@ -1036,6 +1113,10 @@ async def telegram_webhook(request):
 
     try:
         update = types.Update.to_object(update_data)
+        
+        # --- THE CRITICAL FIX ---
+        Bot.set_current(bot)
+        
         await dp.process_update(update)
     except Exception as e:
         logger.error(f"CRITICAL LOW-LEVEL DISPATCHER ERROR: Failed to process update.", exc_info=True)
