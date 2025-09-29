@@ -3,13 +3,13 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 14 (Previous): Fixed bot context loss in message handlers.
-#  FIX 15 (Current - CRITICAL AIOGRAM CONTEXT FIX):                             
-#   1. **Callback Context Loss Fixed:** Replaced `call.answer()` in the         
-#      `handle_cmd_callback` function with the explicit call to                  
-#      `bot.answer_callback_query(call.id)`. This resolves the final known      
-#      `RuntimeError: Can't get bot instance from context` when users click     
-#      inline buttons, ensuring the core start/help flow is fully robust.       
+#  FIX 16 (CRITICAL CALLBACK FIX + ADMIN COMMANDS):                             
+#   1. **AttributeError Fix:** Removed the non-existent `call.message.as_current()` 
+#      call and explicitly set the necessary attributes on the message object 
+#      to correctly mock a user command, fixing the callback crash.
+#   2. **Admin Command Implementation:** Added full FSM and handler logic for: 
+#      /upload, /broadcast, /setmessage, /setimage, /stats, and /restore_db.
+#      The bot is now fully functional with persistent storage and admin tools.
 ################################################################################
 """
 
@@ -45,7 +45,6 @@ from aiohttp.web_runner import AppRunner, TCPSite
 
 # Configure logging to ensure all operations are tracked for reliability
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-# --- CRITICAL FIX 12: Corrected the logging level retrieval ---
 logging.basicConfig(level=getattr(logging, LOG_LEVEL),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -262,6 +261,13 @@ class Database:
         """
         await self.fetchrow(query, user_id)
 
+    async def get_all_user_ids(self, exclude_id=None):
+        """Returns a list of all user IDs."""
+        query = "SELECT id FROM users"
+        if exclude_id is not None:
+            query += f" WHERE id != {exclude_id}"
+        return await self.fetch(query)
+
     async def get_total_users(self):
         """Returns the total number of users."""
         return await self.fetchval("SELECT COUNT(*) FROM users;")
@@ -291,9 +297,10 @@ class Database:
     async def set_message_image(self, key, image_id):
         """Updates the image file_id for a specific key."""
         query = """
-        INSERT INTO messages (key, image_id) VALUES ($1, $2)
+        INSERT INTO messages (key, text, image_id) VALUES ($1, '', $2)
         ON CONFLICT (key) DO UPDATE SET image_id = EXCLUDED.image_id;
         """
+        # Ensure a default text exists if setting image on new key (though keys are created in schema)
         await self.execute(query, key, image_id)
 
     # --- SESSION/UPLOAD METHODS ---
@@ -403,13 +410,22 @@ class UserActivityMiddleware(BaseMiddleware):
 dp.middleware.setup(UserActivityMiddleware(db_manager))
 
 
-# --- FSM FOR UPLOAD PROCESS ---
+# --- FSM FOR ADMIN COMMANDS AND UPLOAD PROCESS ---
 
 class UploadFSM(StatesGroup):
     """States for the multi-step /upload command flow."""
     waiting_for_files = State()
     waiting_for_protection = State()
     waiting_for_auto_delete_time = State()
+
+class AdminFSM(StatesGroup):
+    """States for administrative commands."""
+    waiting_for_message_key = State()
+    waiting_for_new_message_text = State()
+    waiting_for_image_key = State()
+    waiting_for_new_image = State() 
+    waiting_for_broadcast_text = State()
+
 
 # --- CALLBACK DATA ---
 
@@ -427,13 +443,11 @@ async def cmd_owner_start_help(message: types.Message):
 async def cmd_user_start_help(message: types.Message):
     """
     Handles /start (including deep links) and /help commands for all users.
-    
-    CRITICAL FIX 14: Using global 'bot' instance for reliability.
     """
     command = message.get_command()
     payload = message.get_args()
     key = 'help' if command == '/help' else 'start'
-    chat_id = message.chat.id # Get chat ID explicitly
+    chat_id = message.chat.id 
 
     # 1. Handle Deep Link Payload 
     if command == '/start' and payload:
@@ -444,7 +458,7 @@ async def cmd_user_start_help(message: types.Message):
     try:
         content = await db_manager.get_message_content(key)
         if not content:
-            text = "Error: Content not found. Please contact the owner."
+            text = f"Error: '{key}' message content not found. Please contact the owner."
             image_id = None
         else:
             text, image_id = content['text'], content['image_id']
@@ -462,25 +476,33 @@ async def cmd_user_start_help(message: types.Message):
 
     # Send message with image if available, otherwise just text
     try:
-        # --- FIX 14: Use global 'bot' instance instead of 'message.answer' variants ---
-        if image_id:
+        if image_id and text:
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=image_id,
                 caption=text,
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                parse_mode=types.ParseMode.HTML
+            )
+        elif image_id and not text:
+             # If only an image is set (should not happen with defaults, but possible)
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_id,
+                caption=f"Image for /{key}",
+                reply_markup=keyboard,
             )
         else:
             await bot.send_message(
                 chat_id=chat_id,
                 text=text,
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                parse_mode=types.ParseMode.HTML
             )
         logger.info(f"User {message.from_user.id} received /{key} message.")
     except Exception as e:
         logger.error(f"Failed to send /{key} message to {message.from_user.id}: {e}")
         try:
-             # Fallback, using explicit bot instance
             await bot.send_message(chat_id, f"Failed to send full message due to a Telegram API error. Text:\n{text}")
         except Exception as fallback_e:
             logger.error(f"Critical fallback failure for chat {chat_id}: {fallback_e}")
@@ -491,21 +513,22 @@ async def handle_cmd_callback(call: types.CallbackQuery):
     """
     Handles inline button clicks for Start/Help navigation.
     """
-    # --- FIX 15: Replace call.answer() with explicit bot call for webhook reliability ---
     try:
+        # FIX 15: Answer the callback explicitly
         await bot.answer_callback_query(call.id)
     except Exception as e:
         logger.error(f"Failed to answer callback query {call.id}: {e}", exc_info=True)
 
     cmd = call.data.split(':')[1]
     
-    # We use a mock message to reuse the cmd_user_start_help logic
-    mock_message = call.message.as_current()
-    # The call.message.as_current() often loses context, so we explicitly set the user/chat info
+    # FIX 16: Use call.message directly and set attributes to mock the message object
+    mock_message = call.message 
+    
+    # Explicitly set attributes needed for cmd_user_start_help to treat it as /command
+    mock_message.text = f'/{cmd}'
     mock_message.from_user = call.from_user
     mock_message.chat = call.message.chat
-    mock_message.text = f'/{cmd}'
-    
+
     await cmd_user_start_help(mock_message)
 
 # --- DEEP LINK ACCESS LOGIC ---
@@ -537,9 +560,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
     send_protected = (is_protected and not is_owner_access)
 
     info_message = "✅ Files retrieved successfully! The delivery system guarantees reliability."
-    # Use MARKDOWN_V2 only if protected content is requested, otherwise use HTML for simplicity
-    parse_mode = types.ParseMode.MARKDOWN_V2 if send_protected else types.ParseMode.HTML
-
+    
     if send_protected:
         # Use Markdown V2 escapes for protected message
         info_message += "\n\n⚠️ **Content is Protected**\\. Forwarding and saving are disabled\\."
@@ -548,9 +569,9 @@ async def handle_deep_link(message: types.Message, session_id: str):
         delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
         delete_time_str = delete_time.strftime("%H:%M:%S on %Y-%m-%d UTC")
         # Use Markdown V2 escapes for scheduled deletion message
-        info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\\."
+        info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from _this chat_ at `{delete_time_str}`\\."
 
-    await bot.send_message(user_id, info_message, parse_mode=parse_mode)
+    await bot.send_message(user_id, info_message, parse_mode=types.ParseMode.MARKDOWN_V2 if send_protected else types.ParseMode.HTML)
 
     sent_message_ids = []
 
@@ -627,6 +648,353 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
     except Exception as e:
         logger.error(f"CRITICAL: Error during scheduled deletion for chat {chat_id}: {e}")
 
+# --- HANDLERS: ADMINISTRATIVE COMMANDS (OWNER ONLY) ---
+
+# --- CANCEL HANDLER ---
+@dp.message_handler(commands=['cancel'], state='*')
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Allows users to cancel any ongoing FSM state."""
+    current_state = await state.get_state()
+    if current_state is None:
+        await bot.send_message(message.chat.id, "Nothing to cancel.")
+        return
+
+    await state.finish()
+    await bot.send_message(message.chat.id, "✅ Operation cancelled.")
+
+# --- STATS COMMAND ---
+@dp.message_handler(is_owner_filter, commands=['stats'])
+async def cmd_stats(message: types.Message):
+    """Displays bot statistics to the owner."""
+    try:
+        stats = await db_manager.get_all_stats()
+        
+        report = (
+            "📊 **Bot Usage Statistics**\n\n"
+            f"👤 **Total Users:** `{stats.get('total_users', 0)}`\n"
+            f"🟢 **Active Users (48h):** `{stats.get('active_users', 0)}`\n"
+            f"🔗 **Total Sessions Created:** `{stats.get('total_sessions', 0)}`\n"
+            f"📄 **Total Files Uploaded:** `{stats.get('files_uploaded', 0)}`\n"
+        )
+        
+        await bot.send_message(message.chat.id, report, parse_mode=types.ParseMode.MARKDOWN)
+        logger.info(f"Owner {message.from_user.id} requested stats.")
+
+    except Exception as e:
+        logger.error(f"Failed to retrieve or send stats: {e}")
+        await bot.send_message(message.chat.id, "❌ Error retrieving statistics from the database.")
+
+
+# --- MESSAGE AND IMAGE SETTERS ---
+
+@dp.message_handler(is_owner_filter, commands=['setmessage'])
+async def cmd_set_message(message: types.Message):
+    """Starts the FSM to update /start or /help text."""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton("Start Message (/start)", callback_data=ImageTypeCallback.new(key='start')),
+        types.InlineKeyboardButton("Help Message (/help)", callback_data=ImageTypeCallback.new(key='help'))
+    )
+    await bot.send_message(message.chat.id, "Which message would you like to edit?", reply_markup=keyboard)
+    await AdminFSM.waiting_for_message_key.set()
+
+@dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_message_key)
+async def admin_set_message_key_callback(call: types.CallbackQuery, callback_data: dict, state: FSMContext):
+    """Sets the key and asks for the new message text."""
+    await bot.answer_callback_query(call.id)
+    key = callback_data['key']
+    
+    await state.update_data(message_key=key)
+    
+    current_content = await db_manager.get_message_content(key)
+    current_text = current_content['text'] if current_content and current_content['text'] else "No current text found."
+    
+    await bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"Editing **/{key}** message. Current text:\n\n---\n{current_text}\n---\n\nSend the **NEW** text you want to use (HTML allowed).",
+        parse_mode=types.ParseMode.MARKDOWN
+    )
+    await AdminFSM.waiting_for_new_message_text.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_new_message_text)
+async def admin_set_message_text(message: types.Message, state: FSMContext):
+    """Saves the new message text and resets state."""
+    data = await state.get_data()
+    key = data['message_key']
+    new_text = message.text
+    
+    try:
+        await db_manager.set_message_text(key, new_text)
+        await bot.send_message(message.chat.id, f"✅ Successfully updated the **/{key}** message text. Test it with `/{key}`.")
+    except Exception as e:
+        logger.error(f"Failed to set message text for {key}: {e}")
+        await bot.send_message(message.chat.id, "❌ Error saving the new message text to the database.")
+        
+    await state.finish()
+
+
+@dp.message_handler(is_owner_filter, commands=['setimage'])
+async def cmd_set_image(message: types.Message):
+    """Starts the FSM to update /start or /help image."""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton("Start Image (/start)", callback_data=ImageTypeCallback.new(key='start')),
+        types.InlineKeyboardButton("Help Image (/help)", callback_data=ImageTypeCallback.new(key='help'))
+    )
+    await bot.send_message(message.chat.id, "Which message image would you like to set?", reply_markup=keyboard)
+    await AdminFSM.waiting_for_image_key.set()
+
+@dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_image_key)
+async def admin_set_image_key_callback(call: types.CallbackQuery, callback_data: dict, state: FSMContext):
+    """Sets the key and asks for the new image."""
+    await bot.answer_callback_query(call.id)
+    key = callback_data['key']
+    
+    await state.update_data(image_key=key)
+    
+    await bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"Editing **/{key}** image.\n\nPlease send the **NEW** image (as a photo, not a file) you want to use for this message.",
+        parse_mode=types.ParseMode.MARKDOWN
+    )
+    await AdminFSM.waiting_for_new_image.set()
+
+@dp.message_handler(content_types=types.ContentTypes.PHOTO, state=AdminFSM.waiting_for_new_image)
+async def admin_set_new_image(message: types.Message, state: FSMContext):
+    """Saves the new image file_id and resets state."""
+    data = await state.get_data()
+    key = data['image_key']
+    
+    # Get the file_id of the largest photo size
+    image_file_id = message.photo[-1].file_id
+    
+    try:
+        await db_manager.set_message_image(key, image_file_id)
+        await bot.send_message(message.chat.id, f"✅ Successfully updated the **/{key}** message image. Test it with `/{key}`.")
+    except Exception as e:
+        logger.error(f"Failed to set message image for {key}: {e}")
+        await bot.send_message(message.chat.id, "❌ Error saving the new image ID to the database.")
+        
+    await state.finish()
+
+@dp.message_handler(state=AdminFSM.waiting_for_new_image)
+async def admin_set_new_image_invalid(message: types.Message):
+    """Handles non-photo input during image setting state."""
+    await bot.send_message(message.chat.id, "That wasn't a photo. Please send a single **PHOTO** to set as the message image, or use /cancel to stop.")
+
+
+# --- BROADCAST COMMAND ---
+
+@dp.message_handler(is_owner_filter, commands=['broadcast'])
+async def cmd_broadcast(message: types.Message):
+    """Starts the FSM to send a message to all users."""
+    await bot.send_message(message.chat.id, "Send me the message you want to broadcast to all users. I will **copy** your next message. Use /cancel to stop.")
+    await AdminFSM.waiting_for_broadcast_text.set()
+
+@dp.message_handler(state=AdminFSM.waiting_for_broadcast_text, content_types=types.ContentTypes.ANY)
+async def handle_broadcast_text(message: types.Message, state: FSMContext):
+    """Performs the broadcast operation."""
+    await state.finish() 
+    
+    # Get all user IDs (excluding the owner who is sending the message)
+    try:
+        all_users = await db_manager.get_all_user_ids(exclude_id=message.from_user.id)
+        user_ids = [row['id'] for row in all_users]
+    except Exception as e:
+        logger.error(f"Failed to fetch user list for broadcast: {e}")
+        await bot.send_message(message.chat.id, "❌ Error fetching user list for broadcast.")
+        return
+
+    success_count = 0
+    fail_count = 0
+    
+    # Send confirmation/status message immediately
+    await bot.send_message(message.chat.id, f"🚀 Starting broadcast to **{len(user_ids)}** users...", parse_mode=types.ParseMode.MARKDOWN)
+
+    # Use the original message as the content to be copied
+    for user_id in user_ids:
+        try:
+            # Copy the entire message (text, photo, video, etc.)
+            await message.copy_to(user_id, disable_notification=True)
+            success_count += 1
+        except Exception as e:
+            # Catch errors for users who blocked the bot or have invalid IDs
+            logger.warning(f"Failed to send broadcast to user {user_id}: {e}")
+            fail_count += 1
+        await asyncio.sleep(0.05) # Small delay to avoid flooding limits
+
+    report = (
+        f"📣 **Broadcast Complete**\n"
+        f"✅ Sent successfully to `{success_count}` users.\n"
+        f"❌ Failed to send to `{fail_count}` users."
+    )
+    await bot.send_message(message.chat.id, report, parse_mode=types.ParseMode.MARKDOWN)
+
+
+# --- UPLOAD COMMAND ---
+
+@dp.message_handler(is_owner_filter, commands=['upload'])
+async def cmd_upload_start(message: types.Message, state: FSMContext):
+    """Starts the file upload process."""
+    await state.update_data(files=[])
+    await bot.send_message(message.chat.id, 
+                           "📂 **Upload Started**\n\nPlease send the file(s) (Documents, Photos, Videos, or Audio) you want to share. Send `/done` when finished adding files, or `/cancel` to stop.",
+                           parse_mode=types.ParseMode.MARKDOWN)
+    await UploadFSM.waiting_for_files.set()
+
+@dp.message_handler(lambda message: message.text and message.text.lower() == '/done', state=UploadFSM.waiting_for_files)
+async def cmd_upload_done(message: types.Message, state: FSMContext):
+    """Moves from file collection to protection settings."""
+    data = await state.get_data()
+    files = data['files']
+    
+    if not files:
+        await bot.send_message(message.chat.id, "❌ No files were added. Please send at least one file or use /cancel.")
+        return
+        
+    await bot.send_message(message.chat.id, f"✅ Files added: **{len(files)}**.\n\nNext, do you want to protect this content (disable forwarding/saving) for users (Owner can always forward)?", parse_mode=types.ParseMode.MARKDOWN)
+    
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton("Yes, Protect Content 🔒", callback_data=ProtectionCallback.new(is_protected='True')),
+        types.InlineKeyboardButton("No, Allow Sharing 🔓", callback_data=ProtectionCallback.new(is_protected='False'))
+    )
+    await message.answer("Protection setting:", reply_markup=keyboard)
+    await UploadFSM.waiting_for_protection.set()
+
+@dp.message_handler(content_types=[types.ContentTypes.DOCUMENT, types.ContentTypes.PHOTO, types.ContentTypes.VIDEO, types.ContentTypes.AUDIO], state=UploadFSM.waiting_for_files)
+async def cmd_upload_files(message: types.Message, state: FSMContext):
+    """Collects file details and stores them in FSM context."""
+    file_type = None
+    file_id = None
+    
+    if message.document:
+        file_id = message.document.file_id
+        file_type = 'document'
+    elif message.photo:
+        file_id = message.photo[-1].file_id # Largest photo resolution
+        file_type = 'photo'
+    elif message.video:
+        file_id = message.video.file_id
+        file_type = 'video'
+    elif message.audio:
+        file_id = message.audio.file_id
+        file_type = 'audio'
+        
+    if file_id:
+        file_data = {
+            'file_id': file_id,
+            'caption': message.caption or '',
+            'type': file_type
+        }
+        
+        async with state.proxy() as data:
+            data['files'].append(file_data)
+        
+        await bot.send_message(message.chat.id, f"*{file_type.capitalize()} added*. Send the next file or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
+    else:
+        await bot.send_message(message.chat.id, "Could not determine file ID. Please try another format.")
+
+
+@dp.callback_query_handler(ProtectionCallback.filter(), state=UploadFSM.waiting_for_protection)
+async def cmd_upload_protection_callback(call: types.CallbackQuery, callback_data: dict, state: FSMContext):
+    """Handles protection setting and moves to auto-delete time."""
+    await bot.answer_callback_query(call.id)
+    is_protected = callback_data['is_protected'] == 'True'
+    
+    await state.update_data(is_protected=is_protected)
+    
+    protection_text = "🔒 Protection **ENABLED**." if is_protected else "🔓 Protection **DISABLED**."
+    
+    # Edit the message to show the selected option and prompt for next step
+    await bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"{protection_text}\n\nFinally, set the auto-delete time for user chats (in minutes, max **{MAX_AUTO_DELETE_MINUTES}**).\n\n*Send `0` for no auto-delete.*",
+        parse_mode=types.ParseMode.MARKDOWN
+    )
+    await UploadFSM.waiting_for_auto_delete_time.set()
+
+@dp.message_handler(lambda message: message.text and message.text.isdigit(), state=UploadFSM.waiting_for_auto_delete_time)
+async def cmd_upload_auto_delete_time(message: types.Message, state: FSMContext):
+    """Final step: saves the session and generates the deep link."""
+    auto_delete_minutes = int(message.text)
+    
+    if auto_delete_minutes < 0 or auto_delete_minutes > MAX_AUTO_DELETE_MINUTES:
+        await bot.send_message(message.chat.id, f"❌ Invalid time. Must be between 0 and {MAX_AUTO_DELETE_MINUTES} minutes. Try again or /cancel.")
+        return
+        
+    data = await state.get_data()
+    files = data['files']
+    is_protected = data['is_protected']
+    owner_id = message.from_user.id
+
+    # Create the DB session
+    try:
+        session_id = await db_manager.create_upload_session(
+            owner_id=owner_id,
+            file_data=files,
+            is_protected=is_protected,
+            auto_delete_minutes=auto_delete_minutes
+        )
+    except Exception as e:
+        logger.error(f"Failed to create upload session: {e}", exc_info=True)
+        await bot.send_message(message.chat.id, "❌ Critical database error while finalizing the session. Try again.")
+        await state.finish()
+        return
+
+    # Generate the Deep Link
+    deep_link = await get_start_link(session_id, encode=False)
+    
+    # Final confirmation message
+    delete_text = f"Auto-Delete: **{auto_delete_minutes} minutes**." if auto_delete_minutes > 0 else "Auto-Delete: **Disabled**."
+    
+    final_report = (
+        "🎉 **Upload Successful!**\n\n"
+        f"Files: **{len(files)}**\n"
+        f"Protection: **{'Enabled' if is_protected else 'Disabled'}**\n"
+        f"{delete_text}\n\n"
+        "🔗 **Your Deep Link (Click to Copy):**\n"
+        f"`{deep_link}`\n\n"
+        "The link is ready to share. Anyone clicking it will receive the files directly."
+    )
+    
+    await bot.send_message(message.chat.id, final_report, parse_mode=types.ParseMode.MARKDOWN)
+    
+    await state.finish()
+
+@dp.message_handler(state=UploadFSM.waiting_for_auto_delete_time)
+async def cmd_upload_auto_delete_invalid(message: types.Message):
+    """Handles non-numeric input for auto-delete time."""
+    await bot.send_message(message.chat.id, f"❌ Invalid input. Please send a number of minutes between 0 and {MAX_AUTO_DELETE_MINUTES}, or use /cancel.")
+
+# --- RESTORE_DB COMMAND ---
+@dp.message_handler(is_owner_filter, commands=['restore_db'])
+async def cmd_restore_db(message: types.Message):
+    """Resets default start and help messages."""
+    
+    default_start = "👋 Welcome to the Deep-Link File Bot! I securely deliver files via unique links. Reliability is guaranteed by my Neon database persistence."
+    default_help = "📚 Help: Only the owner has upload access. Files are permanent storage in a private channel. Access is granted via unique deep links. Use /start to go to the welcome message."
+    
+    try:
+        async with db_manager._pool.acquire() as conn:
+            # Insert/Update default text
+            for key, text in [('start', default_start), ('help', default_help)]:
+                query = """
+                INSERT INTO messages (key, text) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text, image_id = NULL;
+                """
+                await conn.execute(query, key, text)
+        
+        await bot.send_message(message.chat.id, "✅ **Database Restore Complete:** The `/start` and `/help` messages and images have been reset to their default values.")
+        logger.info(f"Owner {message.from_user.id} restored default messages.")
+        
+    except Exception as e:
+        logger.error(f"Failed to restore default messages: {e}")
+        await bot.send_message(message.chat.id, "❌ Error restoring default messages. Check logs.")
+
 
 # --- GLOBAL ERROR HANDLER ---
 @dp.errors_handler()
@@ -662,30 +1030,25 @@ async def health_handler(request):
     """Returns 'ok' for UptimeRobot pings."""
     return web.Response(text="ok")
 
-# --- CUSTOM MANUAL WEBHOOK HANDLER (CRITICAL FIX 13 APPLIED) ---
 async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
     Aiogram dispatcher using the safer request.json() method.
     """
     
-    # Use aiohttp's built-in JSON parser for safety
     try:
         update_data = await request.json()
     except Exception as e:
         logger.error(f"LOW-LEVEL PARSING FAILURE: Could not parse request body as JSON. {e}", exc_info=True)
         return web.Response(text="Parsing Failed", status=200)
 
-    # Process the update
     try:
         update = types.Update.to_object(update_data)
         await dp.process_update(update)
     except Exception as e:
-        # This will catch errors inside Aiogram's dispatcher
         logger.error(f"CRITICAL LOW-LEVEL DISPATCHER ERROR: Failed to process update.", exc_info=True)
         return web.Response(text="Internal Error Handled", status=200)
 
-    # Return OK to Telegram
     return web.Response(status=200)
 
 
@@ -730,14 +1093,11 @@ def main():
     """Runs the main application using aiohttp's runner."""
     logger.info("Initializing bot system...")
     
-    # Use aiohttp runner for manual control
     loop = asyncio.get_event_loop()
     app = loop.run_until_complete(init_app())
     
-    # Standard aiohttp runner setup
     runner = AppRunner(app)
     loop.run_until_complete(runner.setup())
-    # NOTE: Render expects the app to bind to 0.0.0.0 and the PORT environment variable
     site = TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
     
     logger.info(f"Starting web server on port {os.getenv('PORT', 8080)}")
@@ -769,9 +1129,8 @@ async def on_shutdown(dp):
 
 
 if __name__ == '__main__':
-    # Ensure event loop is available and run main
     try:
         main()
     except Exception as e:
         logger.critical(f"An unhandled error occurred in main execution: {e}")
-        time.sleep(1) 
+        time.sleep(1)
