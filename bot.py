@@ -1,4 +1,4 @@
--- coding: utf-8 --
+#-- coding: utf-8 --
 
 """ Full single-file Telegram bot (Aiogram v2) - Polling only Features included:
 
