@@ -3,12 +3,14 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 12 (Previous): Fixed logging startup error.
-#  FIX 13 (Current - CRITICAL WEBHOOK ACCEPTANCE FIX):                          
-#   1. **Webhook 403 Fix:** Removed the faulty token validation check (`if request.match_info.get('token') != BOT_TOKEN:`)
-#      from the `telegram_webhook` handler. This check incorrectly returned `None` 
-#      and blocked all legitimate Telegram updates with a 403 Forbidden error.
-#      Since the route itself already contains the full token, the check is redundant.
+#  FIX 13 (Previous): Fixed webhook 403 error.
+#  FIX 14 (Current - CRITICAL AIOGRAM CONTEXT FIX):                             
+#   1. **Bot Context Loss Fixed:** Replaced all instances of `message.answer()` 
+#      and `message.answer_photo()` in the `cmd_user_start_help` handler with   
+#      direct calls to the globally defined `bot.send_message()` and           
+#      `bot.send_photo()`, explicitly passing the `chat_id`. This prevents the  
+#      "Can't get bot instance from context" error that occurs during indirect  
+#      handler calls or in webhook mode.                                        
 ################################################################################
 """
 
@@ -426,10 +428,13 @@ async def cmd_owner_start_help(message: types.Message):
 async def cmd_user_start_help(message: types.Message):
     """
     Handles /start (including deep links) and /help commands for all users.
+    
+    CRITICAL FIX 14: Using global 'bot' instance for reliability.
     """
     command = message.get_command()
     payload = message.get_args()
     key = 'help' if command == '/help' else 'start'
+    chat_id = message.chat.id # Get chat ID explicitly
 
     # 1. Handle Deep Link Payload 
     if command == '/start' and payload:
@@ -458,21 +463,28 @@ async def cmd_user_start_help(message: types.Message):
 
     # Send message with image if available, otherwise just text
     try:
+        # --- FIX 14: Use global 'bot' instance instead of 'message.answer' variants ---
         if image_id:
-            await message.answer_photo(
+            await bot.send_photo(
+                chat_id=chat_id,
                 photo=image_id,
                 caption=text,
                 reply_markup=keyboard
             )
         else:
-            await message.answer(
+            await bot.send_message(
+                chat_id=chat_id,
                 text=text,
                 reply_markup=keyboard
             )
         logger.info(f"User {message.from_user.id} received /{key} message.")
     except Exception as e:
         logger.error(f"Failed to send /{key} message to {message.from_user.id}: {e}")
-        await message.answer(f"Failed to send full message due to a Telegram API error. Text:\n{text}")
+        try:
+             # Fallback, using explicit bot instance
+            await bot.send_message(chat_id, f"Failed to send full message due to a Telegram API error. Text:\n{text}")
+        except Exception as fallback_e:
+            logger.error(f"Critical fallback failure for chat {chat_id}: {fallback_e}")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith('cmd:'))
@@ -500,11 +512,11 @@ async def handle_deep_link(message: types.Message, session_id: str):
         session = await db_manager.get_upload_session(session_id)
     except Exception as e:
         logger.error(f"DB read error during deep link access for {session_id}: {e}", exc_info=True)
-        await message.answer("❌ Error: The database is currently unreachable. Cannot verify or deliver the file.")
+        await bot.send_message(user_id, "❌ Error: The database is currently unreachable. Cannot verify or deliver the file.")
         return
 
     if not session:
-        await message.answer("❌ Error: The file session ID is invalid or has expired. Files remain in DB & channel.")
+        await bot.send_message(user_id, "❌ Error: The file session ID is invalid or has expired. Files remain in DB & channel.")
         return
 
     is_owner_access = (user_id == OWNER_ID)
@@ -526,7 +538,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
         delete_time_str = delete_time.strftime("%H:%M:%S on %Y-%m-%d UTC")
         info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\\."
 
-    await message.answer(info_message, parse_mode=parse_mode)
+    await bot.send_message(user_id, info_message, parse_mode=parse_mode)
 
     sent_message_ids = []
 
@@ -572,7 +584,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
 
     except Exception as e:
         logger.error(f"CRITICAL: Failed to send files for session {session_id} to user {user_id}: {e}")
-        await message.answer("A critical error occurred while sending files. Some files might be missing.")
+        await bot.send_message(user_id, "A critical error occurred while sending files. Some files might be missing.")
 
     if auto_delete_minutes > 0 and not is_owner_access and sent_message_ids:
         delay = auto_delete_minutes * 60
@@ -627,7 +639,7 @@ async def handle_all_text_messages(message: types.Message):
     if message.text.startswith('/'):
         return 
     
-    await message.answer("I received your message, but I only understand commands like /start or /help.")
+    await bot.send_message(message.chat.id, "I received your message, but I only understand commands like /start or /help.")
 
 
 # --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS ---
@@ -642,9 +654,6 @@ async def telegram_webhook(request):
     Handles the incoming Telegram update POST request and passes it to the
     Aiogram dispatcher using the safer request.json() method.
     """
-    # --- CRITICAL FIX 13: Removed the faulty token check ---
-    # The request must match the full WEBHOOK_PATH containing the token to reach this function,
-    # making a manual match_info check redundant and error-prone.
     
     # Use aiohttp's built-in JSON parser for safety
     try:
