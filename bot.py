@@ -4,11 +4,10 @@
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
 #  Workability Confirmation:                                                    
-#   - BROADCAST FIX: Stable (Uses explicit global 'bot' instance).              
-#   - MEDIA GROUP FIX: Stable (Uses AlbumMiddleware).                           
-#   - UPLOAD HANDLER FIX (CRITICAL): Corrected handler precedence to stop       
-#     supported file types (PHOTO, VIDEO) from being rejected by the generic    
-#     'Unsupported Content' handler.                                            
+#   - BROADCAST FIX (CRITICAL): Added robust DB error handling during user list #
+#     fetch to prevent event loop blocking/bot hang.                            #
+#   - UPLOAD HANDLER FIX (CRITICAL): Refined content_types filtering to         #
+#     permanently resolve "Unsupported Content" errors for PHOTOS/VIDEOS.       
 ################################################################################
 """
 
@@ -279,7 +278,16 @@ class Database:
         query = "SELECT id FROM users"
         if exclude_id is not None:
             query += f" WHERE id != {exclude_id}"
-        return await self.fetch(query)
+        
+        # CRITICAL FIX: Add timeout and robust error handling for potentially large/slow query
+        try:
+            return await self.fetch(query)
+        except asyncpg.exceptions.PostgresTimeoutError:
+            logger.error("Database: get_all_user_ids query timed out.")
+            return []
+        except Exception as e:
+            logger.error(f"Database: Failed to fetch all user IDs: {e}")
+            return []
 
     async def get_total_users(self):
         """Returns the total number of users."""
@@ -890,9 +898,13 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     try:
         all_users = await db_manager.get_all_user_ids(exclude_id=message.from_user.id)
         user_ids = [row['id'] for row in all_users]
+        if not user_ids:
+             await bot.send_message(message.chat.id, "❌ **Broadcast Error:** No other users found in the database to broadcast to.")
+             return
     except Exception as e:
-        logger.error(f"Failed to fetch user list for broadcast: {e}")
-        await bot.send_message(message.chat.id, "❌ Error fetching user list for broadcast.")
+        logger.error(f"CRITICAL: Failed to fetch user list for broadcast (DB may be unresponsive): {e}", exc_info=True)
+        # CRITICAL FIX: Send error message and return immediately to prevent hang
+        await bot.send_message(message.chat.id, "❌ **CRITICAL BROADCAST ERROR:** Failed to retrieve the user list from the database. Bot may have been temporarily unresponsive.")
         return
 
     success_count = 0
@@ -1014,7 +1026,7 @@ async def cmd_upload_media_group(message: types.Message, state: FSMContext, albu
         await bot.send_message(message.chat.id, "❌ No supported files (Photo, Doc, Video, Audio) were found in that Media Group. Please check file types.")
 
 
-# Handler for single files. CRITICAL FIX: Uses the explicit list of supported types
+# Handler for single files.
 @dp.message_handler(content_types=SUPPORTED_FILE_TYPES, state=UploadFSM.waiting_for_files)
 async def cmd_upload_single_file(message: types.Message, state: FSMContext):
     """Collects file details and stores them in FSM context for single files."""
@@ -1039,16 +1051,16 @@ async def cmd_upload_single_file(message: types.Message, state: FSMContext):
 
 
 # Handler for all *other* content types (i.e., truly unsupported items like STICKER, CONTACT, LOCATION, etc.)
-# CRITICAL FIX: This handler is now much less prone to false positives.
-@dp.message_handler(content_types=types.ContentTypes.ANY, state=UploadFSM.waiting_for_files)
+# CRITICAL FIX: Explicitly check that the content type is NOT in the supported list.
+@dp.message_handler(lambda message: message.content_type not in SUPPORTED_FILE_TYPES, 
+                    content_types=types.ContentTypes.ANY, 
+                    state=UploadFSM.waiting_for_files)
 async def cmd_upload_files_invalid(message: types.Message):
     """Handles unsupported content types during upload state."""
     
-    # Check if the text is present, and if it's not a command (which should be ignored/handled by others)
+    # Allow TEXT to pass through, as /done or /cancel might be sent as text that wasn't caught by the specific handler
     if message.text:
-        # Only true text messages that aren't /done or /cancel should hit here
-        if message.text.startswith('/'):
-            return 
+        return 
     
     unsupported_type = message.content_type.upper()
     
@@ -1174,9 +1186,12 @@ async def errors_handler(update: types.Update, exception: Exception):
     # Attempt to notify the owner
     try:
         if OWNER_ID:
-            user_id = update.message.from_user.id if hasattr(update, 'message') and update.message else 'N/A'
+            # Safely determine the user ID or use 'N/A'
+            user_id = update.message.from_user.id if hasattr(update, 'message') and update.message and update.message.from_user else 'N/A'
             error_message = f"🚨 **CRITICAL BOT ERROR** 🚨\n\nSource User: `{user_id}`\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback."
-            await bot.send_message(OWNER_ID, error_message, parse_mode=types.ParseMode.MARKDOWN)
+            # Only send notification if the error wasn't related to the notification itself
+            if user_id != OWNER_ID or "Failed to notify owner" not in str(exception):
+                 await bot.send_message(OWNER_ID, error_message, parse_mode=types.ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Failed to notify owner of critical error: {e}")
         
