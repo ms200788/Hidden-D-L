@@ -3,13 +3,11 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 10 (Previous): Manual Webhook Setup with Aiohttp runner.
-#  FIX 11 (Current - CRITICAL WEBHOOK PARSING):                                 
-#   1. **Optimized JSON Reading:** Changed the low-level webhook handler from   
-#      `await request.text()` + `json.loads()` to the safer `await request.json()` 
-#      method. This is the most reliable way to parse the incoming Telegram JSON 
-#      update in an aiohttp environment, preventing potential silent failures   
-#      due to encoding or content-type mismatch.                                
+#  FIX 11 (Previous): Safer JSON Parsing in Webhook handler.
+#  FIX 12 (Current - CRITICAL STARTUP FIX):                                     
+#   1. **Logging Typo Fixed:** Corrected the `logging.basicConfig` call from    
+#      `getattr(LOG_LEVEL, LOG_LEVEL)` to `getattr(logging, LOG_LEVEL)`.        
+#      This ensures the application starts without the 'AttributeError'.        
 ################################################################################
 """
 
@@ -45,7 +43,8 @@ from aiohttp.web_runner import AppRunner, TCPSite
 
 # Configure logging to ensure all operations are tracked for reliability
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=getattr(LOG_LEVEL, LOG_LEVEL),
+# --- CRITICAL FIX 12: Corrected the logging level retrieval ---
+logging.basicConfig(level=getattr(logging, LOG_LEVEL),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -636,7 +635,7 @@ async def health_handler(request):
     """Returns 'ok' for UptimeRobot pings."""
     return web.Response(text="ok")
 
-# --- CUSTOM MANUAL WEBHOOK HANDLER (CRITICAL FIX 11 APPLIED) ---
+# --- CUSTOM MANUAL WEBHOOK HANDLER ---
 async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
@@ -646,7 +645,7 @@ async def telegram_webhook(request):
         logger.warning(f"Received webhook request with invalid token: {request.match_info.get('token')}")
         return web.Response(status=403) 
 
-    # --- CRITICAL FIX 11: Use request.json() ---
+    # Use aiohttp's built-in JSON parser for safety
     try:
         update_data = await request.json()
     except Exception as e:
@@ -680,7 +679,6 @@ async def init_app():
     app = web.Application()
     
     # Register core webhook route and healthcheck
-    # Note: The route uses the BOT_TOKEN as a variable to handle the path matching
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
     app.router.add_get('/health', health_handler)
     
@@ -690,8 +688,6 @@ async def init_app():
             webhook_info = await bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-                # We do NOT use the path variable in set_webhook here, 
-                # as the path is derived from the token, which is already in WEBHOOK_URL.
                 await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
             else:
                 logger.info("Webhook already set correctly.")
@@ -717,9 +713,10 @@ def main():
     # Standard aiohttp runner setup
     runner = AppRunner(app)
     loop.run_until_complete(runner.setup())
-    site = TCPSite(runner, '0.0.0.0', HEALTHCHECK_PORT)
+    # NOTE: Render expects the app to bind to 0.0.0.0 and the PORT environment variable
+    site = TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
     
-    logger.info(f"Starting web server on port {HEALTHCHECK_PORT}")
+    logger.info(f"Starting web server on port {os.getenv('PORT', 8080)}")
     try:
         loop.run_until_complete(site.start())
         loop.run_forever()
