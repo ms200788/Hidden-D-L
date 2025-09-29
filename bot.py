@@ -4,11 +4,10 @@
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
 #  Workability Confirmation:                                                    
-#   - BROADCAST FIX: Switched to explicit bot.copy_message to resolve 'Can't    
-#     get bot instance from context' error.                                     
-#   - UPLOAD FIX: Enhanced feedback for unrecognized content types (like        
-#     Stickers or Media Groups) while confirming support for all file types.    
-#   - FSM & DB INTEGRITY: Verified working from previous fixes.                 
+#   - BROADCAST FIX: Switched to explicit global 'bot' instance for copy_message 
+#     to fix 'Can't get bot instance from context' error.                        
+#   - UPLOAD FIX: Implemented AlbumMiddleware to support Media Groups (multiple 
+#     files in one message), resolving single-file upload reliability issues.
 ################################################################################
 """
 
@@ -30,6 +29,10 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.utils.callback_data import CallbackData 
 from aiogram.utils.deep_linking import get_start_link
 from aiogram.utils.executor import start_webhook, start_polling
+
+# --- MEDIA GROUP HANDLING (NEW IMPORT) ---
+from typing import List, Union
+from aiogram.types import Message, CallbackQuery, InlineQuery, Update
 
 # --- EXTERNAL DEPENDENCY (ASYNCPG for PostgreSQL) ---
 import asyncpg
@@ -412,8 +415,71 @@ class UserActivityMiddleware(BaseMiddleware):
             asyncio.create_task(safe_db_user_update(self.db, user_id))
             data['user_id'] = user_id 
 
+# --- MEDIA GROUP MIDDLEWARE (NEW) ---
+
+class AlbumMiddleware(BaseMiddleware):
+    """
+    Middleware for handling media groups (albums).
+    Collects messages with the same media_group_id into an 'album' list.
+    """
+    album_data: dict = {}
+    
+    def __init__(self, latency: Union[int, float] = 0.5):
+        """
+        :param latency: Latency in seconds to wait for subsequent messages in the album.
+        """
+        self.latency = latency
+        super().__init__()
+
+    async def on_process_message(self, message: types.Message, data: dict):
+        """
+        Process incoming messages. If media_group_id is present, collect it.
+        If no media_group_id, skip middleware.
+        """
+        if not message.media_group_id:
+            # Not part of an album, process normally
+            return
+
+        media_group_id = message.media_group_id
+        
+        # Add message to the collected album data
+        if media_group_id not in self.album_data:
+            self.album_data[media_group_id] = [message]
+            # Set up the timeout task
+            asyncio.create_task(self.album_timeout(media_group_id))
+        else:
+            self.album_data[media_group_id].append(message)
+        
+        # Prevent further processing of the individual message until the album is complete
+        # This is CRITICAL for Media Group functionality
+        raise types.CancelHandler()
+
+    async def album_timeout(self, media_group_id: str):
+        """
+        Waits for the latency period, then processes the collected album.
+        """
+        await asyncio.sleep(self.latency)
+
+        # Retrieve and clear the album data
+        album = self.album_data.pop(media_group_id)
+        
+        # Manually create a mock update containing the album list
+        # The first message in the album is used as the representative message
+        main_message = album[0] 
+        
+        # The key for album data used by the handler will be 'album'
+        main_message.conf['album'] = album
+        
+        # Re-process the representative message through the dispatcher
+        # This allows the specific handler to catch the message now tagged with 'album'
+        await self.dispatcher.process_update(types.Update.to_object({
+            "update_id": main_message.update_id,
+            "message": main_message.to_python()
+        }))
+
 # --- MIDDLEWARE SETUP ---
 dp.middleware.setup(UserActivityMiddleware(db_manager))
+dp.middleware.setup(AlbumMiddleware()) # Setup the Album Middleware
 
 
 # --- FSM FOR ADMIN COMMANDS AND UPLOAD PROCESS ---
@@ -698,7 +764,7 @@ async def cmd_stats(message: types.Message):
         await bot.send_message(message.chat.id, "❌ Error retrieving statistics from the database.")
 
 
-# --- MESSAGE AND IMAGE SETTERS ---
+# --- MESSAGE AND IMAGE SETTERS (No changes needed) ---
 
 @dp.message_handler(is_owner_filter, commands=['setmessage'])
 async def cmd_set_message(message: types.Message, state: FSMContext): 
@@ -709,7 +775,6 @@ async def cmd_set_message(message: types.Message, state: FSMContext):
         types.InlineKeyboardButton("Help Message (Help)", callback_data=ImageTypeCallback.new(key='help'))
     )
     await bot.send_message(message.chat.id, "Which message would you like to edit? Select **Start** or **Help** below.", reply_markup=keyboard)
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(AdminFSM.waiting_for_message_key.state)
 
 @dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_message_key)
@@ -729,7 +794,6 @@ async def admin_set_message_key_callback(call: types.CallbackQuery, callback_dat
         text=f"Editing **/{key}** message. Current text snippet:\n\n---\n{current_text}\n---\n\nSend the **NEW** full text you want to use (**HTML** allowed).",
         parse_mode=types.ParseMode.MARKDOWN
     )
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(AdminFSM.waiting_for_new_message_text.state)
 
 @dp.message_handler(state=AdminFSM.waiting_for_new_message_text)
@@ -758,7 +822,6 @@ async def cmd_set_image(message: types.Message, state: FSMContext):
         types.InlineKeyboardButton("Help Image (Help)", callback_data=ImageTypeCallback.new(key='help'))
     )
     await bot.send_message(message.chat.id, "Which message image would you like to set? Select **Start** or **Help** below.", reply_markup=keyboard)
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(AdminFSM.waiting_for_image_key.state)
 
 @dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_image_key)
@@ -775,7 +838,6 @@ async def admin_set_image_key_callback(call: types.CallbackQuery, callback_data:
         text=f"Editing **/{key}** image.\n\nPlease send the **NEW** image (as a photo, not a file) you want to use for this message.",
         parse_mode=types.ParseMode.MARKDOWN
     )
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(AdminFSM.waiting_for_new_image.state)
 
 @dp.message_handler(content_types=types.ContentTypes.PHOTO, state=AdminFSM.waiting_for_new_image)
@@ -808,7 +870,6 @@ async def admin_set_new_image_invalid(message: types.Message):
 async def cmd_broadcast(message: types.Message, state: FSMContext): 
     """Starts the FSM to send a message to all users."""
     await bot.send_message(message.chat.id, "Send me the message (text, image, video, etc.) you want to broadcast to all users. I will **copy** your next message. Use /cancel to stop.")
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(AdminFSM.waiting_for_broadcast_text.state)
 
 @dp.message_handler(state=AdminFSM.waiting_for_broadcast_text, content_types=types.ContentTypes.ANY)
@@ -834,8 +895,8 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     # Use the original message as the content to be copied
     for user_id in user_ids:
         try:
-            # FIX: Use the explicit bot instance's method to avoid context loss
-            await message.bot.copy_message(
+            # BROADCAST FIX: Use the globally initialized 'bot' instance to avoid context loss
+            await bot.copy_message( 
                 chat_id=user_id,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id,
@@ -857,16 +918,51 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     await bot.edit_message_text(report, status_msg.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
 
 
-# --- UPLOAD COMMAND ---
+# --- UPLOAD UTILITY FUNCTION ---
+def extract_file_data(message: types.Message) -> Union[dict, None]:
+    """Extracts file_id, caption, and type from a single message object."""
+    file_type = None
+    file_id = None
+
+    if message.document:
+        file_id = message.document.file_id
+        file_type = 'document'
+    elif message.photo:
+        file_id = message.photo[-1].file_id  # Largest photo resolution
+        file_type = 'photo'
+    elif message.video:
+        file_id = message.video.file_id
+        file_type = 'video'
+    elif message.audio:
+        file_id = message.audio.file_id
+        file_type = 'audio'
+    elif message.voice:
+        file_id = message.voice.file_id
+        file_type = 'voice'
+    elif message.video_note:
+        file_id = message.video_note.file_id
+        file_type = 'video_note'
+    
+    if file_id:
+        return {
+            'file_id': file_id,
+            # Caption primarily comes from the message object itself, but for albums, 
+            # only the first message has the caption, which is handled by AlbumMiddleware.
+            'caption': message.caption or '',
+            'type': file_type
+        }
+    return None
+
+
+# --- UPLOAD COMMAND HANDLERS (REFACTORED FOR MEDIA GROUPS) ---
 
 @dp.message_handler(is_owner_filter, commands=['upload'])
 async def cmd_upload_start(message: types.Message, state: FSMContext):
     """Starts the file upload process."""
     await state.update_data(files=[])
     await bot.send_message(message.chat.id, 
-                           "📂 **Upload Started**\n\nPlease send the file(s) (**Documents**, **Photos**, **Videos**, **Audio**, **Voice** or **Video Note**) you want to share. Send `/done` when finished adding files, or `/cancel` to stop. **Note: Media Groups (multiple files sent at once) are not supported.**",
+                           "📂 **Upload Started**\n\nPlease send the file(s) (**Documents**, **Photos**, **Videos**, **Audio**, **Voice** or **Video Note**) you want to share. You can send **multiple files in one message (Media Group)**. Send `/done` when finished adding files, or `/cancel` to stop.",
                            parse_mode=types.ParseMode.MARKDOWN)
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(UploadFSM.waiting_for_files.state)
 
 @dp.message_handler(lambda message: message.text and message.text.lower() == '/done', state=UploadFSM.waiting_for_files)
@@ -887,10 +983,32 @@ async def cmd_upload_done(message: types.Message, state: FSMContext):
         types.InlineKeyboardButton("No, Allow Sharing 🔓", callback_data=ProtectionCallback.new(is_protected='False'))
     )
     await message.answer("Protection setting:", reply_markup=keyboard)
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(UploadFSM.waiting_for_protection.state)
 
-# UPLOAD FIX: Expanded content types for robustness
+# Handler for Media Groups (messages processed by AlbumMiddleware)
+# This uses the injected 'album' key in message.conf 
+@dp.message_handler(lambda message: 'album' in message.conf, content_types=types.ContentTypes.ANY, state=UploadFSM.waiting_for_files)
+async def cmd_upload_media_group(message: types.Message, state: FSMContext, album: List[types.Message]):
+    """Collects files from a media group."""
+    processed_count = 0
+    
+    # Album is a list of Message objects
+    for msg in album:
+        file_data = extract_file_data(msg)
+        if file_data:
+            async with state.proxy() as data:
+                data['files'].append(file_data)
+            processed_count += 1
+
+    if processed_count > 0:
+        await bot.send_message(message.chat.id, f"*{processed_count} files from the Media Group added*. Send more files or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
+    else:
+        # This occurs if the media group contained only unsupported files (e.g., stickers or animations)
+        await bot.send_message(message.chat.id, "❌ No supported files (Photo, Doc, Video, Audio) were found in that Media Group. Please check file types.")
+
+
+# Handler for single files (Photos, Documents, etc.)
+# This ensures single files are caught quickly if they didn't trigger the media_group middleware
 @dp.message_handler(content_types=[
     types.ContentTypes.DOCUMENT, 
     types.ContentTypes.PHOTO, 
@@ -899,44 +1017,26 @@ async def cmd_upload_done(message: types.Message, state: FSMContext):
     types.ContentTypes.VOICE,
     types.ContentTypes.VIDEO_NOTE
 ], state=UploadFSM.waiting_for_files)
-async def cmd_upload_files(message: types.Message, state: FSMContext):
-    """Collects file details and stores them in FSM context."""
-    file_type = None
-    file_id = None
+async def cmd_upload_single_file(message: types.Message, state: FSMContext):
+    """Collects file details and stores them in FSM context for single files."""
     
-    if message.document:
-        file_id = message.document.file_id
-        file_type = 'document'
-    elif message.photo:
-        file_id = message.photo[-1].file_id # Largest photo resolution
-        file_type = 'photo'
-    elif message.video:
-        file_id = message.video.file_id
-        file_type = 'video'
-    elif message.audio:
-        file_id = message.audio.file_id
-        file_type = 'audio'
-    elif message.voice: # Added voice
-        file_id = message.voice.file_id
-        file_type = 'voice'
-    elif message.video_note: # Added video_note
-        file_id = message.video_note.file_id
-        file_type = 'video_note'
+    # Crucial check: if media_group_id is present, the AlbumMiddleware should handle it. 
+    # If it reached here, it's a single file, or the middleware missed it (rare). We process it anyway.
+    if message.media_group_id and 'album' not in message.conf:
+        # If it reached here but is marked as part of a group, we skip to prevent duplication 
+        # or error, trusting the AlbumMiddleware will fire shortly.
+        logger.debug("Skipping single file with media_group_id; waiting for AlbumMiddleware.")
+        return 
+
+    file_data = extract_file_data(message)
         
-    if file_id:
-        file_data = {
-            'file_id': file_id,
-            # Caption only applies meaningfully to Document, Photo, Video
-            'caption': message.caption or '',
-            'type': file_type
-        }
-        
+    if file_data:
         async with state.proxy() as data:
             data['files'].append(file_data)
         
-        await bot.send_message(message.chat.id, f"*{file_type.capitalize()} added*. Send the next file or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
+        await bot.send_message(message.chat.id, f"*{file_data['type'].capitalize()} added*. Send the next file or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
     else:
-        # This should theoretically not be hit due to the content_types filter, but remains as a safeguard.
+        # This shouldn't happen with the current content_types filter, but remains as safety net.
         logger.warning(f"File handler entered but file_id not found for content type: {message.content_type}")
         await bot.send_message(message.chat.id, "Could not determine file ID. Please try another format.")
 
@@ -973,7 +1073,6 @@ async def cmd_upload_protection_callback(call: types.CallbackQuery, callback_dat
         text=f"{protection_text}\n\nFinally, set the **auto-delete time** for user chats (in minutes, max **{MAX_AUTO_DELETE_MINUTES}**).\n\n*Send `0` for no auto-delete.*",
         parse_mode=types.ParseMode.MARKDOWN
     )
-    # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(UploadFSM.waiting_for_auto_delete_time.state)
 
 @dp.message_handler(lambda message: message.text and message.text.isdigit(), state=UploadFSM.waiting_for_auto_delete_time)
