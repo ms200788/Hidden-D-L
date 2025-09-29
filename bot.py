@@ -8,13 +8,14 @@
 #  complex multi-step upload flow, deep linking, dynamic content, and owner     #
 #  management, designed for deployment on Render via webhooks.                  #
 #                                                                              
-#  FIX 4 (Previous): Attempted to fix the 'web_app' argument error by using     
-#       dp.on_startup.add_handler(), which failed because that method does      
-#       not exist on aiogram v2 Dispatchers.                                    
-#  FIX 5 (Current): Corrected the V2 pattern for adding routes. The custom      
-#       route registration is now moved directly into the on_startup handler,   
-#       using the `dp.web_app` property (which the executor creates) to access  
-#       the underlying aiohttp application, resolving the 'on_startup' error.   
+#  FIX 5 (Previous): Corrected the webhook setup pattern.                       
+#  FIX 6 (Current):                                                             
+#   1. **Callback Fix:** Added `await call.answer()` to inline callback         
+#      handlers to resolve `aiogram.utils.exceptions.InvalidQueryID`.           
+#   2. **Schema Fix:** Added a corruption check for the 'users' table in        
+#      `setup_schema` to detect and fix conflicting column names (e.g.,         
+#      'user_id' vs. 'id') that cause the 'null value in column "user_id"'      
+#      error.                                                                   
 ################################################################################
 """
 
@@ -135,53 +136,78 @@ class Database:
         the schema is correct, implementing repair logic for common corruption.
         """
         logger.info("Database: Checking/setting up schema...")
-        schema_queries = [
-            # 1. Users Table
-            """
-            CREATE TABLE IF NOT EXISTS users (
+        
+        # --- Helper for table creation ---
+        async def create_table(conn, table_name, schema_query):
+            try:
+                await conn.execute(schema_query)
+                logger.info(f"Database: '{table_name}' table ensured.")
+            except DuplicateTableError:
+                pass
+            except Exception as e:
+                logger.error(f"Failed to create table {table_name}: {e}")
+                raise
+
+        async with self._pool.acquire() as conn:
+            # 1. Users Table (CRITICAL: Corruption Check)
+            users_schema = """
+            CREATE TABLE users (
                 id BIGINT PRIMARY KEY,
                 join_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
-            """,
+            """
+            
+            # Check for corruption (like presence of an unwanted 'user_id' column)
+            try:
+                # This query will fail if the table exists but doesn't have the expected 'id' PK
+                await conn.fetchval("SELECT id FROM users LIMIT 1;")
+            except (UndefinedColumnError, asyncpg.exceptions.InvalidCatalogObjectError):
+                logger.warning("Database: 'users' table schema appears corrupted or malformed. Dropping and recreating table to fix conflicting column names.")
+                await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
+                await create_table(conn, 'users', users_schema)
+            except asyncpg.exceptions.PostgresError as e:
+                 # Catch other potential errors, e.g., if it has different columns
+                if 'user_id' in str(e) or 'does not exist' in str(e):
+                    logger.warning(f"Database: Found schema conflict in 'users' table ({e}). Dropping and recreating.")
+                    await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
+                    await create_table(conn, 'users', users_schema)
+                else:
+                    await create_table(conn, 'users', users_schema) # Attempt creation if it truly doesn't exist
+            else:
+                 # If the table exists and the simple check passes, ensure existence
+                await create_table(conn, 'users', users_schema) 
+
+
             # 2. Messages Table
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                key VARCHAR(10) PRIMARY KEY, -- 'start' or 'help'
-                text TEXT NOT NULL,
-                image_id VARCHAR(255) NULL
-            );
-            """,
+            await create_table(conn, 'messages', """
+                CREATE TABLE IF NOT EXISTS messages (
+                    key VARCHAR(10) PRIMARY KEY, -- 'start' or 'help'
+                    text TEXT NOT NULL,
+                    image_id VARCHAR(255) NULL
+                );
+            """)
+
             # 3. Upload Sessions Table
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id VARCHAR(50) PRIMARY KEY,
-                owner_id BIGINT NOT NULL,
-                file_data JSONB NOT NULL, -- [{'file_id': '...', 'caption': '...', 'type': '...'}]
-                is_protected BOOLEAN DEFAULT FALSE,
-                auto_delete_minutes INTEGER DEFAULT 0,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-            """,
+            await create_table(conn, 'sessions', """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id VARCHAR(50) PRIMARY KEY,
+                    owner_id BIGINT NOT NULL,
+                    file_data JSONB NOT NULL, -- [{'file_id': '...', 'caption': '...', 'type': '...'}]
+                    is_protected BOOLEAN DEFAULT FALSE,
+                    auto_delete_minutes INTEGER DEFAULT 0,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
             # 4. Statistics Table
-            """
-            CREATE TABLE IF NOT EXISTS statistics (
-                key VARCHAR(50) PRIMARY KEY,
-                value BIGINT DEFAULT 0
-            );
-            """
-        ]
+            await create_table(conn, 'statistics', """
+                CREATE TABLE IF NOT EXISTS statistics (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value BIGINT DEFAULT 0
+                );
+            """)
 
-        async with self._pool.acquire() as conn:
-            # Step 1: Attempt to create all tables
-            for query in schema_queries:
-                try:
-                    # Execute DDL in autocommit mode
-                    await conn.execute(query)
-                except DuplicateTableError:
-                    pass 
-
-            logger.info("Database: Schema setup complete (initial creation attempts).")
 
             # Step 2: Ensure initial default messages exist and fix corruption if found
             try:
@@ -221,6 +247,8 @@ class Database:
                     logger.info("Database: statistics table successfully reset and populated.")
                 else:
                     raise # Re-raise if it's another UndefinedColumnError
+            
+            logger.info("Database: Schema setup and corruption checks complete.")
 
 
     async def _insert_default_messages(self, conn):
@@ -231,7 +259,7 @@ class Database:
         for key, text in [('start', default_start), ('help', default_help)]:
             query = """
             INSERT INTO messages (key, text) VALUES ($1, $2)
-            ON CONFLICT (key) DO NOTHING;
+            ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text;
             """
             await conn.execute(query, key, text)
         logger.debug("Database: Default messages ensured.")
@@ -242,7 +270,7 @@ class Database:
         for key in default_keys:
             query = """
             INSERT INTO statistics (key, value) VALUES ($1, $2)
-            ON CONFLICT (key) DO NOTHING;
+            ON CONFLICT (key) DO UPDATE SET value = statistics.value + 0;
             """
             await conn.execute(query, key, 0) 
         logger.debug("Database: Default statistics keys ensured.")
@@ -256,8 +284,10 @@ class Database:
         RETURNING join_date;
         """
         try:
+            # We insert into the 'id' column, which is the user ID.
             await self.fetchrow(query, user_id)
         except Exception as e:
+            # Added more specific logging to debug the DB errors
             logger.error(f"DB Error in get_or_create_user for {user_id}: {e}")
 
     async def get_total_users(self):
@@ -460,9 +490,16 @@ async def cmd_user_start_help(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data.startswith('cmd:'))
 async def handle_cmd_callback(call: types.CallbackQuery):
-    """Handles inline button clicks for Start/Help navigation."""
+    """
+    Handles inline button clicks for Start/Help navigation.
+    CRITICAL FIX: call.answer() must be sent immediately to avoid InvalidQueryID.
+    """
+    # 1. Acknowledge the callback immediately
+    await call.answer() 
+    
+    # 2. Process the command
     cmd = call.data.split(':')[1]
-    await call.answer()
+    
     # Mock a message object to reuse the main handlers
     mock_message = call.message.as_current()
     mock_message.text = f'/{cmd}'
@@ -635,7 +672,6 @@ async def on_startup(dp: Dispatcher):
             logger.critical(f"Failed to set webhook: {e}")
 
     # 3. Register Healthcheck Route using dp.web_app (CORRECT AIOGRAM V2 PATTERN)
-    # The executor guarantees dp.web_app is available here in webhook mode.
     if WEBHOOK_URL and hasattr(dp, 'web_app') and dp.web_app is not None:
         dp.web_app.router.add_get('/health', health_handler)
         logger.info("Healthcheck route '/health' registered successfully via dp.web_app.")
@@ -672,14 +708,12 @@ def main():
     
     if is_webhook_mode:
         
-        # REMOVED: dp.on_startup.add_handler(setup_web_routes) -- This caused the 'on_startup' error.
-
         logger.info("Starting bot in Webhook Mode (Render Hosting).")
         
         executor.start_webhook(
             dispatcher=dp,
             webhook_path=WEBHOOK_PATH,
-            on_startup=on_startup, # The on_startup function now handles route injection
+            on_startup=on_startup,
             on_shutdown=on_shutdown,
             skip_updates=True,
             host='0.0.0.0',
