@@ -3,9 +3,11 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: Robust media collector. Checks for file attributes (photo, video, etc.)
-#         directly instead of relying solely on the content_type enum list.     #
-#  FIXED: Added filter to collector to stop listening once /d is requested.     #
+#  FIXED: Owner Bypass for Finalization. Prevents the generic text handler      #
+#         from firing when the owner is replying with auto-delete minutes.     #
+#         (Fixes "CODE 66: I only understand commands...").                      #
+#  FIXED: Consolidated lambda filters for _receive_minutes handler for better   #
+#         dispatching reliability.                                              #
 ################################################################################
 """
 
@@ -615,8 +617,12 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
     return vaulted_file_data
 
 
-@dp.message_handler(lambda m: is_owner(m.from_user.id) and m.content_type == types.ContentTypes.TEXT, 
-                    lambda m: OWNER_ID in active_uploads and active_uploads.get(OWNER_ID, {}).get("_finalize_requested"))
+@dp.message_handler(
+    lambda m: is_owner(m.from_user.id) and
+              m.content_type == types.ContentTypes.TEXT and
+              OWNER_ID in active_uploads and 
+              active_uploads.get(OWNER_ID, {}).get("_finalize_requested")
+) # <-- CONSOLIDATED FILTER FOR RELIABILITY
 async def _receive_minutes(m: types.Message):
     """Receives auto-delete time, vaults files, creates DB session, and generates deep link."""
     
@@ -714,9 +720,6 @@ async def cmd_upload_message_collector(message: types.Message):
     """
     Collects messages during an active session, correctly handling media, text, 
     albums, and filtering unsupported content.
-    
-    FIX: Now uses direct attribute checks (message.photo, message.video, etc.) 
-    for robust media detection in webhook mode.
     """
     upload = active_uploads[OWNER_ID]
     
@@ -836,6 +839,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
     is_protected = session['is_protected']
     auto_delete_minutes = session['auto_delete_minutes']
 
+    # CRITICAL: If the session is protected, but the user is the owner, DISABLE protection.
     send_protected = (is_protected and not is_owner_access)
 
     info_message = "✅ Files retrieved successfully! The delivery system guarantees reliability."
@@ -867,7 +871,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
         send_kwargs = {
             'chat_id': user_id,
             'disable_notification': True,
-            'protect_content': send_protected 
+            'protect_content': send_protected # APPLIES THE OWNER BYPASS LOGIC
         }
         
         # Determine the correct send method and payload
@@ -899,10 +903,10 @@ async def handle_deep_link(message: types.Message, session_id: str):
         elif file_type == 'text':
             send_method = bot.send_message
             send_kwargs['text'] = caption # For text, 'caption' holds the actual message text
-            send_kwargs['protect_content'] = False # Text doesn't need protection flag
+            send_kwargs['protect_content'] = False # Text doesn't need protection flag, and is already unprotected for owner
             caption = None
         else:
-            # Skip unsupported types that were vaulted (e.g. location, contact, etc.)
+            # Skip unsupported types that were vaulted (e.g., location, contact, etc.)
             continue 
 
         # Add caption if available and the method supports it
@@ -1077,7 +1081,7 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
                 disable_notification=True
             )
             success_count += 1
-        except Exception as e:
+        except (ChatNotFound, Exception) as e: # Explicitly handling ChatNotFound and general exceptions
             # Note: We can't log the user ID directly due to privacy, so we log the error
             logger.warning(f"Failed to send broadcast to a user: {e}")
             fail_count += 1
@@ -1097,6 +1101,12 @@ async def handle_all_text_messages(message: types.Message):
     if message.text.startswith('/'):
         return 
     
+    # NEW FIX: OWNER BYPASS for auto-delete timer. If the owner is currently finalizing, 
+    # we assume the message is the minutes reply and silently ignore it here, allowing 
+    # the specific handler (_receive_minutes) to process it first.
+    if is_owner(message.from_user.id) and OWNER_ID in active_uploads and active_uploads.get(OWNER_ID, {}).get("_finalize_requested"):
+         return 
+        
     await bot.send_message(message.chat.id, "I received your message, but I only understand commands like /start or /help.")
 
 
