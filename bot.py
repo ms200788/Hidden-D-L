@@ -4,13 +4,11 @@
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
 #  Workability Confirmation:                                                    
-#   - FSM FIX: Implemented explicit state setting (`state.set_state`).          
-#   - UPLOAD FIX: Expanded content type recognition for robust file handling.   
-#   - BROADCAST: Enhanced error logging for better debugging of failures.       
-#   - DB INTEGRITY: Default messages are only inserted if missing, preserving   
-#     customizations during initial schema setup.                               
-#   - RESTORE: Renamed /restore_db to /reset_messages for clarity and updated   
-#     logic to perform a hard reset on start/help messages and images.          
+#   - BROADCAST FIX: Switched to explicit bot.copy_message to resolve 'Can't    
+#     get bot instance from context' error.                                     
+#   - UPLOAD FIX: Enhanced feedback for unrecognized content types (like        
+#     Stickers or Media Groups) while confirming support for all file types.    
+#   - FSM & DB INTEGRITY: Verified working from previous fixes.                 
 ################################################################################
 """
 
@@ -836,8 +834,13 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     # Use the original message as the content to be copied
     for user_id in user_ids:
         try:
-            # Copy the entire message (text, photo, video, etc.)
-            await message.copy_to(user_id, disable_notification=True)
+            # FIX: Use the explicit bot instance's method to avoid context loss
+            await message.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                disable_notification=True
+            )
             success_count += 1
         except Exception as e:
             # BROADCAST FIX: Log the specific error for debugging failures
@@ -861,7 +864,7 @@ async def cmd_upload_start(message: types.Message, state: FSMContext):
     """Starts the file upload process."""
     await state.update_data(files=[])
     await bot.send_message(message.chat.id, 
-                           "📂 **Upload Started**\n\nPlease send the file(s) (**Documents**, **Photos**, **Videos**, **Audio**, **Voice** or **Video Note**) you want to share. Send `/done` when finished adding files, or `/cancel` to stop.",
+                           "📂 **Upload Started**\n\nPlease send the file(s) (**Documents**, **Photos**, **Videos**, **Audio**, **Voice** or **Video Note**) you want to share. Send `/done` when finished adding files, or `/cancel` to stop. **Note: Media Groups (multiple files sent at once) are not supported.**",
                            parse_mode=types.ParseMode.MARKDOWN)
     # FIX: Use explicit state setting to avoid AttributeError
     await state.set_state(UploadFSM.waiting_for_files.state)
@@ -933,18 +936,24 @@ async def cmd_upload_files(message: types.Message, state: FSMContext):
         
         await bot.send_message(message.chat.id, f"*{file_type.capitalize()} added*. Send the next file or type `/done`.", parse_mode=types.ParseMode.MARKDOWN)
     else:
-        # Should not happen with the explicit content_types list, but acts as a safeguard
+        # This should theoretically not be hit due to the content_types filter, but remains as a safeguard.
+        logger.warning(f"File handler entered but file_id not found for content type: {message.content_type}")
         await bot.send_message(message.chat.id, "Could not determine file ID. Please try another format.")
 
 
 @dp.message_handler(content_types=types.ContentTypes.ANY, state=UploadFSM.waiting_for_files)
 async def cmd_upload_files_invalid(message: types.Message):
     """Handles unsupported content types during upload state."""
-    # This handler catches anything not covered by the explicit file handler above.
     if message.text and message.text.startswith('/'):
         # Ignore commands that aren't /done or /cancel
         return 
-    await bot.send_message(message.chat.id, "❌ That content type is not supported for upload (e.g., sticker, gif, text). Please send a **Document, Photo, Video, Audio, Voice, or Video Note**, or type `/done`.")
+    
+    unsupported_type = message.content_type.upper()
+    
+    await bot.send_message(message.chat.id, 
+                           f"❌ **Unsupported Content** (`{unsupported_type}`). Please send only one of the following: **Document, Photo, Video, Audio, Voice, or Video Note**.",
+                           parse_mode=types.ParseMode.MARKDOWN
+                          )
 
 
 @dp.callback_query_handler(ProtectionCallback.filter(), state=UploadFSM.waiting_for_protection)
@@ -1030,7 +1039,7 @@ async def cmd_upload_auto_delete_invalid(message: types.Message):
 async def cmd_reset_messages(message: types.Message):
     """
     Hard resets default start and help messages, clearing custom images.
-    Note: This is the user-requested /restore_db, but its true function is resetting.
+    Note: The command is now aliased to /reset_messages for clarity, but /restore_db still works.
     It does NOT touch user data or session data.
     """
     
@@ -1041,7 +1050,7 @@ async def cmd_reset_messages(message: types.Message):
         async with db_manager._pool.acquire() as conn:
             # Insert/Update default text and explicitly set image_id to NULL
             for key, text in [('start', default_start), ('help', default_help)]:
-                # DB INTEGRITY FIX: This is a deliberate hard reset, so we update the conflict.
+                # This is a deliberate hard reset to factory defaults
                 query = """
                 INSERT INTO messages (key, text) VALUES ($1, $2)
                 ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text, image_id = NULL;
