@@ -3,11 +3,10 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: Owner Bypass for Finalization. Prevents the generic text handler      #
-#         from firing when the owner is replying with auto-delete minutes.     #
-#         (Fixes "CODE 66: I only understand commands...").                      #
-#  FIXED: Consolidated lambda filters for _receive_minutes handler for better   #
-#         dispatching reliability.                                              #
+#  FIXED: Detailed status and enhanced exception reporting in _receive_minutes  #
+#         to pinpoint exact failure during vaulting/DB creation (fixes "no     #
+#         deep link, no upload" bug).                                          #
+#  FIXED: Enhanced error reporting in broadcast handler.                        #
 ################################################################################
 """
 
@@ -531,8 +530,6 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
     """
     Copies all collected messages to the UPLOAD_CHANNEL_ID and collects 
     the resulting file data (file_id/message_id, type, caption) into a list.
-    
-    CRUCIAL: This function only stores lightweight IDs after vaulting.
     """
     vaulted_file_data = []
     
@@ -622,7 +619,7 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
               m.content_type == types.ContentTypes.TEXT and
               OWNER_ID in active_uploads and 
               active_uploads.get(OWNER_ID, {}).get("_finalize_requested")
-) # <-- CONSOLIDATED FILTER FOR RELIABILITY
+)
 async def _receive_minutes(m: types.Message):
     """Receives auto-delete time, vaults files, creates DB session, and generates deep link."""
     
@@ -639,7 +636,8 @@ async def _receive_minutes(m: types.Message):
         return
     
     # --- 1. VAULTING AND DATA COLLECTION ---
-    status_msg = await m.reply("⏳ **Finalizing Session...**\n\n_Vaulting files to private channel. Please wait..._", parse_mode=types.ParseMode.MARKDOWN)
+    # Detailed status to pinpoint failure
+    status_msg = await m.reply("⏳ **Finalizing Session...**\n\n_1/3 Vaulting files to private channel. Please wait..._", parse_mode=types.ParseMode.MARKDOWN)
     
     try:
         # Perform the heavy lifting: copy files to vault and collect file data
@@ -648,13 +646,15 @@ async def _receive_minutes(m: types.Message):
             exclude_text=upload["exclude_text"]
         )
     except ChatNotFound:
-        await bot.edit_message_text(f"❌ **Finalization Failed:** Upload channel not found. Please ensure the bot is an admin in the vault channel `{UPLOAD_CHANNEL_ID}`.", 
+        # IMPROVED ERROR REPORTING:
+        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** Upload channel not found. Please ensure the bot is an **admin** in the vault channel `{UPLOAD_CHANNEL_ID}`.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
         return
     except Exception as e:
         logger.exception("Critical error during file vaulting.")
-        await bot.edit_message_text(f"❌ **Finalization Failed:** A critical error occurred during file vaulting: `{e}`. Session cancelled.", 
+        # IMPROVED ERROR REPORTING: Show the actual exception type
+        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** A critical error occurred during file vaulting: `{type(e).__name__}: {e}`. Session cancelled. Ensure bot is admin in channel and media is valid.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
         return
@@ -670,6 +670,10 @@ async def _receive_minutes(m: types.Message):
     # --- 2. DB SESSION CREATION ---
     protect = upload.get("_protect_choice", 0) == 1
     
+    # Update status BEFORE DB operation
+    await bot.edit_message_text("⏳ **Finalizing Session...**\n\n_2/3 Creating database session..._", 
+                                m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
+    
     try:
         session_id = await db_manager.create_upload_session(
             owner_id=OWNER_ID,
@@ -679,7 +683,8 @@ async def _receive_minutes(m: types.Message):
         )
     except Exception as e:
         logger.exception("Critical database error during session creation.")
-        await bot.edit_message_text(f"❌ **Finalization Failed:** Database error: `{e}`. Session cancelled.", 
+        # IMPROVED ERROR REPORTING: Show the actual exception type
+        await bot.edit_message_text(f"❌ **Finalization Failed (Database):** Database error: `{type(e).__name__}: {e}`. Session cancelled. Check DB logs.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
         return
@@ -687,6 +692,10 @@ async def _receive_minutes(m: types.Message):
     # --- 3. DEEP LINK GENERATION ---
     deep_link = await get_start_link(session_id, encode=False)
     
+    # Update status BEFORE final report
+    await bot.edit_message_text("⏳ **Finalizing Session...**\n\n_3/3 Generating deep link and report..._", 
+                                m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
+
     # --- 4. FINAL REPORT ---
     delete_text = f"Auto-Delete: **{mins} minutes**." if mins > 0 else "Auto-Delete: **Disabled**."
     
@@ -714,7 +723,7 @@ async def _receive_minutes(m: types.Message):
 
 # --- FILE COLLECTION HANDLER (CATCH-ALL FOR ACTIVE SESSION) ---
 
-@dp.message_handler(lambda m: is_owner(m.from_user.id) and OWNER_ID in active_uploads and not active_uploads.get(OWNER_ID, {}).get("_finalize_requested"), # <-- ADDED finalize check
+@dp.message_handler(lambda m: is_owner(m.from_user.id) and OWNER_ID in active_uploads and not active_uploads.get(OWNER_ID, {}).get("_finalize_requested"), 
                     content_types=types.ContentTypes.ANY)
 async def cmd_upload_message_collector(message: types.Message):
     """
@@ -1063,7 +1072,7 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
              return
     except Exception as e:
         logger.error(f"CRITICAL: Failed to fetch user list for broadcast: {e}", exc_info=True)
-        await bot.send_message(message.chat.id, "❌ **CRITICAL BROADCAST ERROR:** Failed to retrieve the user list from the database.")
+        await bot.send_message(message.chat.id, f"❌ **CRITICAL BROADCAST ERROR:** Failed to retrieve the user list from the database. Error: `{type(e).__name__}`.")
         return
 
     success_count = 0
@@ -1082,7 +1091,6 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
             )
             success_count += 1
         except (ChatNotFound, Exception) as e: # Explicitly handling ChatNotFound and general exceptions
-            # Note: We can't log the user ID directly due to privacy, so we log the error
             logger.warning(f"Failed to send broadcast to a user: {e}")
             fail_count += 1
         await asyncio.sleep(0.05) # Throttle to respect API limits
@@ -1101,9 +1109,7 @@ async def handle_all_text_messages(message: types.Message):
     if message.text.startswith('/'):
         return 
     
-    # NEW FIX: OWNER BYPASS for auto-delete timer. If the owner is currently finalizing, 
-    # we assume the message is the minutes reply and silently ignore it here, allowing 
-    # the specific handler (_receive_minutes) to process it first.
+    # OWNER BYPASS for auto-delete timer.
     if is_owner(message.from_user.id) and OWNER_ID in active_uploads and active_uploads.get(OWNER_ID, {}).get("_finalize_requested"):
          return 
         
@@ -1120,9 +1126,6 @@ async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
     Aiogram dispatcher.
-    
-    CRITICAL FIX: Explicitly sets both Bot and Dispatcher context for
-    reliable FSM/State and message methods (like .reply()).
     """
     
     try:
