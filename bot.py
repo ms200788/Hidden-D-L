@@ -3,10 +3,10 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: Detailed status and enhanced exception reporting in _receive_minutes  #
-#         to pinpoint exact failure during vaulting/DB creation (fixes "no     #
-#         deep link, no upload" bug).                                          #
-#  FIXED: Enhanced error reporting in broadcast handler.                        #
+#  FIXED: Added detailed logging inside _process_messages_for_vaulting to      #
+#         diagnose file vaulting/data collection failures (deep link fix).     #
+#  FIXED: Enhanced broadcast resilience against ChatNotFound errors.            #
+#  FIXED: Ensured broadcast query explicitly excludes the owner's ID.           #
 ################################################################################
 """
 
@@ -64,20 +64,6 @@ WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 
 # Hard limit for auto-delete time
 MAX_AUTO_DELETE_MINUTES = 10080
-
-# Note: SUPPORTED_MEDIA_TYPES list is now used for documentation/reference only, 
-# not for the core check in the collector handler (which is now done via attributes).
-SUPPORTED_MEDIA_TYPES = [
-    types.ContentTypes.DOCUMENT, 
-    types.ContentTypes.PHOTO, 
-    types.ContentTypes.VIDEO, 
-    types.ContentTypes.AUDIO,
-    types.ContentTypes.VOICE,
-    types.ContentTypes.VIDEO_NOTE,
-    types.ContentTypes.STICKER,
-    types.ContentTypes.ANIMATION,
-]
-
 
 # Check for critical configuration
 if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
@@ -257,6 +243,7 @@ class Database:
             query += f" WHERE id != {exclude_id}"
         
         try:
+            # We use fetch to get records like [{'id': 1234}, ...]
             return await self.fetch(query)
         except Exception as e:
             logger.error(f"Database: Failed to fetch all user IDs: {e}")
@@ -408,9 +395,12 @@ class AlbumMiddleware(BaseMiddleware):
 
         album = self.album_data.pop(media_group_id)
         
+        # NOTE: Only the first message is processed by handlers, 
+        # carrying the 'album' key which contains all messages.
         main_message = album[0] 
         main_message.conf['album'] = album
         
+        # Must use process_update to re-inject the message with the album data
         await self.dispatcher.process_update(types.Update.to_object({
             "update_id": main_message.update_id,
             "message": main_message.to_python()
@@ -459,7 +449,7 @@ async def cmd_upload(message: types.Message):
     
     exclude_text_info = " (Text messages will be ignored)" if exclude_text else ""
     await message.reply(
-        f"📂 **Upload session started.** Send media/text you want included.{exclude_text_info}. Use `/d` to finalize, `/e` to cancel.", 
+        f"📂 **Upload session started.** Send media/text you want included.{exclude_text_info}. You can send multiple files in one message (album) or separately. Use `/d` to finalize, `/e` to cancel.", 
         parse_mode=types.ParseMode.MARKDOWN
     )
 
@@ -530,18 +520,29 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
     """
     Copies all collected messages to the UPLOAD_CHANNEL_ID and collects 
     the resulting file data (file_id/message_id, type, caption) into a list.
+    Includes robust logging for debugging vaulting failures.
     """
     vaulted_file_data = []
     
-    # Send a simple header message to the vault channel
-    header = await bot.send_message(UPLOAD_CHANNEL_ID, "--- New Upload Session Vault ---")
+    logger.info(f"Vaulting start: Processing {len(messages)} messages for channel {UPLOAD_CHANNEL_ID}")
     
-    for m0 in messages:
+    # Send a simple header message to the vault channel
+    try:
+        await bot.send_message(UPLOAD_CHANNEL_ID, "--- New Upload Session Vault ---")
+    except Exception as e:
+        logger.error(f"Failed to send vault header: {e}")
+        # We allow this to pass, but the error handling below must catch the ChatNotFound if it's the root cause.
+
+    for idx, m0 in enumerate(messages):
+        log_prefix = f"Msg {idx+1}/{len(messages)} (Type: {m0.content_type.upper()}): "
+        
         try:
-            # Skip commands and text if exclude_text is true
+            # 1. Skip commands and text if exclude_text is true
             if m0.text and m0.text.strip().startswith("/"):
+                logger.debug(log_prefix + "Skipping command.")
                 continue
             if m0.content_type == types.ContentTypes.TEXT and exclude_text:
+                logger.debug(log_prefix + "Skipping text (excluded).")
                 continue
 
             sent_msg = None
@@ -549,16 +550,18 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
             caption = m0.caption or m0.text or ""
             file_type = m0.content_type
 
-            # Use copy_message for all content types for secure vaulting
+            # 2. Vaulting Process
             if m0.content_type != types.ContentTypes.TEXT:
+                logger.debug(log_prefix + "Attempting bot.copy_message...")
                 
+                # Copy the media/non-text message
                 sent_msg = await bot.copy_message(
                     chat_id=UPLOAD_CHANNEL_ID, 
                     from_chat_id=m0.chat.id, 
                     message_id=m0.message_id
                 )
                 
-                # Extract file_id (or message_id) from the copied message object for delivery later
+                # Extract file_id from the copied message object (sent_msg)
                 if sent_msg.photo:
                     file_id = sent_msg.photo[-1].file_id
                     file_type = 'photo'
@@ -584,33 +587,43 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
                     file_id = sent_msg.animation.file_id
                     file_type = 'animation'
                 else:
-                    # Fallback to message_id if file_id extraction fails (e.g., location/contact)
+                    # Fallback for unsupported media types (like location, contact, etc.)
                     file_id = sent_msg.message_id 
                     file_type = 'unsupported_media'
+                    logger.warning(log_prefix + f"Unsupported content type {m0.content_type.upper()}. Vaulting message ID.")
                     
             elif m0.text:
                 # Text-only messages: send directly for vaulting
+                logger.debug(log_prefix + "Attempting bot.send_message (text vault)...")
                 sent_msg = await bot.send_message(UPLOAD_CHANNEL_ID, m0.text)
                 file_id = sent_msg.message_id # Store the vault message ID for text delivery
                 file_type = 'text'
                 caption = m0.text
 
-            if file_id and sent_msg:
+            # 3. Data Collection
+            if file_id and sent_msg and file_type != 'unsupported_media':
                 vaulted_file_data.append({
                     'file_id': file_id, # This is the ID used for delivery (file_id or message_id)
                     'type': file_type,
                     'caption': caption,
                 })
-                
+                logger.info(log_prefix + f"SUCCESS. Vaulted Type: {file_type}. File ID: {file_id[:10]}...")
+            elif file_type == 'unsupported_media':
+                 logger.warning(log_prefix + "SKIPPED: Unsupported media type was vaulted but not added to deliverable list.")
+
+
         except ChatNotFound:
-            logger.error("Upload channel not found. Please ensure the bot is in the UPLOAD_CHANNEL.")
-            raise
+            logger.error(log_prefix + "CRITICAL: Upload channel not found.")
+            # Re-raise ChatNotFound so the main handler can report the critical channel error.
+            raise 
         except Exception as e:
-            logger.exception(f"Error copying message to vault: {e}")
-            # Continue processing other files even if one fails
+            # Catch individual message failures, log them, and continue processing others
+            logger.error(log_prefix + f"FAILURE: Error copying message: {type(e).__name__}: {e}", exc_info=True)
+            # Do NOT re-raise, allow the loop to continue.
         
         await asyncio.sleep(0.1) # Respect API limits
 
+    logger.info(f"Vaulting complete: {len(vaulted_file_data)} files successfully prepared for session.")
     return vaulted_file_data
 
 
@@ -636,7 +649,6 @@ async def _receive_minutes(m: types.Message):
         return
     
     # --- 1. VAULTING AND DATA COLLECTION ---
-    # Detailed status to pinpoint failure
     status_msg = await m.reply("⏳ **Finalizing Session...**\n\n_1/3 Vaulting files to private channel. Please wait..._", parse_mode=types.ParseMode.MARKDOWN)
     
     try:
@@ -646,21 +658,21 @@ async def _receive_minutes(m: types.Message):
             exclude_text=upload["exclude_text"]
         )
     except ChatNotFound:
-        # IMPROVED ERROR REPORTING:
-        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** Upload channel not found. Please ensure the bot is an **admin** in the vault channel `{UPLOAD_CHANNEL_ID}`.", 
+        # CRITICAL ERROR REPORTING: Channel not found
+        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** Upload channel not found. Please ensure the bot is an **admin** in the vault channel `{UPLOAD_CHANNEL_ID}`. Session cancelled.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
         return
     except Exception as e:
         logger.exception("Critical error during file vaulting.")
-        # IMPROVED ERROR REPORTING: Show the actual exception type
-        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** A critical error occurred during file vaulting: `{type(e).__name__}: {e}`. Session cancelled. Ensure bot is admin in channel and media is valid.", 
+        # GENERIC ERROR REPORTING: Show the actual exception type
+        await bot.edit_message_text(f"❌ **Finalization Failed (Vaulting):** A critical error occurred during file vaulting: `{type(e).__name__}: {e}`. Session cancelled. Check logs for details on what file failed.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
         return
 
     # Filter out any non-deliverable items (e.g., failed copies)
-    final_file_data = [d for d in vaulted_file_data if d.get('type') != 'header']
+    final_file_data = [d for d in vaulted_file_data if d.get('type') not in ('header', 'unsupported_media')]
     if not final_file_data:
         await bot.edit_message_text("❌ **Finalization Failed:** No valid files were successfully vaulted. Session cancelled.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
@@ -683,7 +695,7 @@ async def _receive_minutes(m: types.Message):
         )
     except Exception as e:
         logger.exception("Critical database error during session creation.")
-        # IMPROVED ERROR REPORTING: Show the actual exception type
+        # DATABASE ERROR REPORTING: Show the actual exception type
         await bot.edit_message_text(f"❌ **Finalization Failed (Database):** Database error: `{type(e).__name__}: {e}`. Session cancelled. Check DB logs.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
@@ -1065,6 +1077,7 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     await state.finish() 
     
     try:
+        # Fetch user IDs excluding the sender (OWNER_ID)
         all_users = await db_manager.get_all_user_ids(exclude_id=message.from_user.id)
         user_ids = [row['id'] for row in all_users]
         if not user_ids:
@@ -1090,8 +1103,13 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
                 disable_notification=True
             )
             success_count += 1
-        except (ChatNotFound, Exception) as e: # Explicitly handling ChatNotFound and general exceptions
-            logger.warning(f"Failed to send broadcast to a user: {e}")
+        except ChatNotFound: 
+            # This is the expected warning when a user blocks the bot.
+            logger.warning("Failed to send broadcast to a user: Chat not found. Ignoring this user.")
+            fail_count += 1
+        except Exception as e:
+             # Catch other unexpected errors but continue the loop
+            logger.error(f"Failed to send broadcast to user {user_id}: {type(e).__name__}. Ignoring this user.", exc_info=True)
             fail_count += 1
         await asyncio.sleep(0.05) # Throttle to respect API limits
 
