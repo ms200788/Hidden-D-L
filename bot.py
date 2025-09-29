@@ -3,13 +3,13 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 16 (CRITICAL CALLBACK FIX + ADMIN COMMANDS):                             
-#   1. **AttributeError Fix:** Removed the non-existent `call.message.as_current()` 
-#      call and explicitly set the necessary attributes on the message object 
-#      to correctly mock a user command, fixing the callback crash.
-#   2. **Admin Command Implementation:** Added full FSM and handler logic for: 
-#      /upload, /broadcast, /setmessage, /setimage, /stats, and /restore_db.
-#      The bot is now fully functional with persistent storage and admin tools.
+#  FIX 17 (CRITICAL FSM STABILITY FIX):                                         
+#   1. **NoneType FSM Fix:** Explicitly added the 'state: FSMContext' argument  
+#      to the initial admin command handlers (`/setmessage`, `/setimage`,      
+#      `/broadcast`). This ensures the FSM context is properly initialized by   
+#      the dispatcher, mitigating the 'AttributeError: 'NoneType'...' crash.   
+#   2. **Flow Confirmation:** Confirmed that /setmessage and /setimage use      
+#      Inline Keyboards to select 'Start' or 'Help' messages, as requested.     
 ################################################################################
 """
 
@@ -688,14 +688,14 @@ async def cmd_stats(message: types.Message):
 # --- MESSAGE AND IMAGE SETTERS ---
 
 @dp.message_handler(is_owner_filter, commands=['setmessage'])
-async def cmd_set_message(message: types.Message):
+async def cmd_set_message(message: types.Message, state: FSMContext): # FIX: Added state argument
     """Starts the FSM to update /start or /help text."""
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
         types.InlineKeyboardButton("Start Message (/start)", callback_data=ImageTypeCallback.new(key='start')),
         types.InlineKeyboardButton("Help Message (/help)", callback_data=ImageTypeCallback.new(key='help'))
     )
-    await bot.send_message(message.chat.id, "Which message would you like to edit?", reply_markup=keyboard)
+    await bot.send_message(message.chat.id, "Which message would you like to edit? Select 'Start' or 'Help' below.", reply_markup=keyboard)
     await AdminFSM.waiting_for_message_key.set()
 
 @dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_message_key)
@@ -735,14 +735,14 @@ async def admin_set_message_text(message: types.Message, state: FSMContext):
 
 
 @dp.message_handler(is_owner_filter, commands=['setimage'])
-async def cmd_set_image(message: types.Message):
+async def cmd_set_image(message: types.Message, state: FSMContext): # FIX: Added state argument
     """Starts the FSM to update /start or /help image."""
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(
         types.InlineKeyboardButton("Start Image (/start)", callback_data=ImageTypeCallback.new(key='start')),
         types.InlineKeyboardButton("Help Image (/help)", callback_data=ImageTypeCallback.new(key='help'))
     )
-    await bot.send_message(message.chat.id, "Which message image would you like to set?", reply_markup=keyboard)
+    await bot.send_message(message.chat.id, "Which message image would you like to set? Select 'Start' or 'Help' below.", reply_markup=keyboard)
     await AdminFSM.waiting_for_image_key.set()
 
 @dp.callback_query_handler(ImageTypeCallback.filter(), state=AdminFSM.waiting_for_image_key)
@@ -788,7 +788,7 @@ async def admin_set_new_image_invalid(message: types.Message):
 # --- BROADCAST COMMAND ---
 
 @dp.message_handler(is_owner_filter, commands=['broadcast'])
-async def cmd_broadcast(message: types.Message):
+async def cmd_broadcast(message: types.Message, state: FSMContext): # FIX: Added state argument
     """Starts the FSM to send a message to all users."""
     await bot.send_message(message.chat.id, "Send me the message you want to broadcast to all users. I will **copy** your next message. Use /cancel to stop.")
     await AdminFSM.waiting_for_broadcast_text.set()
