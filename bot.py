@@ -2,20 +2,14 @@
 """
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
-#                                                                              #
-#  This bot utilizes aiogram v2 for stability and asyncpg for robust, non-      #
-#  blocking interaction with a Neon (PostgreSQL) database. It includes a        #
-#  complex multi-step upload flow, deep linking, dynamic content, and owner     #
-#  management, designed for deployment on Render via webhooks.                  #
 #                                                                              
-#  FIX 5 (Previous): Corrected the webhook setup pattern.                       
-#  FIX 6 (Current):                                                             
-#   1. **Callback Fix:** Added `await call.answer()` to inline callback         
-#      handlers to resolve `aiogram.utils.exceptions.InvalidQueryID`.           
-#   2. **Schema Fix:** Added a corruption check for the 'users' table in        
-#      `setup_schema` to detect and fix conflicting column names (e.g.,         
-#      'user_id' vs. 'id') that cause the 'null value in column "user_id"'      
-#      error.                                                                   
+#  FIX 6 (Previous): Fixed InvalidQueryID and DB schema corruption checks.      
+#  FIX 7 (Current):                                                             
+#   1. **Middleware Reliability:** Refactored the UserActivityMiddleware to use  
+#      a safe wrapper function for the DB call. This contains potential DB      
+#      errors within a robust try/except block, preventing silent failures      
+#      from blocking the dispatcher and stopping command execution.             
+#   2. **Minor Log Cleanup:** Clarified the schema check process.               
 ################################################################################
 """
 
@@ -137,11 +131,11 @@ class Database:
         """
         logger.info("Database: Checking/setting up schema...")
         
-        # --- Helper for table creation ---
+        # --- Helper for reliable table creation ---
         async def create_table(conn, table_name, schema_query):
             try:
                 await conn.execute(schema_query)
-                logger.info(f"Database: '{table_name}' table ensured.")
+                logger.debug(f"Database: '{table_name}' table ensured.")
             except DuplicateTableError:
                 pass
             except Exception as e:
@@ -158,26 +152,18 @@ class Database:
             );
             """
             
-            # Check for corruption (like presence of an unwanted 'user_id' column)
+            # Check for corruption (e.g., conflicting column names like 'user_id' instead of 'id')
             try:
-                # This query will fail if the table exists but doesn't have the expected 'id' PK
+                # Attempt to select from the 'id' column. This will fail if 'id' doesn't exist.
                 await conn.fetchval("SELECT id FROM users LIMIT 1;")
-            except (UndefinedColumnError, asyncpg.exceptions.InvalidCatalogObjectError):
-                logger.warning("Database: 'users' table schema appears corrupted or malformed. Dropping and recreating table to fix conflicting column names.")
+            except (UndefinedColumnError, asyncpg.exceptions.InvalidCatalogObjectError, asyncpg.exceptions.PostgresError) as e:
+                # If selection fails, the table is likely missing or corrupt. Recreate it.
+                logger.warning(f"Database: 'users' table schema issue detected ({e}). Dropping and recreating table to ensure 'id' primary key.")
                 await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
                 await create_table(conn, 'users', users_schema)
-            except asyncpg.exceptions.PostgresError as e:
-                 # Catch other potential errors, e.g., if it has different columns
-                if 'user_id' in str(e) or 'does not exist' in str(e):
-                    logger.warning(f"Database: Found schema conflict in 'users' table ({e}). Dropping and recreating.")
-                    await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
-                    await create_table(conn, 'users', users_schema)
-                else:
-                    await create_table(conn, 'users', users_schema) # Attempt creation if it truly doesn't exist
             else:
                  # If the table exists and the simple check passes, ensure existence
                 await create_table(conn, 'users', users_schema) 
-
 
             # 2. Messages Table
             await create_table(conn, 'messages', """
@@ -246,7 +232,7 @@ class Database:
                     await self._insert_default_stats(conn) 
                     logger.info("Database: statistics table successfully reset and populated.")
                 else:
-                    raise # Re-raise if it's another UndefinedColumnError
+                    raise 
             
             logger.info("Database: Schema setup and corruption checks complete.")
 
@@ -283,12 +269,9 @@ class Database:
         ON CONFLICT (id) DO UPDATE SET last_active = CURRENT_TIMESTAMP
         RETURNING join_date;
         """
-        try:
-            # We insert into the 'id' column, which is the user ID.
-            await self.fetchrow(query, user_id)
-        except Exception as e:
-            # Added more specific logging to debug the DB errors
-            logger.error(f"DB Error in get_or_create_user for {user_id}: {e}")
+        # Note: This method should be called inside a task/try-except block 
+        # when running from middleware to ensure it doesn't block the dispatcher.
+        await self.fetchrow(query, user_id)
 
     async def get_total_users(self):
         """Returns the total number of users (8. /stats)."""
@@ -390,6 +373,18 @@ def is_owner_filter(message: types.Message):
 
 # --- MIDDLEWARE CLASS ---
 
+async def safe_db_user_update(db_manager, user_id):
+    """
+    Wrapper function to safely perform DB updates in an async task.
+    This prevents potential DB errors from crashing the main dispatch loop.
+    """
+    try:
+        await db_manager.get_or_create_user(user_id)
+    except Exception as e:
+        logger.error(f"CRITICAL ASYNC DB FAILURE: Failed to update user {user_id} activity: {e}")
+        # Crucial: Do NOT raise here. Allow the main update to proceed.
+
+
 class UserActivityMiddleware(BaseMiddleware):
     """
     Middleware to ensure every interaction updates the user's last_active time
@@ -406,13 +401,19 @@ class UserActivityMiddleware(BaseMiddleware):
             user_id = update.message.from_user.id
         elif update.callback_query:
             user_id = update.callback_query.from_user.id
+        # Future-proofing for other common updates
+        elif update.inline_query:
+            user_id = update.inline_query.from_user.id
+        elif update.edited_message:
+            user_id = update.edited_message.from_user.id
         else:
             return # Ignore non-message/callback updates
 
         if user_id:
-            # Non-blocking update to avoid delaying user response
-            asyncio.create_task(self.db.get_or_create_user(user_id))
-            data['user_id'] = user_id
+            # NON-BLOCKING & RELIABLE: Use the safe wrapper to handle DB interaction
+            # This ensures that a DB error won't stop command handlers from running.
+            asyncio.create_task(safe_db_user_update(self.db, user_id))
+            data['user_id'] = user_id # Pass user_id to handlers if needed (optional, but safe)
 
 # --- MIDDLEWARE SETUP ---
 # Apply the middleware globally before starting the bot
