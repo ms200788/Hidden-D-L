@@ -3,14 +3,16 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 8 (Previous): Added global error handler and generic text handler.       
-#  FIX 9 (Current - CRITICAL FIX FOR SILENT STARTUP):                           
-#   1. **Isolated DB Connection in on_startup:** Removed the `raise` from the   
-#      `try...except` block around `db_manager.connect()` in `on_startup`.      
-#      This ensures that a database connection failure is logged but does not   
-#      crash the entire bot process, allowing the dispatcher to activate.       
-#   2. **Increased Logging Detail:** Added `exc_info=True` to the critical DB   
-#      failure log to ensure the full traceback is visible in the console.      
+#  FIX 9 (Previous): Isolated DB Connection in on_startup.
+#  FIX 10 (Current - CRITICAL WEBHOOK RELIABILITY):                             
+#   1. **Manual Webhook Setup:** Replaced `executor.start_webhook` with         
+#      a manual `aiohttp.web.run_app` setup.                                    
+#   2. **Explicit Handler:** Defined a specific `telegram_webhook` function that 
+#      manually processes the incoming JSON request and calls                   
+#      `dp.process_update()`.                                                   
+#   3. **Direct Error Logging:** Added try/except blocks around the update      
+#      processing to catch *any* low-level errors during the critical           
+#      HTTP-to-Dispatcher step, guaranteeing a traceback in the logs.           
 ################################################################################
 """
 
@@ -39,7 +41,8 @@ from asyncpg.exceptions import UniqueViolationError, DuplicateTableError, Undefi
 
 # --- AIOHTTP IMPORTS (CRITICAL for Webhook Fix) ---
 import aiohttp
-from aiohttp import web # Used for the healthcheck response and application type
+from aiohttp import web 
+from aiohttp.web_runner import AppRunner, TCPSite # Required for manual start
 
 # --- CONFIGURATION AND ENVIRONMENT SETUP ---
 
@@ -57,7 +60,7 @@ UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0")) # Channel to store 
 
 # Webhook configuration for Render hosting (16. WEBHOOK ONLY)
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_HOST")
-WEBHOOK_PATH = f'/{BOT_TOKEN}'
+WEBHOOK_PATH = f'/{BOT_TOKEN}' # Must match the path set by Telegram
 WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 
 # Keep-Alive Configuration (15. HEALTHCHECK ENDPOINT)
@@ -85,7 +88,6 @@ class Database:
     async def connect(self):
         """Initializes the database connection pool and ensures schema exists."""
         logger.info("Database: Attempting to connect to PostgreSQL...")
-        # Check if DSN is clearly invalid early
         if not self.dsn or 'postgres' not in self.dsn:
             raise ValueError("Invalid DATABASE_URL provided.")
 
@@ -101,7 +103,7 @@ class Database:
             await self.setup_schema()
         except Exception as e:
             logger.critical(f"Database connection failed during pool creation/schema setup: {e}")
-            raise # Re-raise within this function to signal failure to the caller
+            raise 
 
     async def close(self):
         """Closes the database connection pool."""
@@ -159,16 +161,13 @@ class Database:
             
             # Check for corruption (e.g., conflicting column names like 'user_id' instead of 'id')
             try:
-                # Attempt to select from the 'id' column. This will fail if 'id' doesn't exist.
                 await conn.fetchval("SELECT id FROM users LIMIT 1;")
             except (UndefinedColumnError, asyncpg.exceptions.InvalidCatalogObjectError, asyncpg.exceptions.PostgresError) as e:
-                # If selection fails, the table is likely missing or corrupt. Recreate it.
                 logger.warning(f"Database: 'users' table schema issue detected ({e}). Dropping and recreating table to ensure 'id' primary key.")
                 await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
                 await create_table(conn, 'users', users_schema)
             else:
-                 # If the table exists and the simple check passes, ensure existence
-                await create_table(conn, 'users', users_schema) 
+                 await create_table(conn, 'users', users_schema) 
 
             # 2. Messages Table
             await create_table(conn, 'messages', """
@@ -199,12 +198,10 @@ class Database:
                 );
             """)
 
-
             # Step 2: Ensure initial default messages exist and fix corruption if found
             try:
                 await self._insert_default_messages(conn)
             except UndefinedColumnError as e:
-                # Fix for corrupted 'messages' table
                 if 'column "key" of relation "messages" does not exist' in str(e):
                     logger.warning("Database: messages table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
                     await conn.execute("DROP TABLE IF EXISTS messages;")
@@ -224,7 +221,6 @@ class Database:
             try:
                 await self._insert_default_stats(conn)
             except UndefinedColumnError as e:
-                # NEW FIX: Fix for corrupted 'statistics' table
                 if 'column "key" of relation "statistics" does not exist' in str(e):
                     logger.warning("Database: statistics table schema appears corrupted. Dropping and recreating table to fix missing 'key' column.")
                     await conn.execute("DROP TABLE IF EXISTS statistics;")
@@ -274,8 +270,6 @@ class Database:
         ON CONFLICT (id) DO UPDATE SET last_active = CURRENT_TIMESTAMP
         RETURNING join_date;
         """
-        # Note: This method should be called inside a task/try-except block 
-        # when running from middleware to ensure it doesn't block the dispatcher.
         await self.fetchrow(query, user_id)
 
     async def get_total_users(self):
@@ -315,7 +309,6 @@ class Database:
     # --- SESSION/UPLOAD METHODS (9. /upload, 10. DEEP LINK ACCESS) ---
     async def create_upload_session(self, owner_id, file_data, is_protected, auto_delete_minutes):
         """Creates a new upload session and returns its unique ID (9. Step 6)."""
-        # Ensure deep link is random (10. DEEP LINK ACCESS)
         session_id = str(uuid.uuid4())
         file_data_json = json.dumps(file_data)
         query = """
@@ -365,7 +358,7 @@ db_manager = Database(DATABASE_URL)
 
 # Initialize Bot and Dispatcher
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
-storage = MemoryStorage() # Using in-memory storage for FSM state (fast)
+storage = MemoryStorage() 
 dp = Dispatcher(bot, storage=storage)
 
 
@@ -381,17 +374,14 @@ def is_owner_filter(message: types.Message):
 async def safe_db_user_update(db_manager, user_id):
     """
     Wrapper function to safely perform DB updates in an async task.
-    This prevents potential DB errors from crashing the main dispatch loop.
     """
     try:
-        # Check if pool is available before attempting acquisition
         if db_manager._pool:
             await db_manager.get_or_create_user(user_id)
         else:
             logger.debug(f"DB pool not initialized. Skipping user activity update for {user_id}.")
     except Exception as e:
         logger.error(f"CRITICAL ASYNC DB FAILURE: Failed to update user {user_id} activity: {e}", exc_info=True)
-        # Crucial: Do NOT raise here. Allow the main update to proceed.
 
 
 class UserActivityMiddleware(BaseMiddleware):
@@ -415,7 +405,7 @@ class UserActivityMiddleware(BaseMiddleware):
         elif update.edited_message:
             user_id = update.edited_message.from_user.id
         else:
-            return # Ignore non-message/callback updates
+            return 
 
         if user_id:
             # NON-BLOCKING & RELIABLE: Use the safe wrapper to handle DB interaction
@@ -423,7 +413,6 @@ class UserActivityMiddleware(BaseMiddleware):
             data['user_id'] = user_id 
 
 # --- MIDDLEWARE SETUP ---
-# Apply the middleware globally before starting the bot
 dp.middleware.setup(UserActivityMiddleware(db_manager))
 
 
@@ -450,14 +439,13 @@ async def cmd_owner_start_help(message: types.Message):
 @dp.message_handler(commands=['start', 'help'])
 async def cmd_user_start_help(message: types.Message):
     """
-    Handles /start (including deep links) (3. /start) and /help (4. /help)
-    commands for all users. Retrieves dynamic content from the database.
+    Handles /start and /help commands for all users.
     """
     command = message.get_command()
     payload = message.get_args()
     key = 'help' if command == '/help' else 'start'
 
-    # 1. Handle Deep Link Payload (10. DEEP LINK ACCESS)
+    # 1. Handle Deep Link Payload 
     if command == '/start' and payload:
         await handle_deep_link(message, payload)
         return
@@ -471,7 +459,6 @@ async def cmd_user_start_help(message: types.Message):
         else:
             text, image_id = content['text'], content['image_id']
     except Exception:
-        # DB is likely down or pool is broken, use hardcoded fallback
         logger.error(f"DB access failed in /{key} handler. Using fallback message.")
         text = "⚠️ **System Alert:** The database is currently unavailable. I cannot retrieve dynamic messages, but the core delivery system is active."
         image_id = None
@@ -507,13 +494,9 @@ async def handle_cmd_callback(call: types.CallbackQuery):
     """
     Handles inline button clicks for Start/Help navigation.
     """
-    # 1. Acknowledge the callback immediately
     await call.answer() 
-    
-    # 2. Process the command
     cmd = call.data.split(':')[1]
     
-    # Mock a message object to reuse the main handlers
     mock_message = call.message.as_current()
     mock_message.text = f'/{cmd}'
     await cmd_user_start_help(mock_message)
@@ -523,7 +506,6 @@ async def handle_cmd_callback(call: types.CallbackQuery):
 async def handle_deep_link(message: types.Message, session_id: str):
     """
     Retrieves and sends files associated with a deep link session ID.
-    Handles owner bypass and auto-delete scheduling.
     """
     logger.info(f"User {message.from_user.id} accessed deep link with session ID: {session_id[:8]}...")
     user_id = message.from_user.id
@@ -539,45 +521,35 @@ async def handle_deep_link(message: types.Message, session_id: str):
         await message.answer("❌ Error: The file session ID is invalid or has expired. Files remain in DB & channel.")
         return
 
-    # Owner Bypass Check (14. OWNER BYPASS)
     is_owner_access = (user_id == OWNER_ID)
 
     file_data = json.loads(session['file_data'])
     is_protected = session['is_protected']
     auto_delete_minutes = session['auto_delete_minutes']
 
-    # Apply protection only if content is marked protected AND the user is NOT the owner
     send_protected = (is_protected and not is_owner_access)
 
-    # 1. Inform user about protection/deletion
     info_message = "✅ Files retrieved successfully! The delivery system guarantees reliability."
     parse_mode = types.ParseMode.MARKDOWN_V2 if send_protected else types.ParseMode.HTML
 
     if send_protected:
-        # Owner Bypass: Protect Content ignored (can forward/save)
-        # Note: MarkdownV2 requires escaping periods
         info_message += "\n\n⚠️ **Content is Protected**\\. Forwarding and saving are disabled\\."
     
-    # Auto-delete not applied to owner (14. OWNER BYPASS)
     if auto_delete_minutes > 0 and not is_owner_access:
         delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
         delete_time_str = delete_time.strftime("%H:%M:%S on %Y-%m-%d UTC")
-        # 13. AUTO DELETE LOGIC: Only user’s chat is cleaned
         info_message += f"\n\n⏰ **Auto\-Delete Scheduled:** The files will be automatically deleted from *this chat* at `{delete_time_str}`\\."
 
-    # Use a direct response without parse_mode if no Markdown is needed to avoid escaping issues
     await message.answer(info_message, parse_mode=parse_mode)
 
-    # 2. Send the files (reliable method: send one by one)
     sent_message_ids = []
 
     try:
         for file in file_data:
             file_id = file['file_id']
             caption = file.get('caption')
-            file_type = file.get('type', 'document') # Default for safety
+            file_type = file.get('type', 'document') 
 
-            # Determine the correct sending method (Reliable File Dispatch)
             send_method = None
             if file_type == 'photo':
                 send_method = bot.send_photo
@@ -589,10 +561,8 @@ async def handle_deep_link(message: types.Message, session_id: str):
                 send_method = bot.send_audio
             else:
                 logger.warning(f"Unhandled file type '{file_type}' for session {session_id}")
-                send_method = bot.send_document # Default to document
+                send_method = bot.send_document 
 
-            # Execute the send command
-            # Prepare arguments dynamically based on file type
             send_kwargs = {
                 'chat_id': user_id,
                 'caption': caption,
@@ -608,43 +578,35 @@ async def handle_deep_link(message: types.Message, session_id: str):
             elif file_type == 'audio':
                 send_kwargs['audio'] = file_id
             else:
-                send_kwargs['document'] = file_id # Fallback
+                send_kwargs['document'] = file_id 
 
             sent_msg = await send_method(**send_kwargs)
             sent_message_ids.append(sent_msg.message_id)
-            await asyncio.sleep(0.5) # Throttle to prevent flooding/API limits
+            await asyncio.sleep(0.5) 
 
     except Exception as e:
         logger.error(f"CRITICAL: Failed to send files for session {session_id} to user {user_id}: {e}")
         await message.answer("A critical error occurred while sending files. Some files might be missing.")
 
-    # 3. Schedule Auto-Deletion (13. AUTO DELETE LOGIC)
     if auto_delete_minutes > 0 and not is_owner_access and sent_message_ids:
         delay = auto_delete_minutes * 60
-        # Schedule the deletion task to run independently
         asyncio.create_task(schedule_deletion(user_id, sent_message_ids, delay))
 
 
 async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int):
-    """
-    Schedules the deletion of messages in a user's chat after a specified delay.
-    Only user’s chat is cleaned; DB & channel untouched.
-    """
+    """Schedules the deletion of messages in a user's chat."""
     logger.info(f"Scheduling deletion for {len(message_ids)} messages in chat {chat_id} in {delay_seconds} seconds.")
     try:
         await asyncio.sleep(delay_seconds)
         
-        # Attempt to delete the message batch
         for msg_id in message_ids:
             try:
                 await bot.delete_message(chat_id, msg_id)
-                await asyncio.sleep(0.1) # Throttle
+                await asyncio.sleep(0.1) 
             except Exception as e:
-                # Log but continue with the rest of the batch (reliability)
                 logger.debug(f"Failed to delete message {msg_id} in chat {chat_id}: {e}")
 
         logger.info(f"Successfully cleaned up {len(message_ids)} messages in chat {chat_id}.")
-        # Optional cleanup notification
         try:
             await bot.send_message(chat_id, "✨ The uploaded files have been automatically cleaned from this chat.", disable_notification=True)
         except:
@@ -656,22 +618,20 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
         logger.error(f"CRITICAL: Error during scheduled deletion for chat {chat_id}: {e}")
 
 
-# --- GLOBAL ERROR HANDLER (CRITICAL FIX FOR SILENT CRASHES) ---
+# --- GLOBAL ERROR HANDLER ---
 @dp.errors_handler()
 async def errors_handler(update: types.Update, exception: Exception):
     """Catches all unhandled exceptions during update processing."""
-    # We must explicitly log the exception info to see the traceback
     logger.error(f'An unhandled exception occurred during update processing. Update: {update.update_id}', 
                  exc_info=exception)
     
-    # Owner notification on critical error
     try:
         if OWNER_ID:
             await bot.send_message(OWNER_ID, f"🚨 **CRITICAL BOT ERROR** 🚨\n\nAn unhandled exception occurred during update processing:\n\n`{type(exception).__name__}: {exception}`\n\nCheck logs for full traceback.", parse_mode=types.ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Failed to notify owner of critical error: {e}")
         
-    return True # Returning True tells the dispatcher the error was handled.
+    return True 
 
 
 # --- GENERIC HANDLER (Sanity Check) ---
@@ -679,68 +639,113 @@ async def errors_handler(update: types.Update, exception: Exception):
 async def handle_all_text_messages(message: types.Message):
     """Responds to any non-command text message."""
     if message.text.startswith('/'):
-        # This is a command not caught by specific handlers (e.g., /upload), ignore it for now.
         return 
     
     await message.answer("I received your message, but I only understand commands like /start or /help.")
 
 
-# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (15. HEALTHCHECK, 16. WEBHOOK ONLY) ---
+# --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS ---
 
-# Handler for the health check
 async def health_handler(request):
     """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
     return web.Response(text="ok")
 
+# --- CUSTOM MANUAL WEBHOOK HANDLER (CRITICAL FIX) ---
+async def telegram_webhook(request):
+    """
+    Handles the incoming Telegram update POST request and passes it to the
+    Aiogram dispatcher. This is the critical, manually-implemented step.
+    """
+    if request.match_info.get('token') != BOT_TOKEN:
+        logger.warning(f"Received webhook request with invalid token: {request.match_info.get('token')}")
+        return web.Response(status=403) # Forbidden
 
-async def on_startup(dp: Dispatcher):
-    """
-    Executed on bot startup. Sets webhook, connects to DB, and registers 
-    the custom healthcheck route to the aiohttp web application.
-    """
-    logger.info(f"Bot starting up in {'WEBHOOK' if WEBHOOK_URL else 'POLLING'} mode.")
+    # Get Update from Request Body
+    data = await request.text()
     
-    # 1. Database Connection (CRITICAL for reliability)
-    # CRITICAL FIX 9: We only log the failure but do NOT re-raise, ensuring the 
-    # bot process stays alive and the dispatcher can receive updates.
+    # Process the update
+    try:
+        update = types.Update.to_object(json.loads(data))
+        await dp.process_update(update)
+    except Exception as e:
+        # LOG THIS EXCEPTION IF IT OCCURS. IT IS THE ROOT CAUSE.
+        logger.error(f"CRITICAL LOW-LEVEL DISPATCHER ERROR: Failed to process update. Data:\n{data[:200]}...", exc_info=True)
+        # Ensure the web app always returns 200 OK to Telegram, even on internal failure
+        return web.Response(text="Internal Error Handled", status=200)
+
+    # Return OK to Telegram
+    return web.Response(status=200)
+
+
+async def init_app():
+    """Initializes the entire application: DB, Webhook, and Aiohttp App."""
+    logger.info(f"Bot starting up in WEBHOOK mode.")
+    
+    # 1. Database Connection
     try:
         await db_manager.connect()
     except Exception as e:
+        # Log failure but DO NOT re-raise, allowing the bot to start.
         logger.critical(f"Database connection failed during startup: {e}. ALL DB-dependent features will fail.", exc_info=True)
-        # We allow the function to return normally here.
         
-    # 2. Webhook Setup
+    # 2. Aiohttp Application Setup
+    app = web.Application()
+    
+    # Register core webhook route and healthcheck
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+    app.router.add_get('/health', health_handler)
+    
+    # 3. Webhook Setting
     if WEBHOOK_URL:
         try:
-            webhook_info = await dp.bot.get_webhook_info()
+            webhook_info = await bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 logger.info(f"Setting webhook to: {WEBHOOK_URL}")
-                await dp.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
+                await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
             else:
                 logger.info("Webhook already set correctly.")
         except Exception as e:
             logger.critical(f"Failed to set webhook: {e}")
 
-    # 3. Register Healthcheck Route using dp.web_app (CORRECT AIOGRAM V2 PATTERN)
-    if WEBHOOK_URL and hasattr(dp, 'web_app') and dp.web_app is not None:
-        dp.web_app.router.add_get('/health', health_handler)
-        logger.info("Healthcheck route '/health' registered successfully via dp.web_app.")
-
-    # 4. Final Check and confirmation
-    me = await dp.bot.get_me()
+    # 4. Final Confirmation
+    me = await bot.get_me()
     logger.info(f"Bot '{me.username}' is ready. Owner ID: {OWNER_ID}. Channel ID: {UPLOAD_CHANNEL_ID}.")
-
     logger.info("Bot startup completed successfully.")
+    
+    return app
+
+
+def main():
+    """Runs the main application using aiohttp's runner."""
+    logger.info("Initializing bot system...")
+    
+    # Use aiohttp runner for manual control
+    app = asyncio.get_event_loop().run_until_complete(init_app())
+    
+    # Standard aiohttp runner setup
+    runner = AppRunner(app)
+    asyncio.get_event_loop().run_until_complete(runner.setup())
+    site = TCPSite(runner, '0.0.0.0', HEALTHCHECK_PORT)
+    
+    logger.info(f"Starting web server on port {HEALTHCHECK_PORT}")
+    try:
+        asyncio.get_event_loop().run_until_complete(site.start())
+        asyncio.get_event_loop().run_forever()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped manually.")
+    finally:
+        asyncio.get_event_loop().run_until_complete(site.stop())
+        asyncio.get_event_loop().run_until_complete(runner.cleanup())
+        # Manual shutdown hooks (for DB cleanup)
+        asyncio.get_event_loop().run_until_complete(on_shutdown(dp))
 
 
 async def on_shutdown(dp):
     """Executed on bot shutdown. Closes DB connection and clears webhook."""
     logger.info("Bot shutting down...")
     
-    # 1. Database Disconnection
     await db_manager.close()
     
-    # 2. Webhook Cleanup
     if WEBHOOK_URL:
         logger.info("Clearing webhook...")
         await dp.bot.delete_webhook()
@@ -750,42 +755,10 @@ async def on_shutdown(dp):
     logger.info("Bot shutdown completed.")
 
 
-def main():
-    """Main function to start the bot using the appropriate executor."""
-    logger.info("Initializing bot system...")
-    
-    is_webhook_mode = bool(WEBHOOK_URL)
-    
-    if is_webhook_mode:
-        
-        logger.info("Starting bot in Webhook Mode (Render Hosting).")
-        
-        executor.start_webhook(
-            dispatcher=dp,
-            webhook_path=WEBHOOK_PATH,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            skip_updates=True,
-            host='0.0.0.0',
-            port=HEALTHCHECK_PORT, 
-        )
-    else:
-        # Polling fallback (disabled per request but useful for local testing)
-        logger.warning("WEBHOOK_HOST not set. Starting bot in Polling Mode (for local testing only).")
-        executor.start_polling(
-            dp,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            skip_updates=True
-        )
-
-
 if __name__ == '__main__':
     # Ensure event loop is available and run main
     try:
         main()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped manually.")
     except Exception as e:
         logger.critical(f"An unhandled error occurred in main execution: {e}")
-        time.sleep(1) # Pause before final exit
+        time.sleep(1) 
