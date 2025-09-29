@@ -3,16 +3,13 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 9 (Previous): Isolated DB Connection in on_startup.
-#  FIX 10 (Current - CRITICAL WEBHOOK RELIABILITY):                             
-#   1. **Manual Webhook Setup:** Replaced `executor.start_webhook` with         
-#      a manual `aiohttp.web.run_app` setup.                                    
-#   2. **Explicit Handler:** Defined a specific `telegram_webhook` function that 
-#      manually processes the incoming JSON request and calls                   
-#      `dp.process_update()`.                                                   
-#   3. **Direct Error Logging:** Added try/except blocks around the update      
-#      processing to catch *any* low-level errors during the critical           
-#      HTTP-to-Dispatcher step, guaranteeing a traceback in the logs.           
+#  FIX 10 (Previous): Manual Webhook Setup with Aiohttp runner.
+#  FIX 11 (Current - CRITICAL WEBHOOK PARSING):                                 
+#   1. **Optimized JSON Reading:** Changed the low-level webhook handler from   
+#      `await request.text()` + `json.loads()` to the safer `await request.json()` 
+#      method. This is the most reliable way to parse the incoming Telegram JSON 
+#      update in an aiohttp environment, preventing potential silent failures   
+#      due to encoding or content-type mismatch.                                
 ################################################################################
 """
 
@@ -42,44 +39,43 @@ from asyncpg.exceptions import UniqueViolationError, DuplicateTableError, Undefi
 # --- AIOHTTP IMPORTS (CRITICAL for Webhook Fix) ---
 import aiohttp
 from aiohttp import web 
-from aiohttp.web_runner import AppRunner, TCPSite # Required for manual start
+from aiohttp.web_runner import AppRunner, TCPSite 
 
 # --- CONFIGURATION AND ENVIRONMENT SETUP ---
 
 # Configure logging to ensure all operations are tracked for reliability
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=getattr(logging, LOG_LEVEL),
+logging.basicConfig(level=getattr(LOG_LEVEL, LOG_LEVEL),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Mandatory environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # Owner for full control
-UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0")) # Channel to store files
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) 
+UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0")) 
 
-# Webhook configuration for Render hosting (16. WEBHOOK ONLY)
+# Webhook configuration for Render hosting
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_HOST")
-WEBHOOK_PATH = f'/{BOT_TOKEN}' # Must match the path set by Telegram
+WEBHOOK_PATH = f'/{BOT_TOKEN}'
 WEBHOOK_URL = f'{WEBHOOK_HOST}{WEBHOOK_PATH}' if WEBHOOK_HOST else None
 
-# Keep-Alive Configuration (15. HEALTHCHECK ENDPOINT)
+# Keep-Alive Configuration
 HEALTHCHECK_PORT = int(os.getenv("PORT", 8080))
 
-# Hard limit for auto-delete time (10080 minutes = 7 days)
+# Hard limit for auto-delete time
 MAX_AUTO_DELETE_MINUTES = 10080
 
 # Check for critical configuration
 if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
     logger.error("CRITICAL: One or more essential environment variables are missing (BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID). Exiting.")
-    # exit(1)
 
 
-# --- DATABASE CONNECTION AND MODEL MANAGEMENT (11. DATABASE) ---
+# --- DATABASE CONNECTION AND MODEL MANAGEMENT ---
 
 class Database:
     """
-    Manages the connection pool and all CRUD operations for the PostgreSQL database (Neon).
+    Manages the connection pool and all CRUD operations for the PostgreSQL database.
     """
     def __init__(self, dsn):
         self.dsn = dsn
@@ -122,23 +118,21 @@ class Database:
             return await conn.fetchrow(query, *args)
 
     async def fetch(self, query, *args):
-        """Fetches multiple rows from the database (e.g., all user IDs for broadcast)."""
+        """Fetches multiple rows from the database."""
         async with self._pool.acquire() as conn:
             return await conn.fetch(query, *args)
 
     async def fetchval(self, query, *args):
-        """Fetches a single value from the database (e.g., stat counts)."""
+        """Fetches a single value from the database."""
         async with self._pool.acquire() as conn:
             return await conn.fetchval(query, *args)
 
     async def setup_schema(self):
         """
-        Sets up all necessary tables and performs reliable checks to ensure
-        the schema is correct, implementing repair logic for common corruption.
+        Sets up all necessary tables and performs reliable checks.
         """
         logger.info("Database: Checking/setting up schema...")
         
-        # --- Helper for reliable table creation ---
         async def create_table(conn, table_name, schema_query):
             try:
                 await conn.execute(schema_query)
@@ -150,7 +144,7 @@ class Database:
                 raise
 
         async with self._pool.acquire() as conn:
-            # 1. Users Table (CRITICAL: Corruption Check)
+            # 1. Users Table
             users_schema = """
             CREATE TABLE users (
                 id BIGINT PRIMARY KEY,
@@ -158,8 +152,6 @@ class Database:
                 last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             """
-            
-            # Check for corruption (e.g., conflicting column names like 'user_id' instead of 'id')
             try:
                 await conn.fetchval("SELECT id FROM users LIMIT 1;")
             except (UndefinedColumnError, asyncpg.exceptions.InvalidCatalogObjectError, asyncpg.exceptions.PostgresError) as e:
@@ -183,7 +175,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id VARCHAR(50) PRIMARY KEY,
                     owner_id BIGINT NOT NULL,
-                    file_data JSONB NOT NULL, -- [{'file_id': '...', 'caption': '...', 'type': '...'}]
+                    file_data JSONB NOT NULL,
                     is_protected BOOLEAN DEFAULT FALSE,
                     auto_delete_minutes INTEGER DEFAULT 0,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -198,7 +190,7 @@ class Database:
                 );
             """)
 
-            # Step 2: Ensure initial default messages exist and fix corruption if found
+            # Insert defaults
             try:
                 await self._insert_default_messages(conn)
             except UndefinedColumnError as e:
@@ -213,11 +205,9 @@ class Database:
                         );
                     """)
                     await self._insert_default_messages(conn) 
-                    logger.info("Database: messages table successfully reset and populated.")
                 else:
                     raise 
 
-            # Step 3: Ensure stats are initialized and fix corruption if found
             try:
                 await self._insert_default_stats(conn)
             except UndefinedColumnError as e:
@@ -231,7 +221,6 @@ class Database:
                         );
                     """)
                     await self._insert_default_stats(conn) 
-                    logger.info("Database: statistics table successfully reset and populated.")
                 else:
                     raise 
             
@@ -241,7 +230,7 @@ class Database:
     async def _insert_default_messages(self, conn):
         """Inserts default start/help messages if not already present."""
         default_start = "👋 Welcome to the Deep-Link File Bot! I securely deliver files via unique links. Reliability is guaranteed by my Neon database persistence."
-        default_help = "📚 Help: Only the owner has upload access. Files are permanent storage in a private channel (12. UPLOAD CHANNEL). Access is granted via unique deep links. Use /start to go to the welcome message."
+        default_help = "📚 Help: Only the owner has upload access. Files are permanent storage in a private channel. Access is granted via unique deep links. Use /start to go to the welcome message."
 
         for key, text in [('start', default_start), ('help', default_help)]:
             query = """
@@ -273,18 +262,18 @@ class Database:
         await self.fetchrow(query, user_id)
 
     async def get_total_users(self):
-        """Returns the total number of users (8. /stats)."""
+        """Returns the total number of users."""
         return await self.fetchval("SELECT COUNT(*) FROM users;")
 
     async def get_active_users(self):
-        """Returns the number of users active in the last 48 hours (8. /stats)."""
+        """Returns the number of users active in the last 48 hours."""
         time_threshold = datetime.now() - timedelta(hours=48)
         return await self.fetchval(
             "SELECT COUNT(*) FROM users WHERE last_active >= $1;",
             time_threshold
         )
 
-    # --- MESSAGE/CUSTOMIZATION METHODS (5. /setimage, 6. /setmessage) ---
+    # --- MESSAGE/CUSTOMIZATION METHODS ---
     async def get_message_content(self, key):
         """Retrieves text and image_id for a specific key ('start' or 'help')."""
         query = "SELECT text, image_id FROM messages WHERE key = $1;"
@@ -306,9 +295,9 @@ class Database:
         """
         await self.execute(query, key, image_id)
 
-    # --- SESSION/UPLOAD METHODS (9. /upload, 10. DEEP LINK ACCESS) ---
+    # --- SESSION/UPLOAD METHODS ---
     async def create_upload_session(self, owner_id, file_data, is_protected, auto_delete_minutes):
-        """Creates a new upload session and returns its unique ID (9. Step 6)."""
+        """Creates a new upload session and returns its unique ID."""
         session_id = str(uuid.uuid4())
         file_data_json = json.dumps(file_data)
         query = """
@@ -325,7 +314,7 @@ class Database:
         query = "SELECT * FROM sessions WHERE session_id = $1;"
         return await self.fetchrow(query, session_id)
 
-    # --- STATISTICS METHODS (8. /stats) ---
+    # --- STATISTICS METHODS ---
     async def increment_stat(self, key, amount=1):
         """Increments a statistic counter."""
         query = """
@@ -341,10 +330,8 @@ class Database:
     async def get_all_stats(self):
         """Retrieves all statistics for the /stats command."""
         stats = {}
-        # Derived from user table
         stats['total_users'] = await self.get_total_users()
         stats['active_users'] = await self.get_active_users()
-        # Derived from statistics table
         stats['total_sessions'] = await self.get_stat_value('total_sessions')
         stats['files_uploaded'] = await self.get_stat_value('files_uploaded')
         return stats
@@ -354,7 +341,7 @@ class Database:
 db_manager = Database(DATABASE_URL)
 
 
-# --- AIOGRAM INITIALIZATION (1. CORE SETUP) ---
+# --- AIOGRAM INITIALIZATION ---
 
 # Initialize Bot and Dispatcher
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
@@ -362,10 +349,10 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 
-# --- OWNER/SECURITY UTILITIES (2. COMMANDS – OWNER VS USERS) ---
+# --- OWNER/SECURITY UTILITIES ---
 
 def is_owner_filter(message: types.Message):
-    """Filter to check if the user is the bot owner (defined by OWNER_ID)."""
+    """Filter to check if the user is the bot owner."""
     return message.from_user.id == OWNER_ID
 
 
@@ -408,7 +395,6 @@ class UserActivityMiddleware(BaseMiddleware):
             return 
 
         if user_id:
-            # NON-BLOCKING & RELIABLE: Use the safe wrapper to handle DB interaction
             asyncio.create_task(safe_db_user_update(self.db, user_id))
             data['user_id'] = user_id 
 
@@ -416,7 +402,7 @@ class UserActivityMiddleware(BaseMiddleware):
 dp.middleware.setup(UserActivityMiddleware(db_manager))
 
 
-# --- FSM FOR UPLOAD PROCESS (9. /upload Multi-Step Flow) ---
+# --- FSM FOR UPLOAD PROCESS ---
 
 class UploadFSM(StatesGroup):
     """States for the multi-step /upload command flow."""
@@ -429,7 +415,7 @@ class UploadFSM(StatesGroup):
 ImageTypeCallback = CallbackData("img_type", "key")
 ProtectionCallback = CallbackData("prot", "is_protected")
 
-# --- HANDLERS: CORE USER COMMANDS (2. USERS) ---
+# --- HANDLERS: CORE USER COMMANDS ---
 
 @dp.message_handler(is_owner_filter, commands=['start', 'help']) 
 async def cmd_owner_start_help(message: types.Message):
@@ -439,7 +425,7 @@ async def cmd_owner_start_help(message: types.Message):
 @dp.message_handler(commands=['start', 'help'])
 async def cmd_user_start_help(message: types.Message):
     """
-    Handles /start and /help commands for all users.
+    Handles /start (including deep links) and /help commands for all users.
     """
     command = message.get_command()
     payload = message.get_args()
@@ -464,7 +450,7 @@ async def cmd_user_start_help(message: types.Message):
         image_id = None
 
 
-    # Inline Keyboard (3. /start - "Help" button)
+    # Inline Keyboard 
     keyboard = types.InlineKeyboardMarkup()
     button_key = 'Help' if key == 'start' else 'Start'
     callback_cmd = '/help' if key == 'start' else '/start'
@@ -501,7 +487,7 @@ async def handle_cmd_callback(call: types.CallbackQuery):
     mock_message.text = f'/{cmd}'
     await cmd_user_start_help(mock_message)
 
-# --- DEEP LINK ACCESS LOGIC (10. DEEP LINK ACCESS, 14. OWNER BYPASS) ---
+# --- DEEP LINK ACCESS LOGIC ---
 
 async def handle_deep_link(message: types.Message, session_id: str):
     """
@@ -634,7 +620,7 @@ async def errors_handler(update: types.Update, exception: Exception):
     return True 
 
 
-# --- GENERIC HANDLER (Sanity Check) ---
+# --- GENERIC HANDLER ---
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def handle_all_text_messages(message: types.Message):
     """Responds to any non-command text message."""
@@ -647,30 +633,33 @@ async def handle_all_text_messages(message: types.Message):
 # --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS ---
 
 async def health_handler(request):
-    """Returns 'ok' for UptimeRobot pings (15. HEALTHCHECK ENDPOINT)."""
+    """Returns 'ok' for UptimeRobot pings."""
     return web.Response(text="ok")
 
-# --- CUSTOM MANUAL WEBHOOK HANDLER (CRITICAL FIX) ---
+# --- CUSTOM MANUAL WEBHOOK HANDLER (CRITICAL FIX 11 APPLIED) ---
 async def telegram_webhook(request):
     """
     Handles the incoming Telegram update POST request and passes it to the
-    Aiogram dispatcher. This is the critical, manually-implemented step.
+    Aiogram dispatcher using the safer request.json() method.
     """
     if request.match_info.get('token') != BOT_TOKEN:
         logger.warning(f"Received webhook request with invalid token: {request.match_info.get('token')}")
-        return web.Response(status=403) # Forbidden
+        return web.Response(status=403) 
 
-    # Get Update from Request Body
-    data = await request.text()
-    
+    # --- CRITICAL FIX 11: Use request.json() ---
+    try:
+        update_data = await request.json()
+    except Exception as e:
+        logger.error(f"LOW-LEVEL PARSING FAILURE: Could not parse request body as JSON. {e}", exc_info=True)
+        return web.Response(text="Parsing Failed", status=200)
+
     # Process the update
     try:
-        update = types.Update.to_object(json.loads(data))
+        update = types.Update.to_object(update_data)
         await dp.process_update(update)
     except Exception as e:
-        # LOG THIS EXCEPTION IF IT OCCURS. IT IS THE ROOT CAUSE.
-        logger.error(f"CRITICAL LOW-LEVEL DISPATCHER ERROR: Failed to process update. Data:\n{data[:200]}...", exc_info=True)
-        # Ensure the web app always returns 200 OK to Telegram, even on internal failure
+        # This will catch errors inside Aiogram's dispatcher
+        logger.error(f"CRITICAL LOW-LEVEL DISPATCHER ERROR: Failed to process update.", exc_info=True)
         return web.Response(text="Internal Error Handled", status=200)
 
     # Return OK to Telegram
@@ -685,13 +674,13 @@ async def init_app():
     try:
         await db_manager.connect()
     except Exception as e:
-        # Log failure but DO NOT re-raise, allowing the bot to start.
         logger.critical(f"Database connection failed during startup: {e}. ALL DB-dependent features will fail.", exc_info=True)
         
     # 2. Aiohttp Application Setup
     app = web.Application()
     
     # Register core webhook route and healthcheck
+    # Note: The route uses the BOT_TOKEN as a variable to handle the path matching
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
     app.router.add_get('/health', health_handler)
     
@@ -701,6 +690,8 @@ async def init_app():
             webhook_info = await bot.get_webhook_info()
             if webhook_info.url != WEBHOOK_URL:
                 logger.info(f"Setting webhook to: {WEBHOOK_URL}")
+                # We do NOT use the path variable in set_webhook here, 
+                # as the path is derived from the token, which is already in WEBHOOK_URL.
                 await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True) 
             else:
                 logger.info("Webhook already set correctly.")
@@ -720,24 +711,25 @@ def main():
     logger.info("Initializing bot system...")
     
     # Use aiohttp runner for manual control
-    app = asyncio.get_event_loop().run_until_complete(init_app())
+    loop = asyncio.get_event_loop()
+    app = loop.run_until_complete(init_app())
     
     # Standard aiohttp runner setup
     runner = AppRunner(app)
-    asyncio.get_event_loop().run_until_complete(runner.setup())
+    loop.run_until_complete(runner.setup())
     site = TCPSite(runner, '0.0.0.0', HEALTHCHECK_PORT)
     
     logger.info(f"Starting web server on port {HEALTHCHECK_PORT}")
     try:
-        asyncio.get_event_loop().run_until_complete(site.start())
-        asyncio.get_event_loop().run_forever()
+        loop.run_until_complete(site.start())
+        loop.run_forever()
     except KeyboardInterrupt:
         logger.info("Bot stopped manually.")
     finally:
-        asyncio.get_event_loop().run_until_complete(site.stop())
-        asyncio.get_event_loop().run_until_complete(runner.cleanup())
+        loop.run_until_complete(site.stop())
+        loop.run_until_complete(runner.cleanup())
         # Manual shutdown hooks (for DB cleanup)
-        asyncio.get_event_loop().run_until_complete(on_shutdown(dp))
+        loop.run_until_complete(on_shutdown(dp))
 
 
 async def on_shutdown(dp):
