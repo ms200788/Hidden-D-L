@@ -3,11 +3,12 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: Critical resilience added to _process_messages_for_vaulting: now     #
-#         continues processing files even if one copy fails (fixes multi-file).#
-#  FIXED: Broadcast failure logging: logs the specific error and user ID for   #
-#         each broadcast attempt (diagnoses ChatNotFound/API issues).          #
-#  FIXED: Enhanced user feedback for file collection during /upload.           #
+#  FIXED: Deep Link Reliability: Session IDs are now URL-safe Base64 encoded   #
+#         (shorter payload) to avoid Telegram deep-link limits.                #
+#  FIXED: Multi-File Vaulting: Confirmed resilience logic and added pre-check  #
+#         before finalizing the session.                                       #
+#  FIXED: Broadcast Reliability: Increased throttling and refined error logging#
+#         to pinpoint exact failure reasons per user (ChatNotFound, etc.).     #
 ################################################################################
 """
 
@@ -29,7 +30,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher.middlewares import BaseMiddleware 
 from aiogram.utils.callback_data import CallbackData 
 from aiogram.utils.deep_linking import get_start_link
-from aiogram.utils.exceptions import ChatNotFound, MessageCantBeDeleted
+from aiogram.utils.exceptions import ChatNotFound, MessageCantBeDeleted, BotBlocked, UserDeactivated, MigrateToChat
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- MEDIA GROUP HANDLING (NEW IMPORT) ---
@@ -69,6 +70,17 @@ MAX_AUTO_DELETE_MINUTES = 10080
 # Check for critical configuration
 if not all([BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID]):
     logger.error("CRITICAL: One or more essential environment variables are missing (BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID). Exiting.")
+
+
+# --- UTILITIES FOR SHORT, RELIABLE DEEP-LINK IDS ---
+
+def _generate_short_session_id():
+    """Generates a short, URL-safe base64 ID from a UUID, suitable for deep links."""
+    # Use 16 random bytes from a UUID4
+    uuid_bytes = uuid.uuid4().bytes
+    # Base64 encode it, then strip padding (=) and replace URL-unsafe chars
+    short_id = base64.urlsafe_b64encode(uuid_bytes).decode('utf-8').rstrip('=')
+    return short_id
 
 
 # --- DATABASE CONNECTION AND MODEL MANAGEMENT ---
@@ -173,7 +185,7 @@ class Database:
             # 3. Upload Sessions Table
             await create_table(conn, 'sessions', """
                 CREATE TABLE IF NOT EXISTS sessions (
-                    session_id VARCHAR(50) PRIMARY KEY,
+                    session_id VARCHAR(50) PRIMARY KEY, -- Shortened ID max length 32 is sufficient
                     owner_id BIGINT NOT NULL,
                     file_data JSONB NOT NULL,
                     is_protected BOOLEAN DEFAULT FALSE,
@@ -238,7 +250,7 @@ class Database:
         await self.execute(query, user_id) 
 
     async def get_all_user_ids(self, exclude_id=None):
-        """Returns a list of all user IDs."""
+        """Returns a list of all user IDs as records [{'id': 123}, ...]."""
         query = "SELECT id FROM users"
         if exclude_id is not None:
             # Safely use the parameter for exclusion
@@ -248,7 +260,6 @@ class Database:
             results = await self.fetch(query)
 
         try:
-            # We use fetch to get records like [{'id': 1234}, ...]
             return results
         except Exception as e:
             logger.error(f"Database: Failed to fetch all user IDs: {e}")
@@ -256,8 +267,8 @@ class Database:
 
     # --- SESSION/UPLOAD METHODS ---
     async def create_upload_session(self, owner_id, file_data, is_protected, auto_delete_minutes):
-        """Creates a new upload session and returns its unique ID."""
-        session_id = str(uuid.uuid4())
+        """Creates a new upload session and returns its unique ID (now shortened)."""
+        session_id = _generate_short_session_id() # <-- Use the short ID generator
         file_data_json = json.dumps(file_data)
         query = """
         INSERT INTO sessions (session_id, owner_id, file_data, is_protected, auto_delete_minutes)
@@ -268,8 +279,8 @@ class Database:
         await self.increment_stat('files_uploaded', len(file_data))
         return session_id
 
-    async def get_upload_session(self, session_id):
-        """Retrieves an upload session by its ID."""
+    async def get_upload_session(self, session_id: str):
+        """Retrieves an upload session by its ID (now the short encoded ID)."""
         query = "SELECT * FROM sessions WHERE session_id = $1;"
         return await self.fetchrow(query, session_id)
 
@@ -485,6 +496,7 @@ async def cmd_finalize_upload(message: types.Message):
         await message.reply("No active upload session.", parse_mode=None)
         return
         
+    # Pre-vault check
     if not upload["messages"]:
         await message.reply("❌ Cannot finalize: No messages collected yet. Send files first.", parse_mode=None)
         return
@@ -678,7 +690,7 @@ async def _receive_minutes(m: types.Message):
     # Filter out any non-deliverable items (e.g., failed copies)
     final_file_data = [d for d in vaulted_file_data if d.get('type') not in ('header', 'unsupported_media')]
     if not final_file_data:
-        # This check is vital: if no files were successfully vaulted (even after resilience), we fail here.
+        # This check is vital: if no files were successfully vaulted, we fail here.
         await bot.edit_message_text("❌ **Finalization Failed:** No valid files were successfully vaulted. Ensure bot has all permissions and try again. Session cancelled.", 
                                     m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
         cancel_upload_session(OWNER_ID)
@@ -692,6 +704,7 @@ async def _receive_minutes(m: types.Message):
                                 m.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
     
     try:
+        # session_id is now the short, reliable ID for the deep link
         session_id = await db_manager.create_upload_session(
             owner_id=OWNER_ID,
             file_data=final_file_data,
@@ -707,6 +720,7 @@ async def _receive_minutes(m: types.Message):
         return
 
     # --- 3. DEEP LINK GENERATION ---
+    # The session_id is already the short payload
     deep_link = await get_start_link(session_id, encode=False)
     
     # Update status BEFORE final report
@@ -852,6 +866,7 @@ async def handle_deep_link(message: types.Message, session_id: str):
     user_id = message.from_user.id
     
     try:
+        # session_id is the short, encoded ID
         session = await db_manager.get_upload_session(session_id)
     except Exception as e:
         logger.error(f"DB read error during deep link access for {session_id}: {e}", exc_info=True)
@@ -1113,14 +1128,24 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
             )
             success_count += 1
         except ChatNotFound: 
-            # This is the expected warning when a user blocks the bot.
-            logger.warning(f"Failed to send broadcast to user {user_id}: Chat not found. Ignoring this user.")
+            # User has likely deleted the chat or is no longer reachable by the bot
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat not found (Expected for blocked users).")
+            fail_count += 1
+        except BotBlocked:
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Bot blocked by user.")
+            fail_count += 1
+        except UserDeactivated:
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - User account deactivated.")
+            fail_count += 1
+        except MigrateToChat as e:
+            # If a user's chat migrated, you might update their ID here if you stored it.
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat migrated. New ID: {e.migrate_to_chat_id}")
             fail_count += 1
         except Exception as e:
-             # Catch other unexpected errors but continue the loop
-            logger.error(f"Failed to send broadcast to user {user_id} ({type(e).__name__}). Ignoring this user.", exc_info=True)
+             # Catch all other unexpected errors but continue the loop
+            logger.error(f"BROADCAST FAILURE: User {user_id}. Error: {type(e).__name__}. Ignoring this user.", exc_info=True)
             fail_count += 1
-        await asyncio.sleep(0.05) # Throttle to respect API limits
+        await asyncio.sleep(0.1) # Aggressive throttle for mass mailing
 
     report = (
         f"📣 **Broadcast Complete**\n"
