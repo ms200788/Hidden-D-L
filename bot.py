@@ -3,13 +3,14 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIX 6 (Previous): Fixed InvalidQueryID and DB schema corruption checks.      
-#  FIX 7 (Current):                                                             
-#   1. **Middleware Reliability:** Refactored the UserActivityMiddleware to use  
-#      a safe wrapper function for the DB call. This contains potential DB      
-#      errors within a robust try/except block, preventing silent failures      
-#      from blocking the dispatcher and stopping command execution.             
-#   2. **Minor Log Cleanup:** Clarified the schema check process.               
+#  FIX 7 (Previous): Enhanced middleware reliability to prevent silent failures.
+#  FIX 8 (Current):                                                             
+#   1. **Global Error Handler:** Added `@dp.errors_handler` to catch and log    
+#      any unhandled exceptions during the dispatch cycle (the most likely      
+#      cause of a bot not responding to *any* command). This prevents silent    
+#      crashes.                                                                 
+#   2. **Generic Text Handler:** Added a simple fallback handler to confirm     
+#      the dispatcher is running and processing non-command updates.            
 ################################################################################
 """
 
@@ -381,7 +382,7 @@ async def safe_db_user_update(db_manager, user_id):
     try:
         await db_manager.get_or_create_user(user_id)
     except Exception as e:
-        logger.error(f"CRITICAL ASYNC DB FAILURE: Failed to update user {user_id} activity: {e}")
+        logger.error(f"CRITICAL ASYNC DB FAILURE: Failed to update user {user_id} activity: {e}", exc_info=True)
         # Crucial: Do NOT raise here. Allow the main update to proceed.
 
 
@@ -401,7 +402,6 @@ class UserActivityMiddleware(BaseMiddleware):
             user_id = update.message.from_user.id
         elif update.callback_query:
             user_id = update.callback_query.from_user.id
-        # Future-proofing for other common updates
         elif update.inline_query:
             user_id = update.inline_query.from_user.id
         elif update.edited_message:
@@ -411,9 +411,8 @@ class UserActivityMiddleware(BaseMiddleware):
 
         if user_id:
             # NON-BLOCKING & RELIABLE: Use the safe wrapper to handle DB interaction
-            # This ensures that a DB error won't stop command handlers from running.
             asyncio.create_task(safe_db_user_update(self.db, user_id))
-            data['user_id'] = user_id # Pass user_id to handlers if needed (optional, but safe)
+            data['user_id'] = user_id 
 
 # --- MIDDLEWARE SETUP ---
 # Apply the middleware globally before starting the bot
@@ -493,7 +492,6 @@ async def cmd_user_start_help(message: types.Message):
 async def handle_cmd_callback(call: types.CallbackQuery):
     """
     Handles inline button clicks for Start/Help navigation.
-    CRITICAL FIX: call.answer() must be sent immediately to avoid InvalidQueryID.
     """
     # 1. Acknowledge the callback immediately
     await call.answer() 
@@ -636,6 +634,30 @@ async def schedule_deletion(chat_id: int, message_ids: list, delay_seconds: int)
         logger.info(f"Deletion task for chat {chat_id} was cancelled.")
     except Exception as e:
         logger.error(f"CRITICAL: Error during scheduled deletion for chat {chat_id}: {e}")
+
+
+# --- GLOBAL ERROR HANDLER (CRITICAL FIX FOR SILENT CRASHES) ---
+@dp.errors_handler()
+async def errors_handler(update: types.Update, exception: Exception):
+    """Catches all unhandled exceptions during update processing."""
+    # We must explicitly log the exception info to see the traceback
+    logger.error(f'An unhandled exception occurred during update processing. Update: {update.update_id}', 
+                 exc_info=exception)
+    
+    # Optional: Notify the user/owner if needed, but logging is the priority
+    # For now, just log and return False to let aiogram suppress the error.
+    return True # Returning True tells the dispatcher the error was handled.
+
+
+# --- GENERIC HANDLER (Sanity Check) ---
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def handle_all_text_messages(message: types.Message):
+    """Responds to any non-command text message."""
+    if message.text.startswith('/'):
+        # This is a command not caught by specific handlers (e.g., /upload), ignore it for now.
+        return 
+    
+    await message.answer("I received your message, but I only understand commands like /start or /help.")
 
 
 # --- WEBHOOK SETUP AND STARTUP/SHUTDOWN HOOKS (15. HEALTHCHECK, 16. WEBHOOK ONLY) ---
