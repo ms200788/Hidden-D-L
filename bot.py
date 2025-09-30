@@ -3,12 +3,13 @@
 ################################################################################
 #  HIGHLY RELIABLE TELEGRAM BOT IMPLEMENTATION - AIOGRAM V2 & ASYNCPG/NEON      #
 #                                                                              
-#  FIXED: Deep Link Reliability: Session IDs are now URL-safe Base64 encoded   #
-#         (shorter payload) to avoid Telegram deep-link limits.                #
-#  FIXED: Multi-File Vaulting: Confirmed resilience logic and added pre-check  #
-#         before finalizing the session.                                       #
-#  FIXED: Broadcast Reliability: Increased throttling and refined error logging#
-#         to pinpoint exact failure reasons per user (ChatNotFound, etc.).     #
+#  FIXED: Multi-File Deep Link: Session collects ALL media/text (including      #
+#         albums) and generates ONE unique deep link for reliable, multi-file  #
+#         delivery.                                                            #
+#  FIXED: Broadcast Reliability: Strict throttling (0.1s delay) and detailed   #
+#         error logging to handle BotBlocked/ChatNotFound exceptions gracefully.
+#  FIXED: Deep Link Reliability: Session IDs are URL-safe Base64 encoded (shorter 
+#         payload) to avoid Telegram deep-link limits.                
 ################################################################################
 """
 
@@ -387,6 +388,10 @@ class UserActivityMiddleware(BaseMiddleware):
             data['user_id'] = user_id 
 
 class AlbumMiddleware(BaseMiddleware):
+    """
+    Collects messages belonging to a media group (album) and re-injects 
+    them as a single update to be handled by the collector.
+    """
     album_data: dict = {}
     
     def __init__(self, latency: Union[int, float] = 0.5):
@@ -405,19 +410,21 @@ class AlbumMiddleware(BaseMiddleware):
         else:
             self.album_data[media_group_id].append(message)
         
-        raise types.CancelHandler()
+        raise types.CancelHandler() # Cancel handling for individual album messages
 
     async def album_timeout(self, media_group_id: str):
+        """Waits for the latency period, then processes the collected album."""
         await asyncio.sleep(self.latency)
 
         album = self.album_data.pop(media_group_id)
         
-        # NOTE: Only the first message is processed by handlers, 
+        # Only the first message is processed by handlers, 
         # carrying the 'album' key which contains all messages.
         main_message = album[0] 
         main_message.conf['album'] = album
         
         # Must use process_update to re-inject the message with the album data
+        # so the cmd_upload_message_collector can process it.
         await self.dispatcher.process_update(types.Update.to_object({
             "update_id": main_message.update_id,
             "message": main_message.to_python()
@@ -496,7 +503,7 @@ async def cmd_finalize_upload(message: types.Message):
         await message.reply("No active upload session.", parse_mode=None)
         return
         
-    # Pre-vault check
+    # Pre-vault check: CRITICAL for multi-file sessions
     if not upload["messages"]:
         await message.reply("❌ Cannot finalize: No messages collected yet. Send files first.", parse_mode=None)
         return
@@ -540,6 +547,7 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
     """
     Copies all collected messages to the UPLOAD_CHANNEL_ID and collects 
     the resulting file data. CRITICALLY, it logs and continues on per-message copy failure.
+    This ensures multi-file sessions don't fail because of one corrupt file.
     """
     vaulted_file_data = []
     
@@ -571,7 +579,7 @@ async def _process_messages_for_vaulting(messages: List[types.Message], exclude_
             caption = m0.caption or m0.text or ""
             file_type = m0.content_type
 
-            # 2. Vaulting Process
+            # 2. Vaulting Process: Use copy_message for media, send_message for pure text
             if m0.content_type != types.ContentTypes.TEXT:
                 
                 # Copy the media/non-text message
@@ -775,6 +783,7 @@ async def cmd_upload_message_collector(message: types.Message):
         new_count = 0
         current_message_ids = {msg.message_id for msg in upload["messages"]}
         
+        # Add all valid album messages to the session list
         for msg in album_messages:
             if msg.message_id not in current_message_ids:
                 upload["messages"].append(msg)
@@ -782,7 +791,8 @@ async def cmd_upload_message_collector(message: types.Message):
                 
         if new_count > 0:
             await bot.send_message(message.chat.id, 
-                                   f"*{new_count} files from the Media Group added*. Total files collected: **{len(upload['messages'])}**.", 
+                                   f"*{new_count} files from the Media Group added*. Total files collected: **{len(upload['messages'])}**.\n\n"
+                                   f"Use `/d` to finalize.", 
                                    parse_mode=types.ParseMode.MARKDOWN)
         return
 
@@ -797,7 +807,8 @@ async def cmd_upload_message_collector(message: types.Message):
     if is_supported_media:
         upload["messages"].append(message)
         await bot.send_message(message.chat.id, 
-                               f"*{message.content_type.capitalize()} added*. Total files collected: **{len(upload['messages'])}**.", 
+                               f"*{message.content_type.capitalize()} added*. Total files collected: **{len(upload['messages'])}**.\n\n"
+                               f"Use `/d` to finalize.", 
                                parse_mode=types.ParseMode.MARKDOWN)
         return
         
@@ -810,7 +821,8 @@ async def cmd_upload_message_collector(message: types.Message):
             # Add text message
             upload["messages"].append(message)
             await bot.send_message(message.chat.id, 
-                                   f"*Text message added*. Total files collected: **{len(upload['messages'])}**.", 
+                                   f"*Text message added*. Total files collected: **{len(upload['messages'])}**.\n\n"
+                                   f"Use `/d` to finalize.", 
                                    parse_mode=types.ParseMode.MARKDOWN)
             return
 
@@ -1096,7 +1108,7 @@ async def cmd_stats(message: types.Message):
 
 @dp.message_handler(state=AdminFSM.waiting_for_broadcast_text, content_types=types.ContentTypes.ANY)
 async def handle_broadcast_text(message: types.Message, state: FSMContext):
-    """Performs the broadcast operation."""
+    """Performs the resilient broadcast operation."""
     await state.finish() 
     
     owner_id = message.from_user.id
@@ -1115,7 +1127,7 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
     success_count = 0
     fail_count = 0
     
-    status_msg = await bot.send_message(message.chat.id, f"🚀 Starting broadcast to **{len(user_ids)}** users...", parse_mode=types.ParseMode.MARKDOWN)
+    status_msg = await bot.send_message(message.chat.id, f"🚀 Starting resilient broadcast to **{len(user_ids)}** users...", parse_mode=types.ParseMode.MARKDOWN)
 
     for user_id in user_ids:
         try:
@@ -1129,28 +1141,27 @@ async def handle_broadcast_text(message: types.Message, state: FSMContext):
             success_count += 1
         except ChatNotFound: 
             # User has likely deleted the chat or is no longer reachable by the bot
-            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat not found (Expected for blocked users).")
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat not found. Skipping.")
             fail_count += 1
         except BotBlocked:
-            logger.warning(f"BROADCAST FAILURE: User {user_id} - Bot blocked by user.")
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Bot blocked by user. Skipping.")
             fail_count += 1
         except UserDeactivated:
-            logger.warning(f"BROADCAST FAILURE: User {user_id} - User account deactivated.")
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - User account deactivated. Skipping.")
             fail_count += 1
         except MigrateToChat as e:
-            # If a user's chat migrated, you might update their ID here if you stored it.
-            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat migrated. New ID: {e.migrate_to_chat_id}")
+            logger.warning(f"BROADCAST FAILURE: User {user_id} - Chat migrated. New ID: {e.migrate_to_chat_id}. Skipping.")
             fail_count += 1
         except Exception as e:
              # Catch all other unexpected errors but continue the loop
             logger.error(f"BROADCAST FAILURE: User {user_id}. Error: {type(e).__name__}. Ignoring this user.", exc_info=True)
             fail_count += 1
-        await asyncio.sleep(0.1) # Aggressive throttle for mass mailing
+        await asyncio.sleep(0.1) # Aggressive throttle (10 messages/sec) for mass mailing resilience
 
     report = (
         f"📣 **Broadcast Complete**\n"
         f"✅ Sent successfully to `{success_count}` users.\n"
-        f"❌ Failed to send to `{fail_count}` users."
+        f"❌ Failed (blocked/inactive) to send to `{fail_count}` users."
     )
     await bot.edit_message_text(report, status_msg.chat.id, status_msg.message_id, parse_mode=types.ParseMode.MARKDOWN)
 
