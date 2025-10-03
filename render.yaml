@@ -1,32 +1,15 @@
 services:
   - type: web
-    name: telegram-file-bot
+    name: telegram-upload-bot
     env: python
     plan: free
-    branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
       - key: OWNER_ID
-        sync: false
-      - key: DATABASE_URL
-        fromDatabase:
-          name: bot-db
-          property: connectionString
-      - key: RENDER_URL
-        fromService:
-          type: web
-          name: telegram-file-bot
-          property: url
       - key: UPLOAD_CHANNEL
-        value: "@your_upload_channel"
-      - key: RENDER
-        value: true
-
-databases:
-  - name: bot-db
-    plan: free
-    databaseName: botdb
-    user: botuser
+      - key: DATABASE_URL
+      - key: WEBHOOK_URL
+      - key: WEBAPP_HOST
+      - key: WEBAPP_PORT
