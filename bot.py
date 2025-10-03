@@ -578,7 +578,6 @@ async def on_shutdown(dispatcher: Dispatcher):
 # =========================
 # Entrypoint: start webhook server (Render-friendly)
 # =========================
-if __name__ == "__main__":
     # start_webhook runs aiohttp under the hood and binds to the given host/port
     # webhook_path must match the path Telegram will POST updates to (we set WEBHOOK_URL to .../webhook)
     # Provide web_app to expose /health if needed — aiogram's start_webhook has support for setting a custom web app
@@ -597,13 +596,15 @@ if __name__ == "__main__":
     webhook_path = "/webhook"
 
     logger.info("Starting bot webhook server on %s:%s (webhook path: %s)", WEBAPP_HOST, WEBAPP_PORT, webhook_path)
+
+if __name__ == "__main__":
     start_webhook(
         dispatcher=dp,
-        webhook_path=webhook_path,
-        skip_updates=True,
+        webhook_path="/webhook",
         on_startup=on_startup,
         on_shutdown=on_shutdown,
+        skip_updates=True,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
-        web_app=web_app
+    )
     )
