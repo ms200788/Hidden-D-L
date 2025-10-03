@@ -481,25 +481,28 @@ async def fallback(message: types.Message):
     return
 
 
-# --- Webhook / Startup / Shutdown ---
+# =========================
+# Webhook startup/shutdown integration
+# =========================
+from aiohttp import web
 
-async def on_startup(dp: Dispatcher):
-    logger.info("Starting up...")
+async def on_startup(dispatcher: Dispatcher):
+    # Initialize DB
     await init_db()
+
     # Set webhook
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception as exc:
-        logger.exception("Error setting webhook: %s", exc)
-    # Start deletion job
+        logger.exception("Failed to set webhook: %s", exc)
+
+    # Start APScheduler deletion job
     scheduler.add_job(deletion_worker, "interval", seconds=15, id="deletion_worker", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler started.")
+    logger.info("APScheduler started (deletion worker every 15s).")
 
-
-async def on_shutdown(dp: Dispatcher):
-    logger.info("Shutting down...")
+async def on_shutdown(dispatcher: Dispatcher):
     try:
         await bot.delete_webhook()
     except Exception:
@@ -515,26 +518,37 @@ async def on_shutdown(dp: Dispatcher):
     scheduler.shutdown(wait=False)
     logger.info("Shutdown complete.")
 
+# Health check endpoint
+async def health_check(request):
+    return web.Response(text="OK")
 
 if __name__ == "__main__":
-    # Setup a small health-check route via aiohttp
-    from aiohttp import web
+    # Create aiohttp app
+    app = web.Application()
+    app.router.add_get("/health", health_check)
 
-    async def health_handler(request):
-        return web.Response(text="OK")
+    # Attach Telegram webhook to this app
+    from aiogram.utils.executor import set_webhook
 
-    web_app = web.Application()
-    web_app.router.add_get("/health", health_handler)
+    async def on_startup_combined(app):
+        await on_startup(dp)
 
-    webhook_path = "/webhook"
-    logger.info("Starting webhook server on %s:%s path %s", WEBAPP_HOST, WEBAPP_PORT, webhook_path)
-    start_webhook(
-        dispatcher=dp,
-        webhook_path=webhook_path,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True,
+    async def on_shutdown_combined(app):
+        await on_shutdown(dp)
+
+    # Attach aiogram dispatcher to aiohttp app
+    from aiogram.utils.executor import Executor
+    executor = Executor(dp)
+    executor.on_startup(on_startup_combined)
+    executor.on_shutdown(on_shutdown_combined)
+
+    # Run aiohttp app + aiogram webhook on same port
+    web.run_app(
+        app,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
-        web_app=web_app,
+        print=None,
+        access_log=None,
+        shutdown_timeout=60.0,
+        handle_signals=True,
     )
