@@ -2,14 +2,24 @@ services:
   - type: web
     name: telegram-upload-bot
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python telegram_upload_bot.py"
+    healthCheckPath: /health
     envVars:
-      - key: BOT_TOKEN
-      - key: OWNER_ID
-      - key: UPLOAD_CHANNEL
       - key: DATABASE_URL
+        fromDatabase:
+          name: neon-db-instance-name # ❗️ IMPORTANT: Change this to your Neon DB name in Render
+          property: connectionString
+      - key: BOT_TOKEN
+        sync: false # Set this secret in the Render dashboard
+      - key: OWNER_ID
+        sync: false # Set this secret in the Render dashboard
+      - key: UPLOAD_CHANNEL
+        sync: false # Set this secret in the Render dashboard
       - key: WEBHOOK_URL
-      - key: WEBAPP_HOST
-      - key: WEBAPP_PORT
+        fromService:
+          type: web
+          name: telegram-upload-bot # This should match the 'name' of this service
+          property: url
+      - key: PYTHON_VERSION
+        value: 3.11.5
