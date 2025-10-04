@@ -1,5 +1,3 @@
-# telegram_upload_bot.py
-
 import os
 import asyncio
 import logging
@@ -11,8 +9,9 @@ from typing import Optional, List, Dict, Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import start_webhook
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ParseMode
+from aiogram.dispatcher.webhook import SimpleRequestHandler
+from aiohttp import web
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -24,11 +23,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except Exception:
+except ImportError:
     pass
 
 # --- Logging ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("telegram_upload_bot")
 
 # --- Environment Variables ---
@@ -36,18 +35,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 UPLOAD_CHANNEL = int(os.getenv("UPLOAD_CHANNEL", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# This is the base URL of your Render web service, e.g., "https://your-app-name.onrender.com"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
-WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8000"))
+WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "10000")) # Render uses port 10000 by default
 
 # Validate required envs
 _required = [BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL, DATABASE_URL, WEBHOOK_URL]
 if not all(_required):
     logger.error("One or more required ENV vars missing: BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL, DATABASE_URL, WEBHOOK_URL")
-    # Optionally, exit early
-    # raise RuntimeError("Missing environment variables")
+    raise RuntimeError("Missing environment variables")
 
-# Ensure DATABASE_URL uses asyncpg
+# Ensure DATABASE_URL uses asyncpg for NeonDB
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
     logger.info("Adjusted DATABASE_URL to use asyncpg driver.")
@@ -73,12 +72,16 @@ def format_message_template(text: Optional[str], user: types.User) -> str:
     def repl(m: re.Match):
         label = m.group(1).strip()
         url = m.group(2).strip()
+        # Basic escaping for MarkdownV2
+        label = re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", label)
+        url = re.sub(r"([)])", r"\\\1", url)
         return f"[{label}]({url})"
     result = LINK_PATTERN.sub(repl, result)
     return result
 
 
 # --- Bot & Dispatcher ---
+# Note: Using MarkdownV2, so special characters in user-generated text MUST be escaped.
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN_V2)
 dp = Dispatcher(bot)
 
@@ -88,7 +91,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
     user_id = Column(BigInteger, primary_key=True, index=True)
-    last_active = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    last_active = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class Setting(Base):
@@ -125,8 +128,6 @@ class Delivery(Base):
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="SET NULL"))
 
 # Setup engine & sessionmaker
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL must be set")
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -134,7 +135,7 @@ AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSes
 upload_sessions: Dict[int, Dict[str, Any]] = {}
 
 # Scheduler for deletion
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 # --- DB helper functions ---
@@ -148,9 +149,10 @@ async def add_or_update_user(user_id: int):
     async with AsyncSessionLocal() as session:
         user = await session.get(User, user_id)
         if user:
-            user.last_active = datetime.now(timezone.utc)
+            # last_active is updated automatically by onupdate=func.now()
+            pass
         else:
-            session.add(User(user_id=user_id, last_active=datetime.now(timezone.utc)))
+            session.add(User(user_id=user_id))
         await session.commit()
 
 
@@ -223,13 +225,14 @@ async def count_table_rows(model) -> int:
         return int(result.scalar_one())
 
 
+# FIXED: This query is now efficient and runs directly on the database.
 async def count_active_users(days: int = 2) -> int:
+    """Counts users active in the last N days directly in the database."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User))
-        rows = result.scalars().all()
-    cnt = sum(1 for r in rows if r.last_active and r.last_active.replace(tzinfo=timezone.utc) >= cutoff)
-    return cnt
+        stmt = select(func.count(User.user_id)).where(User.last_active >= cutoff)
+        result = await session.execute(stmt)
+        return int(result.scalar_one())
 
 
 # --- Deletion Worker ---
@@ -237,18 +240,19 @@ async def deletion_worker():
     try:
         now_dt = datetime.now(timezone.utc)
         due = await get_due_deliveries(now_dt)
-        if due:
-            logger.info("Found %d messages to delete.", len(due))
+        if not due:
+            return
+            
+        logger.info("Found %d messages to delete.", len(due))
         for d in due:
             try:
                 await bot.delete_message(chat_id=int(d.chat_id), message_id=int(d.message_id))
                 logger.debug(f"Deleted message {d.message_id} in chat {d.chat_id}")
             except Exception as exc:
                 logger.warning("Error deleting message %s in chat %s: %s", d.message_id, d.chat_id, exc)
-            try:
+            finally:
+                # Always try to delete the DB record to prevent re-attempts
                 await delete_delivery_record(d.id)
-            except Exception as exc:
-                logger.warning("Error deleting delivery record %s: %s", d.id, exc)
     except Exception as exc:
         logger.exception("Exception in deletion_worker: %s", exc)
 
@@ -259,25 +263,33 @@ async def deliver_files_to_user(user_chat_id: int, user_obj: types.User, session
     for f in files:
         try:
             # Try copy_message first
-            try:
-                copied = await bot.copy_message(chat_id=user_chat_id, from_chat_id=UPLOAD_CHANNEL, message_id=f.file_message_id)
-                delivered_msg_id = copied.message_id
-            except Exception as exc:
-                logger.debug("copy_message failed, fallback to forward: %s", exc)
-                forwarded = await bot.forward_message(chat_id=user_chat_id, from_chat_id=UPLOAD_CHANNEL, message_id=f.file_message_id)
-                delivered_msg_id = forwarded.message_id
+            delivered_msg = await bot.copy_message(
+                chat_id=user_chat_id,
+                from_chat_id=UPLOAD_CHANNEL,
+                message_id=f.file_message_id,
+                protect_content=session_row.protect_content
+            )
 
             if session_row.auto_delete_minutes and session_row.auto_delete_minutes > 0:
                 delete_at = datetime.now(timezone.utc) + timedelta(minutes=int(session_row.auto_delete_minutes))
-                await schedule_delivery_for_deletion(user_id=user_obj.id, chat_id=user_chat_id, message_id=delivered_msg_id, delete_at=delete_at, session_id=session_row.id)
-
+                await schedule_delivery_for_deletion(
+                    user_id=user_obj.id,
+                    chat_id=user_chat_id,
+                    message_id=delivered_msg.message_id,
+                    delete_at=delete_at,
+                    session_id=session_row.id
+                )
             delivered += 1
         except Exception as exc:
             logger.exception("Failed to deliver file %s to user %s: %s", f.file_message_id, user_chat_id, exc)
 
     if session_row.auto_delete_minutes and delivered > 0:
         try:
-            await bot.send_message(chat_id=user_chat_id, text=f"⚠ These files will be auto-deleted in {session_row.auto_delete_minutes} minute(s).")
+            # Note: Must escape the message for MarkdownV2
+            await bot.send_message(
+                chat_id=user_chat_id,
+                text=f"⚠️ These files will be auto-deleted in *{session_row.auto_delete_minutes} minute(s)*\\."
+            )
         except Exception as exc:
             logger.debug("Failed to send auto-delete notice: %s", exc)
 
@@ -285,11 +297,6 @@ async def deliver_files_to_user(user_chat_id: int, user_obj: types.User, session
 
 
 # --- Handlers ---
-
-@dp.message_handler(commands=["health"])
-async def cmd_health(message: types.Message):
-    await message.reply("OK")
-
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
@@ -299,19 +306,26 @@ async def cmd_start(message: types.Message):
         deep_link = args
         session_row = await find_session_by_deeplink(deep_link)
         if not session_row:
-            await message.reply("❌ Invalid or expired link.")
+            await message.reply("❌ Invalid or expired link\\.")
             return
         files = await get_files_for_session(session_row.id)
         if not files:
-            await message.reply("⚠ No files available for this session.")
+            await message.reply("⚠️ No files available for this session\\.")
             return
-        delivered = await deliver_files_to_user(user_chat_id=message.chat.id, user_obj=message.from_user, session_row=session_row, files=files)
+        
+        await message.reply(f"⬇️ Preparing your files \\({len(files)}\\)\\.\\.\\.")
+        delivered = await deliver_files_to_user(
+            user_chat_id=message.chat.id,
+            user_obj=message.from_user,
+            session_row=session_row,
+            files=files
+        )
         if delivered == 0:
-            await message.reply("⚠ Failed to deliver files.")
+            await message.reply("⚠️ Failed to deliver files due to an internal error\\.")
         return
 
     # No args: welcome
-    welcome_text = await get_setting("welcome_text") or "👋 Welcome, {first_name}!"
+    welcome_text = await get_setting("welcome_text") or "👋 Welcome, {first_name}\\!"
     formatted = format_message_template(welcome_text, message.from_user)
     welcome_image = await get_setting("welcome_image")
     try:
@@ -320,235 +334,252 @@ async def cmd_start(message: types.Message):
         else:
             await bot.send_message(chat_id=message.chat.id, text=formatted)
     except Exception as exc:
-        logger.warning("Failed to send welcome: %s", exc)
+        logger.warning("Failed to send welcome message: %s", exc)
         try:
-            await message.reply("👋 Welcome!")
-        except:
+            await message.reply("👋 Welcome\\!")
+        except Exception:
             pass
 
 
-@dp.message_handler(commands=["setstart"])
+@dp.message_handler(commands=["setstart"], user_id=OWNER_ID)
 async def cmd_setstart(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
     if not message.reply_to_message:
-        await message.reply("Reply to a message (text or image) with /setstart to set welcome message (and optional image).")
+        await message.reply("Reply to a message with `/setstart` to set the welcome message\\.\nIt can be text or an image with a caption\\.")
         return
+    
     reply = message.reply_to_message
-    text = reply.caption or reply.text or "👋 Welcome, {first_name}!"
-    img_file_id = None
-    if reply.photo:
-        img_file_id = reply.photo[-1].file_id
+    text = reply.caption or reply.text or "👋 Welcome, {first_name}\\!"
+    img_file_id = reply.photo[-1].file_id if reply.photo else None
+    
     await save_setting("welcome_text", text)
-    if img_file_id:
-        await save_setting("welcome_image", img_file_id)
-    await message.reply("✅ Welcome message and image (if provided) saved.")
+    await save_setting("welcome_image", img_file_id or "")
+    await message.reply("✅ Welcome message and image (if provided) have been saved\\.")
 
 
-@dp.message_handler(commands=["upload"])
+@dp.message_handler(commands=["upload"], user_id=OWNER_ID)
 async def cmd_upload(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    upload_sessions[OWNER_ID] = {"files": [], "protect": False, "timer": 0}
+    upload_sessions[OWNER_ID] = {"files": [], "protect": False, "timer": 0, "step": "protect"}
     await message.reply(
-        "📤 Upload session started.\n"
-        "Reply with `on` or `off` to set protect_content.\n"
-        "Then reply with number of minutes for auto-delete (0 = off).\n"
-        "Then send files (photos, documents, videos etc.).\n"
-        "When done, send /d to finish, or /e to cancel."
+        "📤 *New Upload Session Started*\n\n"
+        "*Step 1: Content Protection*\n"
+        "Should users be prevented from forwarding/saving these files? Send `yes` or `no`\\.",
     )
 
 
-@dp.message_handler(lambda message: message.from_user.id == OWNER_ID and OWNER_ID in upload_sessions and message.text is not None)
+@dp.message_handler(lambda msg: msg.from_user.id == OWNER_ID and OWNER_ID in upload_sessions, content_types=types.ContentTypes.TEXT)
 async def owner_text_responses(message: types.Message):
     sess = upload_sessions.get(OWNER_ID)
-    if sess is None:
-        return
+    if not sess: return
+
+    step = sess.get("step")
     txt = message.text.strip().lower()
-    if txt in ("on", "off", "yes", "no"):
-        sess["protect"] = txt in ("on", "yes")
-        await message.reply(f"Protect content set to {sess['protect']}. Now send auto-delete minutes (0 = off).")
-        return
-    if txt.isdigit():
+
+    if step == "protect":
+        if txt in ("yes", "on"):
+            sess["protect"] = True
+            await message.reply("✅ Protection: *ON*\\.")
+        elif txt in ("no", "off"):
+            sess["protect"] = False
+            await message.reply("✅ Protection: *OFF*\\.")
+        else:
+            await message.reply("Invalid input\\. Please send `yes` or `no`\\.")
+            return
+        
+        sess["step"] = "timer"
+        await message.answer(
+            "*Step 2: Auto\\-Delete Timer*\n"
+            "After how many minutes should the files be deleted from the user's chat? Send a number \\(e\\.g\\., `60` for 1 hour\\)\\. Send `0` to disable\\."
+        )
+
+    elif step == "timer":
+        if not txt.isdigit():
+            await message.reply("Invalid input\\. Please send a number of minutes \\(e\\.g\\., `15`\\), or `0` to disable\\.")
+            return
+        
         minutes = int(txt)
         sess["timer"] = minutes
-        await message.reply(f"Auto-delete timer set to {minutes}. Now send files, then /d to finish or /e to cancel.")
-        return
-    # not part of upload flow; ignore
+        if minutes > 0:
+            await message.reply(f"✅ Auto\\-Delete: *{minutes} minute(s)*\\.")
+        else:
+            await message.reply("✅ Auto\\-Delete: *Disabled*\\.")
+
+        sess["step"] = "files"
+        await message.answer(
+            "*Step 3: Send Files*\n"
+            "Now, send all the files you want to include in this bundle\\. When you are finished, send /d to generate the link\\.\n\nTo cancel, send /e\\."
+        )
 
 
-@dp.message_handler(lambda message: message.from_user.id == OWNER_ID, content_types=types.ContentTypes.ANY)
+@dp.message_handler(lambda msg: msg.from_user.id == OWNER_ID and OWNER_ID in upload_sessions, content_types=types.ContentTypes.ANY)
 async def owner_file_handler(message: types.Message):
-    if OWNER_ID not in upload_sessions:
+    sess = upload_sessions.get(OWNER_ID)
+    if not sess or sess.get("step") != "files":
         return
+
     # Only accept media / document types
     if not (message.document or message.photo or message.video or message.audio or message.voice or message.sticker):
         return
-    sess = upload_sessions[OWNER_ID]
-    try:
-        # copy or forward to upload channel
-        try:
-            sent = await bot.copy_message(chat_id=UPLOAD_CHANNEL, from_chat_id=message.chat.id, message_id=message.message_id)
-            sent_id = sent.message_id
-        except Exception as exc:
-            logger.warning("copy_message failed: %s. Falling back to forward.", exc)
-            forwarded = await bot.forward_message(chat_id=UPLOAD_CHANNEL, from_chat_id=message.chat.id, message_id=message.message_id)
-            sent_id = forwarded.message_id
 
-        sess["files"].append({"file_message_id": sent_id, "caption": message.caption or ""})
-        await message.reply("📌 File added. Continue or send /d to finish, /e to cancel.")
+    try:
+        sent = await bot.copy_message(chat_id=UPLOAD_CHANNEL, from_chat_id=message.chat.id, message_id=message.message_id)
+        sess["files"].append({"file_message_id": sent.message_id, "caption": message.caption or ""})
+        await message.reply(f"📌 File added \\({len(sess['files'])}\\)\\. Send more files, or /d to finish\\.")
     except Exception as exc:
         logger.exception("Failed to forward to upload channel: %s", exc)
-        await message.reply("⚠ Error while forwarding to upload channel.")
+        await message.reply("⚠️ Error: Could not save file to upload channel\\. Please try again\\.")
 
 
-@dp.message_handler(commands=["d"])
+@dp.message_handler(commands=["d"], user_id=OWNER_ID)
 async def cmd_finish_upload(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
     if OWNER_ID not in upload_sessions:
-        await message.reply("No active upload session.")
+        await message.reply("No active upload session\\. Use /upload to start one\\.")
         return
+    
     sess = upload_sessions.pop(OWNER_ID)
     files = sess.get("files", [])
     if not files:
-        await message.reply("No files added. Session cancelled.")
+        await message.reply("No files were added\\. Session cancelled\\.")
         return
+        
     deep_link = gen_deep_link()
     session_id = await create_session_record(OWNER_ID, deep_link, sess.get("protect", False), sess.get("timer", 0))
     for f in files:
         await add_file_record(session_id, f["file_message_id"], f.get("caption", ""))
-    await message.reply(f"✅ Upload complete.\n🔗 Deep link (share with users):\n`/start {deep_link}`")
+        
+    bot_info = await bot.get_me()
+    share_link = f"https://t.me/{bot_info.username}?start={deep_link}"
+    
+    await message.reply(
+        f"✅ *Upload Complete*\n\n"
+        f"Total Files: *{len(files)}*\n"
+        f"Protection: *{'ON' if sess.get('protect') else 'OFF'}*\n"
+        f"Auto\\-Delete: *{sess.get('timer', 0)} minutes*\n\n"
+        f"Share this link with your users:\n"
+        f"`{share_link}`"
+    )
 
 
-@dp.message_handler(commands=["e"])
+@dp.message_handler(commands=["e"], user_id=OWNER_ID)
 async def cmd_cancel_upload(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
     if OWNER_ID in upload_sessions:
         upload_sessions.pop(OWNER_ID, None)
-    await message.reply("❌ Upload cancelled.")
+    await message.reply("❌ Upload session cancelled\\.")
 
 
-@dp.message_handler(commands=["broadcast"])
+@dp.message_handler(commands=["broadcast"], user_id=OWNER_ID)
 async def cmd_broadcast(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
     args = message.get_args().strip()
     if not args:
-        await message.reply("Usage: /broadcast <message>. Use {Label|url} syntax for links.")
+        await message.reply("Usage: `/broadcast <message>`\\. Use `{Label|url}` for links\\.")
         return
-    text = LINK_PATTERN.sub(lambda m: f"[{m.group(1)}]({m.group(2)})", args)
+    
+    text_to_send = format_message_template(args, message.from_user)
+
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User.user_id))
         user_ids = result.scalars().all()
+    
     if not user_ids:
-        await message.reply("No users to broadcast.")
+        await message.reply("No users to broadcast to.")
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Open", callback_data="broadcast_open")]]
-    )
-    sent = 0
+
+    sent, failed = 0, 0
+    await message.reply(f"📢 Starting broadcast to {len(user_ids)} users...")
+
     for uid in user_ids:
         try:
-            await bot.send_message(chat_id=uid, text=text, reply_markup=kb)
+            await bot.send_message(chat_id=uid, text=text_to_send)
             sent += 1
-        except Exception:
-            pass
-    await message.reply(f"✅ Broadcast done: {sent}/{len(user_ids)} sent.")
+        except Exception as e:
+            logger.warning("Broadcast failed for user %d: %s", uid, e)
+            failed += 1
+        await asyncio.sleep(0.1) # Avoid hitting rate limits
+
+    await message.reply(f"✅ Broadcast done\\.\n*Sent*: {sent}\n*Failed*: {failed}")
 
 
-@dp.message_handler(commands=["stats"])
+@dp.message_handler(commands=["stats"], user_id=OWNER_ID)
 async def cmd_stats(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
     total_users = await count_table_rows(User)
     active_users = await count_active_users(2)
     total_files = await count_table_rows(FileModel)
     total_sessions = await count_table_rows(SessionModel)
+    
     await message.reply(
-        f"📊 Stats:\n"
-        f"👥 Total Users: {total_users}\n"
-        f"🟢 Active (2d): {active_users}\n"
-        f"📂 Files: {total_files}\n"
-        f"📦 Sessions: {total_sessions}"
+        f"📊 *Bot Stats*\n\n"
+        f"👥 *Total Users*: {total_users}\n"
+        f"🟢 *Active Users* \\(48h\\): {active_users}\n"
+        f"📂 *Total Files Shared*: {total_files}\n"
+        f"📦 *Total Sessions Created*: {total_sessions}"
     )
 
 
-@dp.message_handler()
-async def fallback(message: types.Message):
-    # Ignore unknown commands/messages
-    return
+# --- Webhook and Server Setup ---
 
-
-# =========================
-# Webhook startup/shutdown integration
-# =========================
-from aiohttp import web
-
+# This function will be called when the application starts up
 async def on_startup(dispatcher: Dispatcher):
-    # Initialize DB
+    # 1. Initialize DB
     await init_db()
 
-    # Set webhook
+    # 2. Set webhook
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    full_webhook_url = WEBHOOK_URL.rstrip('/') + webhook_path
     try:
-        await bot.set_webhook(WEBHOOK_URL)
-        logger.info("Webhook set to %s", WEBHOOK_URL)
+        await bot.set_webhook(full_webhook_url)
+        logger.info(f"Webhook set to {full_webhook_url}")
     except Exception as exc:
         logger.exception("Failed to set webhook: %s", exc)
 
-    # Start APScheduler deletion job
-    scheduler.add_job(deletion_worker, "interval", seconds=15, id="deletion_worker", replace_existing=True)
+    # 3. Start APScheduler deletion job
+    scheduler.add_job(deletion_worker, "interval", seconds=30, id="deletion_worker", replace_existing=True)
     scheduler.start()
-    logger.info("APScheduler started (deletion worker every 15s).")
+    logger.info("APScheduler started (deletion worker every 30s).")
 
+# This function will be called when the application shuts down
 async def on_shutdown(dispatcher: Dispatcher):
-    try:
-        await bot.delete_webhook()
-    except Exception:
-        pass
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-    try:
-        await engine.dispose()
-    except Exception:
-        pass
+    logger.info("Shutting down...")
     scheduler.shutdown(wait=False)
+    await bot.delete_webhook()
+    await dp.storage.close()
+    await dp.storage.wait_closed()
+    await (await bot.get_session()).close()
+    await engine.dispose()
     logger.info("Shutdown complete.")
 
-# Health check endpoint
-async def health_check(request):
+# Health check endpoint for Render/Uptime pinger
+async def health_check(request: web.Request):
     return web.Response(text="OK")
 
 if __name__ == "__main__":
-    # Create aiohttp app
+    # The path for the webhook must be secret and known only to you and Telegram.
+    # Using the bot token in the path is a simple way to achieve this.
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+
+    # Create the main aiohttp application
     app = web.Application()
+
+    # Create a handler for incoming Telegram updates.
+    # This connects aiogram's Dispatcher to the aiohttp web server.
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    
+    # Register the webhook handler on the secret path
+    app.router.add_post(webhook_path, webhook_handler)
+
+    # Register the health check endpoint for Render's health checks
     app.router.add_get("/health", health_check)
+    
+    # Register the startup and shutdown callbacks
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
-    # Attach Telegram webhook to this app
-    from aiogram.utils.executor import set_webhook
-
-    async def on_startup_combined(app):
-        await on_startup(dp)
-
-    async def on_shutdown_combined(app):
-        await on_shutdown(dp)
-
-    # Attach aiogram dispatcher to aiohttp app
-    from aiogram.utils.executor import Executor
-    executor = Executor(dp)
-    executor.on_startup(on_startup_combined)
-    executor.on_shutdown(on_shutdown_combined)
-
-    # Run aiohttp app + aiogram webhook on same port
+    # Start the web server
+    logger.info(f"Starting web server on {WEBAPP_HOST}:{WEBAPP_PORT}")
     web.run_app(
         app,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
-        print=None,
-        access_log=None,
-        shutdown_timeout=60.0,
-        handle_signals=True,
+        access_log=logger,
     )
