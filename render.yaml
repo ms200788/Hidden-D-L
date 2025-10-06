@@ -1,18 +1,21 @@
 services:
   - type: web
-    name: telegram-upload-bot
+    name: telegram-owner-upload-bot
     env: python
-    plan: starter
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
-      - key: DATABASE_URL
-        sync: false
+        fromDatabase: false
       - key: OWNER_ID
-        sync: false
+        fromDatabase: false
       - key: UPLOAD_CHANNEL_ID
-        sync: false
+        fromDatabase: false
+      - key: DATABASE_URL
+        fromDatabase: false
       - key: WEBHOOK_URL
-        sync: false
+        fromDatabase: false
+      - key: PORT
+        value: "8080"
