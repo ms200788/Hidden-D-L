@@ -1,551 +1,523 @@
-#!/usr/bin/env python3
 # bot.py
-"""
-Render-deployable Telegram bot (single-file)
-- Uses python-telegram-bot (async) and asyncpg (Neon/Postgres)
-- Webhook mode (auto-registers webhook at WEBHOOK_URL + /webhook)
-- Owner-only multi-file upload sessions (copies to UPLOAD_CHANNEL_ID)
-- Deep links: very long random tokens
-- Auto-delete delivered messages (deletions persisted in DB so they survive restarts)
-- Protect_content for non-owner deliveries (owner bypass)
-- /setstart supports replying to a message (text/photo) to set welcome
-- /broadcast supports inline buttons using {Label | https://...} syntax inside message text
-- /stats shows totals
-- All configuration via environment variables:
-    BOT_TOKEN, DATABASE_URL, OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_URL, PORT (optional)
-"""
-
 import os
 import asyncio
 import logging
 import secrets
-import re
+import string
 from datetime import datetime, timedelta, timezone
+
 from typing import Optional, List
 
-import asyncpg
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, Text
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiohttp import web
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
 
-# ---------------- CONFIG ----------------
+from sqlalchemy import (
+    Column,
+    Integer,
+    BigInteger,
+    String,
+    DateTime,
+    Boolean,
+    ForeignKey,
+    select,
+    func,
+    Text as SQLText,
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ---------- Environment (no hard-coded sensitive data) ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
-PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8000")))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # e.g. 6169237879
+UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))  # e.g. -1002985126019
+DATABASE_URL = os.getenv("DATABASE_URL")  # async PG string, e.g. postgresql+asyncpg://...
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # if set, webhook will be used
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8080"))
 
-# entropy for deep links (bytes -> token_urlsafe length ~ 1.3*bytes)
-DEEP_LINK_BYTES = int(os.getenv("DEEP_LINK_BYTES", "72"))  # ~96+ chars token
+if not BOT_TOKEN or OWNER_ID == 0 or UPLOAD_CHANNEL_ID == 0 or not DATABASE_URL:
+    log.error("Missing required environment variables. BOT_TOKEN, OWNER_ID, UPLOAD_CHANNEL_ID, DATABASE_URL required.")
+    raise SystemExit("Please set required environment variables.")
 
-if not BOT_TOKEN or not DATABASE_URL:
-    raise RuntimeError("BOT_TOKEN and DATABASE_URL env vars are required")
+# ---------- Database setup ----------
+Base = declarative_base()
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("upload-bot")
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True)  # telegram user id
+    first_name = Column(String, nullable=True)
+    username = Column(String, nullable=True)
+    last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# ---------------- DB POOL ----------------
-db_pool: Optional[asyncpg.pool.Pool] = None
+class Session(Base):
+    __tablename__ = "sessions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished = Column(Boolean, default=False)
 
-async def init_db_pool():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=6)
-    # create tables
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                last_seen TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                id SERIAL PRIMARY KEY,
-                owner_id BIGINT NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                ended BOOLEAN DEFAULT FALSE,
-                deep_link_token TEXT,
-                auto_delete_minutes INT,
-                protect_content BOOLEAN DEFAULT TRUE,
-                note TEXT
-            );
-            CREATE TABLE IF NOT EXISTS files (
-                id SERIAL PRIMARY KEY,
-                session_id INT REFERENCES sessions(id) ON DELETE CASCADE,
-                upload_chat_id BIGINT NOT NULL,
-                upload_msg_id BIGINT NOT NULL,
-                original_caption TEXT,
-                original_file_type TEXT,
-                original_file_id TEXT,
-                created_at TIMESTAMP NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS start_config (
-                id INT PRIMARY KEY DEFAULT 1,
-                welcome_text TEXT,
-                welcome_image_file_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS deletions (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                message_id BIGINT NOT NULL,
-                delete_at TIMESTAMP NOT NULL,
-                created_at TIMESTAMP NOT NULL
-            );
-            """
-        )
-        # ensure a default start_config row
-        cnt = await conn.fetchval("SELECT COUNT(*) FROM start_config;")
-        if cnt == 0:
-            await conn.execute("INSERT INTO start_config(id, welcome_text, welcome_image_file_id) VALUES (1, NULL, NULL);")
+class FileItem(Base):
+    __tablename__ = "files"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=True)
+    upload_channel_message_id = Column(BigInteger, nullable=False)
+    upload_channel_id = Column(BigInteger, nullable=False)
+    origin_caption = Column(SQLText, nullable=True)
+    origin_file_type = Column(String, nullable=True)
+    deep_link = Column(String(256), unique=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    autodelete_minutes = Column(Integer, nullable=True)
+    # relation
+    session = relationship("Session", backref="files")
 
-# ---------------- UTIL ----------------
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+class PendingDelete(Base):
+    __tablename__ = "pending_deletes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False)
+    chat_id = Column(BigInteger, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
+    expire_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-def make_deep_link_token() -> str:
-    return secrets.token_urlsafe(DEEP_LINK_BYTES)
+class Welcome(Base):
+    __tablename__ = "welcome"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_file_id = Column(String, nullable=True)
+    text = Column(SQLText, nullable=True)
 
-async def add_or_update_user(user):
-    if not user:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO users(user_id, username, first_name, last_name, last_seen)
-            VALUES($1,$2,$3,$4,$5)
-            ON CONFLICT (user_id) DO UPDATE SET
-              username = EXCLUDED.username,
-              first_name = EXCLUDED.first_name,
-              last_name = EXCLUDED.last_name,
-              last_seen = EXCLUDED.last_seen;
-            """,
-            user.id,
-            getattr(user, "username", None),
-            getattr(user, "first_name", None),
-            getattr(user, "last_name", None),
-            datetime.utcnow(),
-        )
+# Create engine & session factory
+engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-# ---------------- PERSISTENT DELETION WORKER ----------------
-async def schedule_deletion_record(chat_id: int, message_id: int, minutes_from_now: int):
-    """Persist a deletion job to DB (survives restarts)."""
-    delete_at = datetime.utcnow() + timedelta(minutes=minutes_from_now)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO deletions (chat_id, message_id, delete_at, created_at) VALUES ($1,$2,$3,$4);",
-            chat_id,
-            message_id,
-            delete_at,
-            datetime.utcnow(),
-        )
+# ---------- Bot & dispatcher ----------
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher()
 
-async def deletion_worker(app):
-    """Background task: runs every 15 seconds and deletes due messages."""
-    bot = app.bot
-    logger.info("Deletion worker started.")
+# ---------- Utils ----------
+ALPHABET = string.ascii_letters + string.digits + "-_"
+
+def gen_deep_link(length: int = 128) -> str:
+    return ''.join(secrets.choice(ALPHABET) for _ in range(length))
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def add_or_update_user(tg_user: types.User):
+    async with AsyncSessionLocal() as session:
+        q = await session.get(User, tg_user.id)
+        if q is None:
+            q = User(id=tg_user.id, first_name=tg_user.first_name, username=tg_user.username, last_seen=datetime.now(timezone.utc))
+            session.add(q)
+        else:
+            q.first_name = tg_user.first_name
+            q.username = tg_user.username
+            q.last_seen = datetime.now(timezone.utc)
+        await session.commit()
+
+# ---------- Background tasks ----------
+DELETE_CHECK_INTERVAL = 15  # seconds
+
+async def pending_delete_worker():
+    log.info("Pending delete worker started.")
     while True:
         try:
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= $1 ORDER BY delete_at ASC LIMIT 50;", datetime.utcnow())
-                if rows:
-                    logger.info("Found %d deletions due.", len(rows))
-                for r in rows:
-                    did = r["id"]
-                    chat_id = r["chat_id"]
-                    message_id = r["message_id"]
+            now = datetime.now(timezone.utc)
+            async with AsyncSessionLocal() as s:
+                q = await s.execute(select(PendingDelete).where(PendingDelete.expire_at <= now))
+                due = q.scalars().all()
+                for pd in due:
                     try:
-                        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                        await bot.delete_message(chat_id=pd.chat_id, message_id=pd.message_id)
+                    except TelegramBadRequest as e:
+                        log.debug(f"delete_message failed (probably already deleted): {e}")
                     except Exception as e:
-                        # log but still remove the record to avoid repeat attempts
-                        logger.debug("delete_message failed for %s:%s — %s", chat_id, message_id, e)
+                        log.exception("Error deleting message:", e)
                     # remove record
-                    await conn.execute("DELETE FROM deletions WHERE id=$1;", did)
-        except Exception as e:
-            logger.exception("Deletion worker error: %s", e)
-        await asyncio.sleep(15)
+                    await s.delete(pd)
+                await s.commit()
+        except Exception:
+            log.exception("pending_delete_worker loop error")
+        await asyncio.sleep(DELETE_CHECK_INTERVAL)
 
-# ---------------- HANDLERS ----------------
-
-# /start — normal welcome or deep link retrieval
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await add_or_update_user(user)
-    args = context.args or []
-    if args:
-        token = args[0]
-        # fetch session only if ended = true (finalized)
-        async with db_pool.acquire() as conn:
-            session = await conn.fetchrow("SELECT * FROM sessions WHERE deep_link_token=$1 AND ended=TRUE;", token)
-            if not session:
-                await update.message.reply_text("🔍 Invalid or expired link.")
-                return
-            files = await conn.fetch("SELECT * FROM files WHERE session_id=$1 ORDER BY id ASC;", session["id"])
-
-        if not files:
-            await update.message.reply_text("⚠️ No files found for this link.")
-            return
-
-        auto_delete = session["auto_delete_minutes"]
-        protect_flag = session["protect_content"]
-        owner_flag = is_owner(user.id)
-        delivered = []
-        for f in files:
+# ---------- Handlers ----------
+# start: show welcome image and text (supports {first_name})
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await add_or_update_user(message.from_user)
+    async with AsyncSessionLocal() as s:
+        q = await s.execute(select(Welcome).order_by(Welcome.id.desc()).limit(1))
+        w = q.scalars().first()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Get Deep Link", callback_data="dummy")]])
+    if w:
+        text = w.text or ""
+        text = text.replace("{first_name}", (message.from_user.first_name or ""))
+        if w.image_file_id:
             try:
-                copy = await context.bot.copy_message(
-                    chat_id=update.effective_chat.id,
-                    from_chat_id=f["upload_chat_id"],
-                    message_id=f["upload_msg_id"],
-                    caption=f["original_caption"] or None,
-                    parse_mode=ParseMode.HTML,
-                    protect_content=(False if owner_flag else (False if protect_flag is False else True)),
-                )
-                delivered.append(copy.message_id)
-                # persist deletion if session had auto_delete_minutes set and >0
-                if auto_delete and int(auto_delete) > 0 and not owner_flag:
-                    await schedule_deletion_record(update.effective_chat.id, copy.message_id, int(auto_delete))
-            except Exception as e:
-                logger.exception("Failed to deliver file: %s", e)
-        if auto_delete and int(auto_delete) > 0:
-            await update.message.reply_text(f"⏳ Files will be deleted in {auto_delete} minutes.")
-        return
-
-    # Normal welcome
-    async with db_pool.acquire() as conn:
-        cfg = await conn.fetchrow("SELECT welcome_text, welcome_image_file_id FROM start_config WHERE id=1;")
-    welcome_text = cfg["welcome_text"]
-    welcome_image = cfg["welcome_image_file_id"]
-    name = getattr(user, "first_name", "") or ""
-    if welcome_image and welcome_text:
-        text = welcome_text.replace("{first_name}", name)
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=welcome_image, caption=text, parse_mode=ParseMode.HTML)
-    elif welcome_image:
-        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=welcome_image)
-    elif welcome_text:
-        text = welcome_text.replace("{first_name}", name)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                await bot.send_photo(chat_id=message.chat.id, photo=w.image_file_id, caption=text, reply_markup=None)
+            except Exception:
+                # fallback to text
+                await message.answer(text or "Welcome!")
+        else:
+            await message.answer(text or "Welcome!")
     else:
-        await update.message.reply_text("Welcome — use deep links to fetch files.")
+        await message.answer("Welcome! Use /start to see this message.")
 
-# /setstart — owner replies to a message (text or photo)
-async def setstart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
+# setstart owner-only
+@dp.message(Command("setstart"))
+async def cmd_setstart(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("Only owner can set start message.")
+    # Owner replies to a message or sends new text or photo to set welcome
+    if message.reply_to_message:
+        r = message.reply_to_message
+        img_id = None
+        if r.photo:
+            img_id = r.photo[-1].file_id
+        text = r.text or r.caption or ""
+        async with AsyncSessionLocal() as s:
+            w = Welcome(image_file_id=img_id, text=text)
+            s.add(w)
+            await s.commit()
+        await message.reply("Start/welcome message set.")
+    else:
+        # set text-only: /setstart Your text here...
+        args = message.text.partition(" ")[2]
+        if not args:
+            return await message.reply("Reply to a message (photo/text) or send `/setstart <text>`.")
+        async with AsyncSessionLocal() as s:
+            w = Welcome(image_file_id=None, text=args)
+            s.add(w)
+            await s.commit()
+        await message.reply("Start/welcome text set.")
+
+# start upload session (owner-only)
+@dp.message(Command("startupload"))
+async def cmd_startupload(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("Only owner can start upload session.")
+    async with AsyncSessionLocal() as s:
+        sess = Session(owner_id=OWNER_ID)
+        s.add(sess)
+        await s.commit()
+        await s.refresh(sess)
+        await message.reply(f"Upload session started. Session id: {sess.id}\nSend files (documents/photos/audio/video). When done, send /d. To terminate and cancel use /e.")
+
+# /d -> done session (mark finished)
+@dp.message(Command("d"))
+async def cmd_done(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    # find last unfinished session
+    async with AsyncSessionLocal() as s:
+        q = await s.execute(select(Session).where(Session.owner_id == OWNER_ID, Session.finished == False).order_by(Session.started_at.desc()).limit(1))
+        sess = q.scalars().first()
+        if not sess:
+            return await message.reply("No active session found.")
+        sess.finished = True
+        await s.commit()
+        await message.reply(f"Session {sess.id} marked finished. Files in session: {len(sess.files)}")
+
+# /e -> terminate current session (delete it and files metadata?) We'll just mark finished and inform owner.
+@dp.message(Command("e"))
+async def cmd_terminate(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    async with AsyncSessionLocal() as s:
+        q = await s.execute(select(Session).where(Session.owner_id == OWNER_ID, Session.finished == False).order_by(Session.started_at.desc()).limit(1))
+        sess = q.scalars().first()
+        if not sess:
+            return await message.reply("No active session found.")
+        # mark finished (you may also implement deletion of metadata if desired)
+        sess.finished = True
+        await s.commit()
+        await message.reply(f"Session {sess.id} terminated.")
+
+# owner can set autodelete default for upcoming uploads via /setautodel <minutes>
+@dp.message(Command("setautodel"))
+async def cmd_setautodel(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("Owner only.")
+    args = message.text.partition(" ")[2]
+    if not args or not args.strip().isdigit():
+        return await message.reply("Usage: /setautodel <minutes> (integer minutes). Use 0 to disable")
+    minutes = int(args.strip())
+    # Store in a simple in-memory place per owner for next uploads (since not asked to persist)
+    # But we want persistence; simple approach: set an env var? Instead store in DB as a small table or in Session metadata.
+    # For simplicity we'll set a short-lived flag in memory for now:
+    global OWNER_NEXT_AUTODEL
+    OWNER_NEXT_AUTODEL = minutes if minutes > 0 else None
+    await message.reply(f"Auto-delete for next uploads will be: {minutes} minute(s).")
+
+OWNER_NEXT_AUTODEL: Optional[int] = None
+
+# Handler for messages that contain files (owner only allowed to upload)
+@dp.message((Text(startswith="/") == False))
+async def all_messages_handler(message: Message):
+    # Save/update user record
+    await add_or_update_user(message.from_user)
+
+    # Only owner may upload files (except /start etc.)
+    if message.from_user.id != OWNER_ID:
+        # Allow users only to use /start and deep links; any other attempt -> reply
+        txt = message.text or ""
+        # If message looks like a deep link: match 128-char token
+        candidate = txt.strip().split()[-1] if txt.strip() else ""
+        if len(candidate) >= 64:  # user may paste deep link or anything; owners deep links typically 128
+            # try to resolve deep link
+            async with AsyncSessionLocal() as s:
+                q = await s.execute(select(FileItem).where(FileItem.deep_link == candidate))
+                fileobj = q.scalars().first()
+                if fileobj:
+                    await deliver_file_to_user(fileobj, message.from_user.id)
+                    return
+        # Otherwise show allowed commands
+        return await message.reply("You can use /start or send a deep link to fetch a file.")
+
+    # Owner messages: treat as upload if contains media
+    if not (message.document or message.photo or message.video or message.audio or message.voice or message.sticker):
+        # owner sent some text - allow commands to be processed above; ignore others
         return
 
-    if update.message.reply_to_message:
-        rm = update.message.reply_to_message
-        new_text = None
-        new_image = None
-        if rm.photo:
-            new_image = rm.photo[-1].file_id
-        if rm.text or rm.caption:
-            new_text = (rm.caption or rm.text)
-        async with db_pool.acquire() as conn:
-            cur = await conn.fetchrow("SELECT welcome_text, welcome_image_file_id FROM start_config WHERE id=1;")
-            prev_text = cur["welcome_text"]
-            prev_img = cur["welcome_image_file_id"]
-            final_text = new_text if new_text is not None else prev_text
-            final_img = new_image if new_image is not None else prev_img
-            await conn.execute("UPDATE start_config SET welcome_text=$1, welcome_image_file_id=$2 WHERE id=1;", final_text, final_img)
-        await update.message.reply_text("✅ Welcome config updated.")
+    # Find active session
+    async with AsyncSessionLocal() as s:
+        q = await s.execute(select(Session).where(Session.owner_id==OWNER_ID, Session.finished==False).order_by(Session.started_at.desc()).limit(1))
+        sess = q.scalars().first()
+        if not sess:
+            # auto-create session
+            sess = Session(owner_id=OWNER_ID)
+            s.add(sess)
+            await s.commit()
+            await s.refresh(sess)
+
+    # Forward/copy file to upload channel (use copy_message to preserve file)
+    try:
+        origin_caption = message.caption or message.text or ""
+        # copy message to upload channel
+        copied = await bot.copy_message(
+            chat_id=UPLOAD_CHANNEL_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            caption=origin_caption,
+        )
+        upload_msg_id = copied.message_id
+        # determine file type
+        ftype = "document"
+        if message.photo:
+            ftype = "photo"
+        elif message.video:
+            ftype = "video"
+        elif message.audio:
+            ftype = "audio"
+        elif message.voice:
+            ftype = "voice"
+        elif message.sticker:
+            ftype = "sticker"
+
+        # create deep link
+        dl = gen_deep_link(128)
+        # save file metadata
+        async with AsyncSessionLocal() as s:
+            fin = FileItem(
+                session_id=sess.id,
+                upload_channel_message_id=upload_msg_id,
+                upload_channel_id=UPLOAD_CHANNEL_ID,
+                origin_caption=origin_caption,
+                origin_file_type=ftype,
+                deep_link=dl,
+                autodelete_minutes=OWNER_NEXT_AUTODEL,
+            )
+            s.add(fin)
+            await s.commit()
+            await s.refresh(fin)
+
+        # reply to owner with deep link
+        await message.reply(f"File uploaded ✅\nDeep link (shareable):\n`{dl}`\n\nNote: anyone with this link can fetch the file via the bot.\nAuto-delete (minutes): {OWNER_NEXT_AUTODEL or 0}")
+
+        # reset OWNER_NEXT_AUTODEL after use
+        OWNER_NEXT_AUTODEL = None
+    except TelegramRetryAfter as e:
+        await message.reply(f"Rate limited by Telegram. Retry after {e.timeout} seconds.")
+    except Exception as e:
+        log.exception("Error copying/uploading file")
+        await message.reply(f"Upload failed: {e}")
+
+# deliver file to user by copying from upload channel to user's chat_id
+async def deliver_file_to_user(fileobj: FileItem, user_id: int):
+    # send copy from upload channel message to user, with caption preserved.
+    protect = True
+    if user_id == OWNER_ID:
+        protect = False  # owner bypass protect_content
+    try:
+        copied = await bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=fileobj.upload_channel_id,
+            message_id=fileobj.upload_channel_message_id,
+            caption=fileobj.origin_caption,
+            protect_content=protect,
+        )
+    except TelegramBadRequest as e:
+        log.exception("Failed to copy message to user")
+        try:
+            await bot.send_message(user_id, "Sorry, failed to deliver file.")
+        except Exception:
+            pass
         return
 
-    # set via args as text
-    if context.args:
-        text = " ".join(context.args)
-        async with db_pool.acquire() as conn:
-            cur = await conn.fetchrow("SELECT welcome_image_file_id FROM start_config WHERE id=1;")
-            prev_img = cur["welcome_image_file_id"]
-            await conn.execute("UPDATE start_config SET welcome_text=$1, welcome_image_file_id=$2 WHERE id=1;", text, prev_img)
-        await update.message.reply_text("✅ Welcome text set.")
-        return
+    # If an autodelete was set for this file, add to pending_deletes for this user's message
+    if fileobj.autodelete_minutes and fileobj.autodelete_minutes > 0:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=fileobj.autodelete_minutes)
+        async with AsyncSessionLocal() as s:
+            pd = PendingDelete(user_id=user_id, chat_id=user_id, message_id=copied.message_id, expire_at=expire)
+            s.add(pd)
+            await s.commit()
+        # notify user about scheduled deletion
+        try:
+            await bot.send_message(user_id, f"This file will be deleted in {fileobj.autodelete_minutes} minute(s).")
+        except Exception:
+            pass
 
-    await update.message.reply_text("Usage: reply to a message with /setstart or use /setstart <text>")
+# callback for inline dummy (placeholder)
+@dp.callback_query(Text(startswith="dummy"))
+async def cb_dummy(callback: types.CallbackQuery):
+    await callback.answer("This is a demo button.", show_alert=False)
 
-# /upload — owner starts session
-async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
+# /deep <token> fallback for users who want command-based fetch
+@dp.message(Command("deep"))
+async def cmd_deep(message: Message):
+    args = message.text.partition(" ")[2]
+    if not args:
+        return await message.reply("Usage: /deep <deep_link_token>")
+    token = args.strip()
+    async with AsyncSessionLocal() as s:
+        q = await s.execute(select(FileItem).where(FileItem.deep_link == token))
+        fileobj = q.scalars().first()
+    if not fileobj:
+        return await message.reply("Deep link not found.")
+    await deliver_file_to_user(fileobj, message.from_user.id)
+
+# /stats (owner only)
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != OWNER_ID:
         return
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("INSERT INTO sessions(owner_id, created_at, ended) VALUES ($1,$2,FALSE) RETURNING *;", OWNER_ID, datetime.utcnow())
-    context.user_data["current_session_id"] = row["id"]
-    await update.message.reply_text(
-        "📦 Upload session started.\nSend files now (documents, photos, videos, audio, voice, stickers).\nWhen finished send /d to finalize and generate deep link. Send /e to cancel.\nOptional: /settimer <minutes> and /protect on|off for this session."
+    two_days = datetime.now(timezone.utc) - timedelta(days=2)
+    async with AsyncSessionLocal() as s:
+        total_users = await s.scalar(select(func.count(User.id)))
+        active_users = await s.scalar(select(func.count(User.id)).where(User.last_seen >= two_days))
+        total_files = await s.scalar(select(func.count(FileItem.id)))
+        total_sessions = await s.scalar(select(func.count(Session.id)))
+    await message.reply(
+        f"Stats:\n• Total users: {total_users}\n• Active users (2 days): {active_users}\n• Total files: {total_files}\n• Total sessions: {total_sessions}"
     )
 
-# /settimer <minutes> - set auto-delete for current session
-async def settimer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
+# /broadcast - owner only with inline buttons support
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id != OWNER_ID:
         return
-    if "current_session_id" not in context.user_data:
-        await update.message.reply_text("No active upload session. Use /upload.")
-        return
-    try:
-        minutes = int(context.args[0])
-        if minutes < 0:
-            raise ValueError()
-    except Exception:
-        await update.message.reply_text("Usage: /settimer <minutes>  — integer minutes (0 allowed).")
-        return
-    sid = context.user_data["current_session_id"]
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE sessions SET auto_delete_minutes=$1 WHERE id=$2;", minutes, sid)
-    await update.message.reply_text(f"Auto-delete set to {minutes} minutes for this session.")
-
-# /protect on|off - set protect_content for copies delivered to users (default on)
-async def protect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
-        return
-    if "current_session_id" not in context.user_data:
-        await update.message.reply_text("No active upload session. Use /upload.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /protect on  OR  /protect off")
-        return
-    val = context.args[0].lower()
-    if val not in ("on", "off"):
-        await update.message.reply_text("Usage: /protect on  OR  /protect off")
-        return
-    flag = True if val == "on" else False
-    sid = context.user_data["current_session_id"]
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE sessions SET protect_content=$1 WHERE id=$2;", flag, sid)
-    await update.message.reply_text(f"Protect content set to {'ON' if flag else 'OFF'} for this session.")
-
-# Owner files handler — accept any non-command message from owner during session
-async def owner_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        return
-    if "current_session_id" not in context.user_data:
-        await update.message.reply_text("No active session. Start with /upload")
-        return
-    session_id = context.user_data["current_session_id"]
-    msg = update.message
-    caption = msg.caption or None
-    try:
-        # copy message to upload channel (bot must be admin)
-        copied = await context.bot.copy_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=msg.chat.id, message_id=msg.message_id, caption=caption or None, parse_mode=ParseMode.HTML)
-        # determine type and original file id best-effort
-        file_type = "unknown"
-        original_file_id = None
-        if msg.document:
-            file_type = "document"
-            original_file_id = msg.document.file_id
-        elif msg.photo:
-            file_type = "photo"
-            original_file_id = msg.photo[-1].file_id
-        elif msg.video:
-            file_type = "video"
-            original_file_id = msg.video.file_id
-        elif msg.audio:
-            file_type = "audio"
-            original_file_id = msg.audio.file_id
-        elif msg.voice:
-            file_type = "voice"
-            original_file_id = msg.voice.file_id
-        elif msg.sticker:
-            file_type = "sticker"
-            original_file_id = msg.sticker.file_id
-
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO files(session_id, upload_chat_id, upload_msg_id, original_caption, original_file_type, original_file_id, created_at)
-                VALUES($1,$2,$3,$4,$5,$6,$7);
-                """,
-                session_id,
-                copied.chat.id,
-                copied.message_id,
-                caption,
-                file_type,
-                original_file_id,
-                datetime.utcnow(),
-            )
-        await update.message.reply_text("✅ File added to session.")
-    except Exception as e:
-        logger.exception("Failed to copy file to upload channel: %s", e)
-        await update.message.reply_text("❌ Failed to copy file to upload channel. Ensure bot is admin in upload channel and has post/manage rights.")
-
-# /d finalize: generate deep link, mark session ended
-async def done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
-        return
-    if "current_session_id" not in context.user_data:
-        await update.message.reply_text("No active session.")
-        return
-    session_id = context.user_data["current_session_id"]
-    async with db_pool.acquire() as conn:
-        files_count = await conn.fetchval("SELECT COUNT(*) FROM files WHERE session_id=$1;", session_id)
-    if files_count == 0:
-        await update.message.reply_text("No files uploaded in this session. Upload files or use /e to cancel.")
-        return
-    token = make_deep_link_token()
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE sessions SET deep_link_token=$1, ended=TRUE WHERE id=$2;", token, session_id)
-    context.user_data.pop("current_session_id", None)
-    bot_user = await context.bot.get_me()
-    deep_link = f"https://t.me/{bot_user.username}?start={token}"
-    await update.message.reply_text(f"✅ Session finalized. Deep link:\n\n{deep_link}\n\nAnyone with this link can fetch the files.")
-
-# /e end session without creating link
-async def end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
-        return
-    if "current_session_id" not in context.user_data:
-        await update.message.reply_text("No active session.")
-        return
-    sid = context.user_data["current_session_id"]
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE sessions SET ended=TRUE WHERE id=$1;", sid)
-    context.user_data.pop("current_session_id", None)
-    await update.message.reply_text("Upload session terminated (no deep link created).")
-
-# /broadcast — owner replies to a message to broadcast. supports {Label | url}
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Reply to a message (text/photo/doc) with /broadcast to send it to all users.")
-        return
-    msg_to_send = update.message.reply_to_message
-    text_source = (msg_to_send.text or msg_to_send.caption or "") + ""
+    # Owner should reply to a message (text/photo) containing the broadcast payload.
+    if not message.reply_to_message:
+        return await message.reply("Reply to a message you want to broadcast (text or media).")
+    payload = message.reply_to_message
+    # parse optional inline buttons from owner message text line after /broadcast e.g.
+    # /broadcast [Button1|https://...] [Button2|https://...]
+    # A simple parser:
+    parts = message.text.partition(" ")[2].strip()
     buttons = []
-    for match in re.finditer(r"\{([^{}|]+)\s*\|\s*(https?://[^\s{}]+)\}", text_source):
-        label = match.group(1).strip()
-        url = match.group(2).strip()
-        buttons.append((label, url))
-    markup = None
-    if buttons:
-        kb = [[InlineKeyboardButton(label, url=url)] for (label, url) in buttons]
-        markup = InlineKeyboardMarkup(kb)
+    if parts:
+        for token in parts.split():
+            if "|" in token:
+                t, url = token.split("|", 1)
+                buttons.append([InlineKeyboardButton(t, url=url)])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
-    # fetch recipients
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM users;")
-    users = [r["user_id"] for r in rows]
+    # fetch all users
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(select(User.id))
+        users = [r[0] for r in rows.all()]
+
     sent = 0
-    failed = 0
-    await update.message.reply_text(f"📣 Broadcasting to {len(users)} users (starting).")
     for uid in users:
         try:
-            if msg_to_send.photo or msg_to_send.document or msg_to_send.video or msg_to_send.audio:
-                await msg_to_send.copy(chat_id=uid, caption=msg_to_send.caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+            if payload.photo:
+                await bot.send_photo(chat_id=uid, photo=payload.photo[-1].file_id, caption=payload.caption or "", reply_markup=kb)
+            elif payload.text:
+                await bot.send_message(chat_id=uid, text=payload.text, reply_markup=kb)
+            elif payload.document:
+                await bot.send_document(chat_id=uid, document=payload.document.file_id, caption=payload.caption or "", reply_markup=kb)
             else:
-                await context.bot.send_message(chat_id=uid, text=msg_to_send.text or msg_to_send.caption or " ", parse_mode=ParseMode.HTML, reply_markup=markup)
+                # fallback forward
+                await bot.forward_message(chat_id=uid, from_chat_id=payload.chat.id, message_id=payload.message_id)
             sent += 1
         except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    await update.message.reply_text(f"Broadcast complete. Sent: {sent}, Failed: {failed}")
+            continue
 
-# /stats owner-only
-async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Not allowed.")
-        return
-    async with db_pool.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users;")
-        two_days_ago = datetime.utcnow() - timedelta(days=2)
-        active_2days = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_seen >= $1;", two_days_ago)
-        total_files = await conn.fetchval("SELECT COUNT(*) FROM files;")
-        total_sessions = await conn.fetchval("SELECT COUNT(*) FROM sessions;")
-    await update.message.reply_text(
-        f"📊 Stats:\nTotal users: {total_users}\nActive (2 days): {active_2days}\nTotal files: {total_files}\nTotal sessions: {total_sessions}"
-    )
+    await message.reply(f"Broadcast sent to {sent}/{len(users)} users.")
 
-# /deep <token> alternative
-async def deep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /deep <token>")
-        return
-    # reuse start_handler by placing args
-    await start_handler(update, context)
-
-# fallback unknown command
-async def unknown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Unknown command or not allowed.")
-
-# ---------------- WEBHOOK / APP SETUP ----------------
+# simple health endpoint and start logic
 async def on_startup(app):
-    # initialize DB
-    await init_db_pool()
-    # start deletion worker
-    app.create_task(deletion_worker(app))
-    # set webhook if WEBHOOK_URL provided
+    await init_db()
+    # start background worker
+    app["delete_worker"] = asyncio.create_task(pending_delete_worker())
+    # if webhook configured, set webhook
     if WEBHOOK_URL:
-        # ensure webhook path ends with /webhook
-        webhook_path = "/webhook"
-        url = WEBHOOK_URL
-        if url.endswith("/"):
-            url = url.rstrip("/")
-        hook_url = url + webhook_path
-        try:
-            await app.bot.set_webhook(hook_url)
-            logger.info("Webhook set to %s", hook_url)
-        except Exception as e:
-            logger.exception("Failed to set webhook: %s", e)
-    else:
-        logger.warning("WEBHOOK_URL not provided — the bot will fail to receive updates via webhook.")
+        await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
-def build_app():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def on_shutdown(app):
+    # cancel delete worker
+    worker = app.get("delete_worker")
+    if worker:
+        worker.cancel()
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
+    await bot.session.close()
 
-    # Commands
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("setstart", setstart_handler))
-    app.add_handler(CommandHandler("upload", upload_handler))
-    app.add_handler(CommandHandler("settimer", settimer_handler))
-    app.add_handler(CommandHandler("protect", protect_handler))
-    app.add_handler(CommandHandler("d", done_handler))
-    app.add_handler(CommandHandler("e", end_handler))
-    app.add_handler(CommandHandler("broadcast", broadcast_handler))
-    app.add_handler(CommandHandler("stats", stats_handler))
-    app.add_handler(CommandHandler("deep", deep_cmd))
+# A quick endpoint to accept webhook requests (if using webhook)
+async def handle_webhook(request: web.Request):
+    body = await request.read()
+    update = types.Update.to_object(types.BaseObject.parse_raw(body))
+    await dp.feed_update(update)  # feed update into dispatcher
+    return web.Response(text="ok")
 
-    # Owner file receiver: any non-command message from owner will be treated as upload content when session active
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.User(user_id=OWNER_ID), owner_file_handler))
+# Health
+async def health(request: web.Request):
+    return web.Response(text="ok")
 
-    # Unknown commands
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_handler))
-
-    app.post_init = on_startup
+# Build aiohttp app for webhook mode; if polling mode, run polling instead.
+def create_app():
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    app.router.add_get("/health", health)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_shutdown)
     return app
 
-# ---------------- MAIN (run webhook server) ----------------
-async def main():
-    app = build_app()
-
-    # run_webhook - Application.run_webhook will start aiohttp server internally
-    listen = "0.0.0.0"
-    webhook_path = "/webhook"
-    port = PORT
-    logger.info("Starting webhook server on %s:%s%s", listen, port, webhook_path)
-    # run_webhook is blocking and will return when shutdown
-    await app.run_webhook(listen=listen, port=port, webhook_path=webhook_path)
-
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down.")
+    # choose webhook if WEBHOOK_URL set, else polling
+    if WEBHOOK_URL:
+        app = create_app()
+        web.run_app(app, host=HOST, port=PORT)
+    else:
+        # Polling mode (useful if webhook not configured)
+        async def _polling_main():
+            await init_db()
+            # start delete worker
+            worker = asyncio.create_task(pending_delete_worker())
+            try:
+                # Start long polling
+                await dp.start_polling(bot)
+            finally:
+                worker.cancel()
+        asyncio.run(_polling_main())
