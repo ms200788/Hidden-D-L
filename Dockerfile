@@ -1,28 +1,15 @@
-# Dockerfile for Render deploy (aiogram 2.x, web service mode)
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Upgrade pip first to avoid dependency resolver issues
-RUN pip install --no-cache-dir --upgrade pip
+RUN apt-get update && apt-get install -y build-essential libpq-dev --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all source files
-COPY . /app
+COPY . .
 
-# Create data dir for sqlite & backups
-RUN mkdir -p /app/data
+ENV PORT=10000
 
-# Environment defaults (overridden by Render dashboard)
-ENV DB_PATH=/app/data/database.sqlite3
-ENV JOB_DB_PATH=/app/data/jobs.sqlite
-ENV PORT=8080
-
-# Expose the port for Render (Render injects $PORT)
-EXPOSE 8080
-
-# Start bot (with aiohttp web server inside bot.py)
 CMD ["python", "bot.py"]
