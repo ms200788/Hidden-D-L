@@ -18,4 +18,4 @@ services:
       - key: WEBHOOK_URL
         fromDatabase: false
       - key: PORT
-        value: "8080"
+        value: "10000"
