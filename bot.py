@@ -1,14 +1,15 @@
 # bot.py
 """
-Final deployable Telegram Upload + Deep-link Bot (aiogram 2.25.0)
-- Owner-only upload sessions, 1..95 files per session -> 1 deep link per session
+Telegram Upload + Deep-link Bot (aiogram 2.25.0)
+- Owner-only upload sessions (1..95 files) -> 1 deep link per session
 - /d flow: owner replies 'on'/'off' then supplies autodelete minutes -> deep link returned
-- /e aborts session
+- /e aborts active session
 - Files copied to UPLOAD_CHANNEL_ID; DB stores metadata only
-- /start (public) and /start <token> deep-link delivery
-- /setstart, /broadcast, /stats, /restart, /help (owner-only)
+- Sessions post a header message in upload channel; finalized header shows deep link + file count
+- /revoke <token|link> marks session inactive (revoked) — does NOT delete channel files
+- /start (public) and /start <token> serves deep link files (unless revoked)
+- /setstart, /broadcast, /stats, /restart, /help, /health
 - Auto-delete scheduling persisted in DB and resumed after restarts
-- /health endpoint for UptimeRobot
 """
 
 import os
@@ -36,7 +37,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL")  # must be postgresql+asyncpg://...
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql+asyncpg://...
 UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))  # -100...
 PING_SECRET = os.getenv("PING_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
@@ -66,8 +67,10 @@ class SessionModel(Base):
     __tablename__ = "sessions"
     id = Column(Integer, primary_key=True)
     owner_id = Column(BigInteger, nullable=False)
-    token = Column(String(255), unique=True, nullable=True)
+    token = Column(String(255), unique=True, nullable=True)  # set when finalized
+    header_message_id = Column(BigInteger, nullable=True)  # message id of session header in upload channel
     active = Column(Boolean, default=True)
+    revoked = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -109,13 +112,14 @@ AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=F
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("DB initialized.")
+    logger.info("DB initialized / tables ensured.")
+
 
 # ---------------- Bot setup ----------------
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# runtime state for /d interactive flow
+# runtime state (owner flows)
 active_sessions_cache: Dict[int, int] = {}
 awaiting_protect_choice: Dict[int, int] = {}
 awaiting_autodel_choice: Dict[int, int] = {}
@@ -133,7 +137,7 @@ def parse_braces_links(text: str) -> str:
             if j == -1:
                 out += html.escape(text[i:])
                 break
-            inside = text[i+1:j]
+            inside = text[i + 1:j]
             if "|" in inside:
                 word, url = inside.split("|", 1)
                 out += f'<a href="{html.escape(url.strip(), quote=True)}">{html.escape(word.strip())}</a>'
@@ -180,13 +184,22 @@ def json_to_keyboard(j: Optional[List[List[Dict[str, Any]]]]) -> Optional[Inline
         kb.row(*buttons)
     return kb
 
-# ---------------- DB helper funcs ----------------
+# ---------------- DB helpers ----------------
 async def create_session(owner_id: int) -> int:
     async with AsyncSessionLocal() as s:
         new = SessionModel(owner_id=owner_id, active=True)
         s.add(new)
         await s.commit()
         await s.refresh(new)
+        # post header message into upload channel and store header_message_id
+        try:
+            header_text = f"📦 New session #{new.id} started by owner.\nUpload files in this session (1..95)."
+            sent = await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=header_text)
+            new.header_message_id = sent.message_id
+            s.add(new)
+            await s.commit()
+        except Exception as e:
+            logger.exception("Failed to post session header in upload channel: %s", e)
         active_sessions_cache[owner_id] = new.id
         return new.id
 
@@ -196,13 +209,13 @@ async def get_active_session(owner_id: int) -> Optional[int]:
     if sid:
         async with AsyncSessionLocal() as s:
             row = await s.get(SessionModel, sid)
-            if row and row.active:
+            if row and row.active and not row.revoked:
                 return sid
             else:
                 active_sessions_cache.pop(owner_id, None)
                 return None
     async with AsyncSessionLocal() as s:
-        q = select(SessionModel).where(SessionModel.owner_id == owner_id, SessionModel.active == True).order_by(SessionModel.created_at.desc())
+        q = select(SessionModel).where(SessionModel.owner_id == owner_id, SessionModel.active == True, SessionModel.revoked == False).order_by(SessionModel.created_at.desc())
         res = await s.execute(q)
         row = res.scalar_one_or_none()
         if row:
@@ -228,10 +241,19 @@ async def add_file_entry(session_id: int, upload_channel_id: int, upload_message
         return fe.id
 
 
+def make_short_token() -> str:
+    # produce token between 18 and 24 characters (using token_urlsafe with 16 bytes ~ 22 chars)
+    t = secrets.token_urlsafe(16)
+    # guard length
+    if len(t) < 18:
+        t = secrets.token_urlsafe(17)
+    if len(t) > 24:
+        t = t[:24]
+    return t
+
+
 async def finalize_session(owner_id: int, session_id: int, protect: bool, autodel_minutes: int) -> str:
-    token = secrets.token_urlsafe(64)
-    while len(token) < 44:
-        token = secrets.token_urlsafe(64)
+    token = make_short_token()
     async with AsyncSessionLocal() as s:
         row = await s.get(SessionModel, session_id)
         if not row:
@@ -246,7 +268,24 @@ async def finalize_session(owner_id: int, session_id: int, protect: bool, autode
             f.protected = protect
             f.auto_delete_minutes = autodel_minutes
             s.add(f)
+        # update header message in upload channel to show deep link and file count
+        file_count = len(files)
+        try:
+            bot_info = await bot.get_me()
+            deep_link = f"https://t.me/{bot_info.username}?start={token}"
+            header_text = f"📦 Session #{row.id}\nDeep link: {deep_link}\nFiles: {file_count}"
+            if row.header_message_id:
+                try:
+                    await bot.edit_message_text(chat_id=UPLOAD_CHANNEL_ID, message_id=row.header_message_id, text=header_text)
+                except Exception:
+                    # if edit fails, just send a new message
+                    await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=header_text)
+            else:
+                await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=header_text)
+        except Exception as e:
+            logger.exception("Failed to post deep link/header in upload channel: %s", e)
         await s.commit()
+    # cleanup runtime
     active_sessions_cache.pop(owner_id, None)
     awaiting_protect_choice.pop(owner_id, None)
     awaiting_autodel_choice.pop(owner_id, None)
@@ -290,6 +329,7 @@ async def upsert_user(tg_user: types.User):
             s.add(u)
         await s.commit()
 
+
 # ---------------- Deletion worker ----------------
 async def deletion_worker():
     logger.info("Starting deletion worker (poll every 30s)")
@@ -315,6 +355,7 @@ async def deletion_worker():
             logger.exception("Deletion worker error: %s", e)
         await asyncio.sleep(30)
 
+
 # ---------------- HTTP health ----------------
 async def handle_health(request):
     if PING_SECRET:
@@ -333,9 +374,10 @@ async def start_webapp(host="0.0.0.0", port=PORT):
     await site.start()
     logger.info("Health endpoint started on port %s", port)
 
+
 # ---------------- Handlers ----------------
 
-# /start (public) — if args present treat as deep link token
+# /start (public). If args present treat as deep link token
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     await upsert_user(message.from_user)
@@ -349,6 +391,9 @@ async def cmd_start(message: types.Message):
             sess = res.scalar_one_or_none()
             if not sess:
                 await message.reply("Invalid or expired link.")
+                return
+            if sess.revoked or not sess.active:
+                await message.reply("This link has been revoked or is inactive.")
                 return
             q2 = select(FileEntry).where(FileEntry.session_id == sess.id)
             res2 = await s.execute(q2)
@@ -385,7 +430,7 @@ async def cmd_start(message: types.Message):
                 await message.reply(f"These files will be deleted in {max_autodel} minutes.")
             return
 
-    # no args -> show saved start message (if any)
+    # no args -> show saved start
     cfg = await get_config("start_pointer")
     if cfg:
         try:
@@ -408,7 +453,8 @@ async def cmd_start(message: types.Message):
             return
     await message.reply("Welcome! No start message configured.")
 
-# /help (owner only)
+
+# /help owner-only
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -418,16 +464,19 @@ async def cmd_help(message: types.Message):
         "/upload - start upload session (owner only)\n"
         "/d - finalize session (owner only) -> then reply 'on'/'off' for protect, then enter minutes\n"
         "/e - abort session\n"
-        "/setstart - reply to message to set /start content\n"
-        "/broadcast - reply to message to broadcast to all users\n"
-        "/stats - show totals\n"
-        "/restart - restart bot\n"
-        "/health - health endpoint\n"
-        "Formatting: {first_name} and {word|url} supported."
+        "/setstart - reply to a message (text or media) to set /start content\n"
+        "/broadcast - reply to a message to broadcast to all users\n"
+        "/stats - show totals (owner only)\n"
+        "/revoke <token|link> - revoke a deep link (owner only)\n"
+        "/restart - restart bot (owner only)\n"
+        "/health - health endpoint (for uptime ping)\n\n"
+        "Formatting: use {first_name} in start template; use {word|url} to create clickable links.\n"
+        "Only owner can use upload/broadcast/setstart/revoke/etc. Users can only use /start and deep links."
     )
     await message.reply(help_text)
 
-# /upload (owner only)
+
+# /upload (owner-only)
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -440,7 +489,8 @@ async def cmd_upload(message: types.Message):
     sid = await create_session(OWNER_ID)
     await message.reply(f"Upload session started (id={sid}). Send 1..95 files. When done send /d. To abort send /e.")
 
-# owner media collector (only media content types — will NOT intercept text commands)
+
+# owner media collector (explicit content_types so text commands won't be swallowed)
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID, content_types=[
     "photo", "document", "video", "animation", "sticker", "audio", "voice"
 ])
@@ -448,13 +498,12 @@ async def owner_file_collector(message: types.Message):
     sid = await get_active_session(OWNER_ID)
     if not sid:
         return
-    # check limit
     async with AsyncSessionLocal() as s:
         q = select(FileEntry).where(FileEntry.session_id == sid)
         res = await s.execute(q)
         existing = res.scalars().all()
         if len(existing) >= 95:
-            await message.reply("Session reached 95 files (max). Send /d to finalize or /e to abort.")
+            await message.reply("Session reached maximum 95 files. Send /d to finalize or /e to abort.")
             return
     caption_text = message.caption or message.text or None
     buttons_json = None
@@ -474,10 +523,11 @@ async def owner_file_collector(message: types.Message):
                                    auto_delete_minutes=0)
         await message.reply(f"Saved file to upload channel (entry id={fid}).")
     except Exception as e:
-        logger.exception("Forward to upload channel failed: %s", e)
-        await message.reply("Failed to save file to upload channel. Ensure bot is admin there.")
+        logger.exception("Failed to forward to upload channel: %s", e)
+        await message.reply("Failed to save file to upload channel. Make sure bot is admin there.")
 
-# /d finalize: ask protect content (owner replies 'on'/'off', then minutes)
+
+# /d -> ask protect on/off (owner). Then owner replies 'on'/'off', then minutes (handled below)
 @dp.message_handler(commands=["d"])
 async def cmd_d(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -491,22 +541,20 @@ async def cmd_d(message: types.Message):
         res = await s.execute(q)
         files = res.scalars().all()
         if not files:
-            await message.reply("Session contains no files. Upload at least one file before finalizing.")
+            await message.reply("Session contains no files. Upload at least one before finalizing.")
             return
     awaiting_protect_choice[OWNER_ID] = sid
     awaiting_context[OWNER_ID] = {"session_id": sid}
     await message.reply("Protect content? Reply 'on' or 'off'.")
 
 
-# owner finalize flow: handles only owner text replies for protect/autodel; ignores commands
+# owner finalize flow (text only, ignores commands)
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID, content_types=["text"])
 async def owner_finalize_flow(message: types.Message):
     txt_raw = (message.text or "").strip()
     if txt_raw.startswith("/"):
-        # command — let command handlers process it
-        return
-
-    # protect choice stage
+        return  # let command handlers process
+    # protect stage
     if OWNER_ID in awaiting_protect_choice and OWNER_ID not in awaiting_autodel_choice:
         txt = txt_raw.lower()
         if txt not in ("on", "off"):
@@ -516,13 +564,12 @@ async def owner_finalize_flow(message: types.Message):
         protect = (txt == "on")
         awaiting_context[OWNER_ID]["protect"] = protect
         awaiting_autodel_choice[OWNER_ID] = sid
-        await message.reply("Enter auto-delete time in minutes (0..10080). Send 0 to disable.")
+        await message.reply("Enter auto-delete time in minutes (0..10080). Send 0 to disable auto-delete.")
         return
-
     # autodel stage
     if OWNER_ID in awaiting_autodel_choice:
         if not re.fullmatch(r"\d{1,5}", txt_raw):
-            await message.reply("Please send a number between 0 and 10080.")
+            await message.reply("Please send a number between 0 and 10080 (minutes).")
             return
         minutes = int(txt_raw)
         if minutes < 0 or minutes > 10080:
@@ -544,9 +591,9 @@ async def owner_finalize_flow(message: types.Message):
         else:
             await bot.send_message(chat_id=OWNER_ID, text=f"Session finalized. Deep link:\n{full_link}")
         return
-
     # otherwise ignore
     return
+
 
 # /e abort session
 @dp.message_handler(commands=["e"])
@@ -568,9 +615,10 @@ async def cmd_e(message: types.Message):
     awaiting_protect_choice.pop(OWNER_ID, None)
     awaiting_autodel_choice.pop(OWNER_ID, None)
     awaiting_context.pop(OWNER_ID, None)
-    await message.reply("Session aborted. Uploaded copies remain in upload channel but are not accessible via deep link.")
+    await message.reply("Session aborted. Uploaded copies remain in upload channel but are not linked.")
 
-# /setstart owner-only: reply to a message to set start content
+
+# /setstart owner-only: reply to message to set start content
 @dp.message_handler(commands=["setstart"])
 async def cmd_setstart(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -584,10 +632,11 @@ async def cmd_setstart(message: types.Message):
         await set_config("start_pointer", pointer)
         template = message.reply_to_message.caption or message.reply_to_message.text or ""
         await set_config("start_template", template)
-        await message.reply("Start content saved.")
+        await message.reply("Start content saved. /start will send this content and template text with {first_name}.")
     except Exception as e:
         logger.exception("Setstart failed: %s", e)
         await message.reply("Failed to set start content. Ensure bot is admin in upload channel.")
+
 
 # /broadcast owner-only: reply to message to broadcast
 @dp.message_handler(commands=["broadcast"])
@@ -625,7 +674,8 @@ async def cmd_broadcast(message: types.Message):
             failed += 1
     await message.reply(f"Broadcast complete. Sent: {sent}, Failed: {failed}")
 
-# /stats
+
+# /stats owner-only
 @dp.message_handler(commands=["stats"])
 async def cmd_stats(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -638,6 +688,40 @@ async def cmd_stats(message: types.Message):
         total_sessions = (await s.execute(select(func.count()).select_from(SessionModel))).scalar()
     await message.reply(f"Total users: {total_users}\nActive (2 days): {active_users}\nTotal files: {total_files}\nTotal sessions: {total_sessions}")
 
+
+# /revoke <token|link> owner-only: mark session revoked/inactive
+@dp.message_handler(commands=["revoke"])
+async def cmd_revoke(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    arg = message.get_args().strip()
+    if not arg:
+        await message.reply("Usage: /revoke <token or full link>")
+        return
+    # extract token if a full link provided
+    m = re.search(r"start=([A-Za-z0-9_\-]+)", arg)
+    token = m.group(1) if m else arg
+    async with AsyncSessionLocal() as s:
+        q = select(SessionModel).where(SessionModel.token == token)
+        res = await s.execute(q)
+        sess = res.scalar_one_or_none()
+        if not sess:
+            await message.reply("Session not found for that token.")
+            return
+        sess.revoked = True
+        sess.active = False
+        s.add(sess)
+        await s.commit()
+        # edit header in upload channel to reflect revoked status
+        try:
+            if sess.header_message_id:
+                txt = f"📦 Session #{sess.id} — REVOKED by owner."
+                await bot.edit_message_text(chat_id=UPLOAD_CHANNEL_ID, message_id=sess.header_message_id, text=txt)
+        except Exception:
+            pass
+    await message.reply(f"Session #{sess.id} revoked. Deep link will no longer work.")
+
+
 # /restart owner-only
 @dp.message_handler(commands=["restart"])
 async def cmd_restart(message: types.Message):
@@ -647,29 +731,31 @@ async def cmd_restart(message: types.Message):
     await bot.close()
     os._exit(0)
 
-# fallback - update user last_active for any non-command messages
+
+# fallback - update user last_active (do not intercept commands)
 @dp.message_handler(content_types=types.ContentType.ANY)
 async def fallback(message: types.Message):
-    # do not intercept commands (text starting with '/')
     if message.text and message.text.startswith("/"):
         return
     await upsert_user(message.from_user)
-    # no reply for general users
+    return
+
 
 # ---------------- Startup / Restore ----------------
 async def restore_on_startup():
-    # DB is source-of-truth; nothing heavy to load here
-    logger.info("Restoring minimal runtime state (DB is source).")
+    logger.info("Restoring minimal runtime state (DB is source of truth).")
+    # nothing heavy to populate; active_sessions_cache repopulated lazily
 
 
 async def on_startup(dp_obj):
-    logger.info("Bot startup: init DB, start workers")
+    logger.info("Bot starting...")
     await init_db()
     await restore_on_startup()
     loop = asyncio.get_event_loop()
     loop.create_task(deletion_worker())
     loop.create_task(start_webapp())
-    logger.info("Startup complete.")
+    logger.info("Bot started.")
+
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
