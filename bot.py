@@ -1,11 +1,13 @@
 # bot.py
 """
-Final deploy-ready Telegram bot (aiogram v2.25.1)
-- Persistent PostgreSQL via SQLAlchemy + asyncpg
-- Alembic auto-run if present, safe fallback ensures
-- Upload sessions, deep links (permanent), flood-safe copying
-- Owner-only controls and user-facing /start <token>
-- Config exclusively via environment variables
+Deploy-ready Telegram Upload + Deep-link bot
+- Aiogram v2.25.1
+- PostgreSQL only (asyncpg)
+- Alembic-aware (auto-run if present), fallback safe ALTERs
+- Permanent deep links (revoked only via /revoke)
+- Upload session isolation and ordering (seq)
+- Flood-safe copying with RetryAfter handling
+- All config via environment variables
 """
 
 import os
@@ -25,30 +27,29 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 from aiogram.utils.exceptions import BadRequest, RetryAfter
-import aiogram.utils.exceptions as aiogram_ex
+import aiogram.utils.exceptions as ai_exc
 
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, Text, Boolean, DateTime, JSON, func, select, text, SmallInteger
+    Column, Integer, BigInteger, String, Text, Boolean, DateTime, JSON, func, select, text
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # ----------------------------
-# CONFIG (via environment variables)
+# Environment / config
 # ----------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")  # must be postgresql+asyncpg://...
 UPLOAD_CHANNEL_ID = int(os.getenv("UPLOAD_CHANNEL_ID", "0"))
 PING_SECRET = os.getenv("PING_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-DEEP_LINK_LENGTH = int(os.getenv("DEEP_LINK_LENGTH", "48"))  # 32..64 OK
+DEEP_LINK_LENGTH = int(os.getenv("DEEP_LINK_LENGTH", "48"))  # 32..64 recommended
 AUTO_RUN_ALEMBIC = os.getenv("AUTO_RUN_ALEMBIC", "1")
 MAX_FILES_PER_SESSION = int(os.getenv("MAX_FILES_PER_SESSION", "99"))
 ALLOWED_UPLOAD_TYPES = os.getenv("ALLOWED_UPLOAD_TYPES", "photo,document,video,animation,sticker,audio,voice")
 
-# Minimal checks
 if not TELEGRAM_TOKEN:
     raise SystemExit("Missing TELEGRAM_TOKEN env var")
 if OWNER_ID == 0:
@@ -56,16 +57,16 @@ if OWNER_ID == 0:
 if not DATABASE_URL:
     raise SystemExit("Missing DATABASE_URL env var")
 if UPLOAD_CHANNEL_ID == 0:
-    raise SystemExit("Missing UPLOAD_CHANNEL_ID env var (channel id)")
+    raise SystemExit("Missing UPLOAD_CHANNEL_ID env var")
 
 # ----------------------------
 # Logging
 # ----------------------------
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("bot")
+logger = logging.getLogger("upload_bot")
 
 # ----------------------------
-# Database models (SQLAlchemy)
+# Database models
 # ----------------------------
 Base = declarative_base()
 
@@ -82,11 +83,11 @@ class SessionModel(Base):
     __tablename__ = "sessions"
     id = Column(Integer, primary_key=True)
     owner_id = Column(BigInteger, nullable=False, index=True)
-    token = Column(String(255), unique=True, nullable=True, index=True)
+    token = Column(String(255), unique=True, nullable=True, index=True)  # permanent token
     header_message_id = Column(BigInteger, nullable=True)
     protect_content = Column(Boolean, default=True)
     auto_delete_minutes = Column(Integer, default=0)
-    active = Column(Boolean, default=True)   # keeps link usable when finalized
+    active = Column(Boolean, default=True)   # True: usable; set False on abort/revoke
     revoked = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -100,7 +101,7 @@ class FileEntry(Base):
     buttons = Column(JSON, nullable=True)
     protected = Column(Boolean, default=True)
     auto_delete_minutes = Column(Integer, default=0)
-    seq = Column(Integer, nullable=False, default=0)  # ordering
+    seq = Column(Integer, nullable=False, default=0)  # ordering by upload
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Delivery(Base):
@@ -119,73 +120,67 @@ class Config(Base):
     value = Column(Text)
 
 # ----------------------------
-# DB engine & session factory
+# Create async engine & sessionmaker
 # ----------------------------
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True, future=True)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # ----------------------------
-# Bot init
+# Aiogram init
 # ----------------------------
 bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 
 # ----------------------------
-# Ephemeral in-memory states (owner flows)
+# In-memory ephemeral state for owner interactive flows
 # ----------------------------
-active_sessions_cache: Dict[int, int] = {}           # owner_id -> session_id
+active_sessions_cache: Dict[int, int] = {}  # owner_id -> session_id
 awaiting_protect_choice: Dict[int, int] = {}
 awaiting_autodel_choice: Dict[int, int] = {}
 awaiting_context: Dict[int, dict] = {}
 
 # ----------------------------
-# Utilities
+# Utility helpers
 # ----------------------------
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 def gen_token(length: int = DEEP_LINK_LENGTH) -> str:
     n = max(24, int(length * 3 / 4))
-    token = secrets.token_urlsafe(n)
-    if len(token) < length:
-        token = secrets.token_urlsafe(n + 6)
-    return token[:length]
+    t = secrets.token_urlsafe(n)
+    if len(t) < length:
+        t = secrets.token_urlsafe(n + 6)
+    return t[:length]
 
-def escape_html_safe(text: Optional[str]) -> str:
-    if text is None:
-        return ""
-    return html.escape(text)
+def escape_html(text: Optional[str]) -> str:
+    return "" if text is None else html.escape(text)
 
 def parse_braces_links(text: Optional[str]) -> str:
     """
-    Convert {word|url} to <a href="url">word</a>, escaping other text.
-    Avoids CantParseEntities by escaping user-provided parts.
+    Convert {word|url} into safe <a href="url">word</a> with HTML escaping around other parts.
     """
     if not text:
         return ""
-    out_parts = []
+    out = []
     i = 0
     L = len(text)
     while i < L:
         if text[i] == "{":
             j = text.find("}", i)
             if j == -1:
-                out_parts.append(escape_html_safe(text[i:]))
+                out.append(escape_html(text[i:]))
                 break
             inside = text[i+1:j]
             if "|" in inside:
                 left, right = inside.split("|", 1)
-                left_e = escape_html_safe(left.strip())
-                right_e = escape_html_safe(right.strip())
-                # right must be safe url; we still escape to avoid HTML injection
-                out_parts.append(f'<a href="{right_e}">{left_e}</a>')
+                out.append(f'<a href="{escape_html(right.strip())}">{escape_html(left.strip())}</a>')
             else:
-                out_parts.append(escape_html_safe("{" + inside + "}"))
+                out.append(escape_html("{" + inside + "}"))
             i = j + 1
         else:
-            out_parts.append(escape_html_safe(text[i]))
+            out.append(escape_html(text[i]))
             i += 1
-    return "".join(out_parts)
+    return "".join(out)
 
 def keyboard_to_json(kb: Optional[InlineKeyboardMarkup]) -> Optional[List[List[Dict[str, Any]]]]:
     if not kb:
@@ -193,12 +188,8 @@ def keyboard_to_json(kb: Optional[InlineKeyboardMarkup]) -> Optional[List[List[D
     rows = []
     for r in kb.inline_keyboard:
         row = []
-        for btn in r:
-            row.append({
-                "text": btn.text,
-                "url": getattr(btn, "url", None),
-                "callback_data": getattr(btn, "callback_data", None)
-            })
+        for b in r:
+            row.append({"text": b.text, "url": getattr(b, "url", None), "callback_data": getattr(b, "callback_data", None)})
         rows.append(row)
     return rows
 
@@ -219,18 +210,18 @@ def json_to_keyboard(j: Optional[List[List[Dict[str, Any]]]]) -> Optional[Inline
     return kb
 
 # ----------------------------
-# Alembic helper + safe fallback
+# Alembic helper and fallback for first-run schema issues
 # ----------------------------
 def run_alembic_upgrade_head(cwd: Optional[str] = None) -> Tuple[bool, str]:
     try:
         cmd = ["alembic", "upgrade", "head"]
-        logger.info("Running alembic: %s", " ".join(cmd))
+        logger.info("Running Alembic: %s", " ".join(cmd))
         completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
         out = completed.stdout + "\n" + completed.stderr
         if completed.returncode == 0:
-            logger.info("Alembic succeeded.")
+            logger.info("Alembic upgrade succeeded.")
             return True, out
-        logger.warning("Alembic exit code %s", completed.returncode)
+        logger.warning("Alembic exited code %s", completed.returncode)
         return False, out
     except FileNotFoundError as e:
         logger.warning("Alembic not found: %s", e)
@@ -242,14 +233,13 @@ def run_alembic_upgrade_head(cwd: Optional[str] = None) -> Tuple[bool, str]:
 async def ensure_schema_fallback():
     async with engine.begin() as conn:
         try:
-            # add columns if missing (safe, idempotent)
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS header_message_id BIGINT"))
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT TRUE"))
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auto_delete_minutes INTEGER DEFAULT 0"))
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE"))
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE"))
             await conn.execute(text("ALTER TABLE files ADD COLUMN IF NOT EXISTS seq INTEGER DEFAULT 0"))
-            logger.info("Fallback ALTERs applied")
+            logger.info("Applied fallback ALTERs")
         except Exception:
             logger.exception("Fallback schema ensure failed")
 
@@ -262,15 +252,12 @@ async def init_db_create_all():
     logger.info("create_all executed")
 
 async def create_session(owner_id: int) -> int:
-    """
-    Start a new upload session for owner; create DB row and post header to upload channel
-    """
     async with AsyncSessionLocal() as s:
         new = SessionModel(owner_id=owner_id, active=True, revoked=False)
         s.add(new)
         await s.commit()
         await s.refresh(new)
-        header_text = f"📦 New upload session #{new.id} — waiting for files..."
+        header_text = f"📦 Upload session #{new.id} started by owner."
         try:
             sent = await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=header_text)
             new.header_message_id = sent.message_id
@@ -320,22 +307,19 @@ async def add_file_entry(session_id: int, upload_channel_id: int, upload_message
 
 async def finalize_session(owner_id: int, session_id: int, protect: bool, autodel_minutes: int) -> str:
     """
-    IMPORTANT: keep session.active True so link remains usable.
-    Mark revoked only on /revoke or /e (abort).
-    Token is persisted (committed) before returning.
+    Finalize: generate token, set protect/autodel on files, commit token before returning.
+    IMPORTANT: do NOT set active = False here — keep active True so deep link remains usable.
     """
     token = gen_token(DEEP_LINK_LENGTH)
     async with AsyncSessionLocal() as s:
         row = await s.get(SessionModel, session_id)
         if not row:
-            raise RuntimeError("Session not found")
+            raise RuntimeError("session not found")
         row.token = token
         row.protect_content = protect
         row.auto_delete_minutes = autodel_minutes
-        # do NOT set row.active = False here (that would disable link)
         row.revoked = False
         s.add(row)
-        # update files entries
         q = select(FileEntry).where(FileEntry.session_id == session_id).order_by(FileEntry.seq.asc())
         res = await s.execute(q)
         files = res.scalars().all()
@@ -343,13 +327,12 @@ async def finalize_session(owner_id: int, session_id: int, protect: bool, autode
             f.protected = protect
             f.auto_delete_minutes = autodel_minutes
             s.add(f)
-        # commit token & file updates BEFORE sending link
-        await s.commit()
-        # update header in upload channel
+        await s.commit()  # commit token and file updates before sending link
+        # update header message with deep link and file count
         try:
             me = await bot.get_me()
-            deep_link = f"https://t.me/{me.username}?start={token}"
-            header_text = f"📦 Session #{row.id}\nDeep link:\n{deep_link}\nFiles: {len(files)}"
+            deep = f"https://t.me/{me.username}?start={token}"
+            header_text = f"📦 Session #{row.id}\nDeep link:\n{deep}\nFiles: {len(files)}"
             if row.header_message_id:
                 try:
                     await bot.edit_message_text(chat_id=UPLOAD_CHANNEL_ID, message_id=row.header_message_id, text=header_text)
@@ -359,12 +342,12 @@ async def finalize_session(owner_id: int, session_id: int, protect: bool, autode
                 await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=header_text)
         except Exception:
             logger.exception("Failed to update header after finalize")
-    # clear ephemeral caches
+    # clear ephemeral owner state
     active_sessions_cache.pop(owner_id, None)
     awaiting_protect_choice.pop(owner_id, None)
     awaiting_autodel_choice.pop(owner_id, None)
     awaiting_context.pop(owner_id, None)
-    logger.info("Session %s finalized token=%s", session_id, token)
+    logger.info("Finalized session %s token=%s", session_id, token)
     return token
 
 async def set_config(key: str, value: str):
@@ -403,19 +386,13 @@ async def upsert_user(tg_user: types.User):
         await s.commit()
 
 # ----------------------------
-# Flood-safe copy helper
+# Safe copy wrapper (handles RetryAfter & retries)
 # ----------------------------
 async def safe_copy_message(from_chat_id: int, message_id: int, to_chat_id: int, protect_content: Optional[bool] = None) -> types.Message:
-    """
-    Copy a message with retry on RetryAfter and brief sleeps to avoid floods.
-    Returns the copied message object.
-    """
     attempt = 0
     while True:
         try:
-            kwargs = {}
             if protect_content is not None:
-                # some aiogram versions support protect_content in copy_message, some don't -> try/except
                 try:
                     return await bot.copy_message(chat_id=to_chat_id, from_chat_id=from_chat_id, message_id=message_id, protect_content=bool(protect_content))
                 except TypeError:
@@ -425,25 +402,25 @@ async def safe_copy_message(from_chat_id: int, message_id: int, to_chat_id: int,
         except RetryAfter as e:
             attempt += 1
             wait = e.timeout + 1
-            logger.warning("RetryAfter: sleeping %s seconds (attempt %s) while copying message %s from %s to %s", wait, attempt, message_id, from_chat_id, to_chat_id)
+            logger.warning("RetryAfter while copying message %s from %s to %s. Sleeping %s seconds (attempt %s)", message_id, from_chat_id, to_chat_id, wait, attempt)
             await asyncio.sleep(wait)
             continue
         except BadRequest as e:
-            # Common reasons: Message to copy not found, chat migrated, etc.
-            logger.exception("BadRequest while copying message %s from %s to %s: %s", message_id, from_chat_id, to_chat_id, e)
+            logger.warning("BadRequest copying message %s from %s to %s: %s", message_id, from_chat_id, to_chat_id, e)
+            # bubble up BadRequest so caller can decide (message deleted / cannot be copied)
             raise
         except Exception as e:
             attempt += 1
             if attempt > 4:
-                logger.exception("Max attempts reached while copying message %s from %s to %s: %s", message_id, from_chat_id, to_chat_id, e)
+                logger.exception("Failed copying message after attempts: %s", e)
                 raise
             backoff = min(5 * attempt, 10)
-            logger.warning("Unexpected error copying message; retrying in %s seconds (attempt %s): %s", backoff, attempt, e)
+            logger.warning("Unexpected error copying message, retry in %s seconds (attempt %s): %s", backoff, attempt, e)
             await asyncio.sleep(backoff)
             continue
 
 # ----------------------------
-# Deletion worker
+# Deletion worker: removes delivered messages when their delete_at is reached
 # ----------------------------
 async def deletion_worker():
     logger.info("Deletion worker started.")
@@ -461,7 +438,6 @@ async def deletion_worker():
                         s.add(d)
                         logger.info("Deleted delivered message %s in chat %s", d.message_id, d.chat_id)
                     except BadRequest as e:
-                        # message might already be deleted; mark as deleted to avoid loops
                         d.deleted = True
                         s.add(d)
                         logger.warning("Could not delete delivered message %s: %s", d.message_id, e)
@@ -480,7 +456,7 @@ async def handle_health(request):
             return web.Response(text="unauthorized", status=401)
     return web.Response(text="ok")
 
-async def start_webapp(host: str="0.0.0.0", port:int=PORT):
+async def start_webapp(host: str = "0.0.0.0", port: int = PORT):
     app = web.Application()
     app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
@@ -490,19 +466,14 @@ async def start_webapp(host: str="0.0.0.0", port:int=PORT):
     logger.info("Health endpoint started on %s:%s", host, port)
 
 # ----------------------------
-# Handlers: /start, owner commands, upload flow
+# Handlers: /start, /upload, /d, /e, /setstart, /broadcast, /revoke, /stats, /help, /restart
 # ----------------------------
-
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    """
-    /start [token] -> if token given, deliver session files (if token valid and not revoked)
-    else show configured start message.
-    """
     try:
         await upsert_user(message.from_user)
     except Exception:
-        logger.exception("upsert_user error in /start")
+        logger.exception("upsert_user failed in /start")
 
     args = message.get_args().strip()
     if args:
@@ -514,10 +485,10 @@ async def cmd_start(message: types.Message):
             if not sess:
                 await message.reply("This link is invalid or expired.")
                 return
-            if sess.revoked:
+            if sess.revoked or not sess.active:
                 await message.reply("This link is invalid or expired.")
                 return
-            # fetch files in order by seq ascending (owner upload order)
+            # fetch files for that session ordered by seq
             q2 = select(FileEntry).where(FileEntry.session_id == sess.id).order_by(FileEntry.seq.asc(), FileEntry.id.asc())
             res2 = await s.execute(q2)
             files = res2.scalars().all()
@@ -528,16 +499,17 @@ async def cmd_start(message: types.Message):
             max_autodel = 0
             for f in files:
                 try:
-                    # use safe copy (handles RetryAfter)
-                    msg = await safe_copy_message(from_chat_id=f.upload_channel_id, message_id=f.upload_message_id, to_chat_id=message.chat.id, protect_content=f.protected)
+                    # owner bypass: if requester is owner, protect_content=False to allow full control
+                    protect = False if message.from_user and message.from_user.id == OWNER_ID else f.protected
+                    msg = await safe_copy_message(from_chat_id=f.upload_channel_id, message_id=f.upload_message_id, to_chat_id=message.chat.id, protect_content=protect)
                     delivered_pairs.append((f, msg))
-                    # slight pause to avoid flood
+                    # small delay to avoid flood
                     await asyncio.sleep(0.05)
                 except BadRequest as e:
                     logger.warning("BadRequest copying file entry %s: %s", f.id, e)
                 except Exception:
                     logger.exception("Failed to deliver file entry %s", f.id)
-            # schedule deletions if any
+            # schedule deletions
             async with AsyncSessionLocal() as s2:
                 for f, msg in delivered_pairs:
                     if f.auto_delete_minutes and f.auto_delete_minutes > 0:
@@ -546,11 +518,13 @@ async def cmd_start(message: types.Message):
                         s2.add(d)
                         max_autodel = max(max_autodel, f.auto_delete_minutes)
                 await s2.commit()
+            # send final notification if autodelete set
             if max_autodel > 0:
+                # safe text, avoid parse errors
                 await message.reply(f"These files will be deleted in {max_autodel} minutes.")
             return
 
-    # no token: show start pointer if configured
+    # no args => show configured start message if any
     cfg = await get_config("start_pointer")
     if cfg:
         try:
@@ -558,19 +532,17 @@ async def cmd_start(message: types.Message):
             c_id = int(channel_id_str)
             m_id = int(msg_id_str)
             start_template = await get_config("start_template") or ""
-            txt_with_name = start_template.replace("{first_name}", html.escape(message.from_user.first_name or ""))
+            txt_with_name = start_template.replace("{first_name}", escape_html(message.from_user.first_name or ""))
             html_text = parse_braces_links(txt_with_name)
-            # copy start media
             try:
                 await safe_copy_message(from_chat_id=c_id, message_id=m_id, to_chat_id=message.chat.id, protect_content=False)
             except Exception:
-                logger.exception("Failed to copy start pointer message")
+                logger.exception("Failed to copy start pointer")
             if html_text.strip():
-                # send the parsed HTML (already escaped appropriately)
                 await bot.send_message(chat_id=message.chat.id, text=html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
             return
         except Exception:
-            logger.exception("Error sending start pointer")
+            logger.exception("sending start pointer failed")
             await message.reply("Welcome!")
             return
     await message.reply("Welcome! No start message configured.")
@@ -578,7 +550,7 @@ async def cmd_start(message: types.Message):
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     if not is_owner(message.from_user.id):
-        await message.reply("Owner-only.")
+        await message.reply("Owner-only command.")
         return
     help_text = (
         "Owner commands:\n"
@@ -591,10 +563,9 @@ async def cmd_help(message: types.Message):
         "/revoke <token|link> - revoke a deep link\n"
         "/restart - restart the bot\n"
         "/health - HTTP endpoint\n\n"
-        "Templates: use {first_name} and {word|https://example.com} in captions or start template."
+        "Templates: use {first_name} and {word|https://example.com} inside captions/start."
     )
-    # escape to prevent entity parse issues
-    await message.reply(escape_html_safe(help_text))
+    await message.reply(escape_html(help_text))
 
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
@@ -608,15 +579,14 @@ async def cmd_upload(message: types.Message):
     sid = await create_session(OWNER_ID)
     await message.reply(f"Upload session started (id={sid}). Send 1..{MAX_FILES_PER_SESSION} files. When done send /d. To abort send /e.")
 
-# Owner media collector (files are copied to upload channel and recorded in DB)
+# Owner media collector
 allowed_types = [t.strip() for t in ALLOWED_UPLOAD_TYPES.split(",") if t.strip()]
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID, content_types=allowed_types)
 async def owner_file_collector(message: types.Message):
     sid = await get_active_session(OWNER_ID)
     if not sid:
-        # ignore owner files if not in upload session
         return
-    # check existing count
+    # count existing
     async with AsyncSessionLocal() as s:
         q = select(FileEntry).where(FileEntry.session_id == sid)
         res = await s.execute(q)
@@ -625,7 +595,6 @@ async def owner_file_collector(message: types.Message):
             await message.reply(f"Session reached {MAX_FILES_PER_SESSION} files (max). Use /d to finalize or /e to abort.")
             return
         seq = len(existing) + 1
-    # caption and inline buttons
     caption_text = message.caption or message.text or None
     buttons_json = None
     if message.reply_markup:
@@ -633,22 +602,17 @@ async def owner_file_collector(message: types.Message):
             buttons_json = keyboard_to_json(message.reply_markup)
         except Exception:
             buttons_json = None
-    # copy message to upload channel using safe_copy_message
+    # copy to upload channel safely
     try:
         copied = await safe_copy_message(from_chat_id=message.chat.id, message_id=message.message_id, to_chat_id=UPLOAD_CHANNEL_ID, protect_content=False)
-    except RetryAfter as e:
-        # safe_copy_message handles RetryAfter, but just in case:
-        await asyncio.sleep(e.timeout + 1)
-        copied = await safe_copy_message(from_chat_id=message.chat.id, message_id=message.message_id, to_chat_id=UPLOAD_CHANNEL_ID, protect_content=False)
     except BadRequest as e:
-        logger.exception("BadRequest while copying owner media to upload channel: %s", e)
+        logger.exception("BadRequest copying owner media to upload channel: %s", e)
         await message.reply("Failed to copy to upload channel (BadRequest). Ensure bot has permission.")
         return
     except Exception:
         logger.exception("Failed to copy owner media to upload channel")
         await message.reply("Failed to copy to upload channel. Ensure bot is admin there and not rate-limited.")
         return
-    # record file entry in DB
     try:
         fid = await add_file_entry(session_id=sid,
                                    upload_channel_id=UPLOAD_CHANNEL_ID,
@@ -687,24 +651,26 @@ async def owner_finalize_flow(message: types.Message):
     txt = (message.text or "").strip()
     if txt.startswith("/"):
         return
+    # protect stage
     if OWNER_ID in awaiting_protect_choice and OWNER_ID not in awaiting_autodel_choice:
         low = txt.lower()
         if low not in ("on", "off"):
-            await message.reply("Reply 'on' or 'off'.")
+            await message.reply("Please reply 'on' or 'off' for protect content.")
             return
         sid = awaiting_protect_choice.pop(OWNER_ID)
         protect = (low == "on")
         awaiting_context[OWNER_ID]["protect"] = protect
         awaiting_autodel_choice[OWNER_ID] = sid
-        await message.reply("Enter auto-delete minutes (0..10080). Send 0 to disable.")
+        await message.reply("Enter auto-delete time in minutes (0..10080). Send 0 to disable.")
         return
+    # autodel stage
     if OWNER_ID in awaiting_autodel_choice:
         if not re.fullmatch(r"\d{1,5}", txt):
-            await message.reply("Send a number between 0 and 10080.")
+            await message.reply("Please send an integer minutes value between 0 and 10080.")
             return
         minutes = int(txt)
         if minutes < 0 or minutes > 10080:
-            await message.reply("Minutes must be 0..10080.")
+            await message.reply("Minutes must be between 0 and 10080.")
             return
         sid = awaiting_autodel_choice.pop(OWNER_ID)
         context = awaiting_context.pop(OWNER_ID, {})
@@ -712,22 +678,19 @@ async def owner_finalize_flow(message: types.Message):
         try:
             token = await finalize_session(OWNER_ID, sid, protect=protect, autodel_minutes=minutes)
         except Exception:
-            logger.exception("Finalize session failed")
-            await message.reply("Failed to finalize session.")
+            logger.exception("Finalize error")
+            await message.reply("Failed to finalize session due to internal error.")
             return
         me = await bot.get_me()
-        deep = f"https://t.me/{me.username}?start={token}"
+        deep_link = f"https://t.me/{me.username}?start={token}"
         if minutes > 0:
-            await bot.send_message(chat_id=OWNER_ID, text=f"Session finalized.\nDeep link:\n{deep}\nThese files will be deleted in {minutes} minutes after delivery.")
+            await bot.send_message(chat_id=OWNER_ID, text=f"Session finalized. Deep link:\n{deep_link}\nThese files will be deleted in {minutes} minutes after delivery.")
         else:
-            await bot.send_message(chat_id=OWNER_ID, text=f"Session finalized.\nDeep link:\n{deep}")
+            await bot.send_message(chat_id=OWNER_ID, text=f"Session finalized. Deep link:\n{deep_link}")
         return
 
 @dp.message_handler(commands=["e"])
 async def cmd_e(message: types.Message):
-    """
-    Abort current upload session: mark revoked and inactive, clear ephemeral owner state.
-    """
     if not is_owner(message.from_user.id):
         return
     sid = await get_active_session(OWNER_ID)
@@ -746,7 +709,7 @@ async def cmd_e(message: types.Message):
     awaiting_protect_choice.pop(OWNER_ID, None)
     awaiting_autodel_choice.pop(OWNER_ID, None)
     awaiting_context.pop(OWNER_ID, None)
-    await message.reply("Session aborted (terminated). Uploaded copies remain in upload channel but are not linked.")
+    await message.reply("Session aborted. Uploaded copies remain in upload channel but are not linked.")
 
 @dp.message_handler(commands=["setstart"])
 async def cmd_setstart(message: types.Message):
@@ -754,13 +717,13 @@ async def cmd_setstart(message: types.Message):
         await message.reply("Owner-only.")
         return
     if not message.reply_to_message:
-        await message.reply("Reply to a message to set start content.")
+        await message.reply("Reply to a message (text or media) to set /start content.")
         return
     try:
         copied = await safe_copy_message(from_chat_id=message.reply_to_message.chat.id, message_id=message.reply_to_message.message_id, to_chat_id=UPLOAD_CHANNEL_ID, protect_content=False)
     except Exception:
         logger.exception("Failed to copy start pointer to upload channel")
-        await message.reply("Failed to set start pointer. Ensure bot can post in upload channel.")
+        await message.reply("Failed to set start content. Ensure bot can post in upload channel.")
         return
     pointer = f"{UPLOAD_CHANNEL_ID}:{copied.message_id}"
     template = message.reply_to_message.caption or message.reply_to_message.text or ""
@@ -800,7 +763,7 @@ async def cmd_broadcast(message: types.Message):
         except Exception:
             logger.warning("Broadcast failed for %s", uid)
             failed += 1
-    await message.reply(f"Broadcast done. Sent: {sent}, Failed: {failed}")
+    await message.reply(f"Broadcast complete. Sent: {sent}, Failed: {failed}")
 
 @dp.message_handler(commands=["stats"])
 async def cmd_stats(message: types.Message):
@@ -855,7 +818,6 @@ async def cmd_restart(message: types.Message):
 
 @dp.message_handler(content_types=types.ContentType.ANY)
 async def fallback(message: types.Message):
-    # do not interfere with commands
     if message.text and message.text.startswith("/"):
         return
     try:
@@ -864,7 +826,7 @@ async def fallback(message: types.Message):
         logger.exception("upsert_user fallback failed")
 
 # ----------------------------
-# Startup: run alembic or fallback & start background tasks
+# Startup sequence: alembic or fallback ensures + background tasks
 # ----------------------------
 async def startup_sequence():
     cwd = os.getcwd()
@@ -876,17 +838,17 @@ async def startup_sequence():
             logger.warning("Alembic upgrade failed; fallback ensures will run. Output:\n%s", out)
             await ensure_schema_fallback()
     else:
-        logger.info("Alembic not run; creating tables and fallback ensures.")
+        logger.info("Alembic not run; creating tables and applying fallback ensures.")
         await init_db_create_all()
         await ensure_schema_fallback()
 
 async def on_startup(dp_obj):
-    logger.info("Startup: removing webhook and running migrations/ensures.")
+    logger.info("Startup: deleting webhook and running migrations/ensures.")
     try:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
-            logger.warning("delete_webhook failed on startup: %s", e)
+            logger.warning("delete_webhook failed: %s", e)
         await startup_sequence()
     except Exception:
         logger.exception("startup_sequence failed")
