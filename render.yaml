@@ -1,16 +1,19 @@
 services:
   - type: web
-    name: telegram-upload-bot
+    name: telegram-bot
     env: python
     plan: free
-    region: oregon
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
-    autoDeploy: true
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python bot.py
     envVars:
-      - key: TELEGRAM_TOKEN
-        fromDatabase: false
-      - key: DATABASE_URL
-        fromDatabase: false
+      - key: BOT_TOKEN
+        sync: false
       - key: OWNER_ID
-        fromDatabase: false
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: UPLOAD_CHANNEL_ID
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
+    branch: main
