@@ -1,51 +1,29 @@
 # bot.py
-"""
-Session-based file-sharing Telegram bot (webhook mode)
-Designed to be persisted on Render with a PostgreSQL DB.
-Key design decisions (your requirements):
-- Minimal DB usage: store only stable channel file_ids (from upload channel) and session metadata.
-- Upload flow durable across restarts: /upload creates a draft session in DB; owner sends files; /done finalizes.
-- Random deep links (64 chars) per session -> https://t.me/<bot>?start=<token>
-- Owner-only management commands; /start is public.
-- Owner bypasses protect_content.
-- Autodelete timer per session (0 = disabled); delivered copies deleted after N minutes.
-- /health endpoint for uptime checks.
-- No in-memory FSM: session state persisted in DB (status transitions).
-- Uses aiogram 2.25.0 and aiohttp 3.8.6 compatibility patterns (Bot.set_current).
-"""
-
-# Standard library
-import os
-import sys
 import asyncio
 import logging
-import secrets
-import traceback
+import os
+import random
+import string
+import json
+from typing import List, Dict, Optional, Tuple  # ✅ FIXED: added Tuple
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
 
-# Third-party
 from aiohttp import web
-from aiohttp.web_request import Request
-
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher import FSMContext
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from aiogram.utils.executor import start_webhook
+from aiogram.utils.exceptions import TelegramAPIError
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
 
 from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    select,
-    func,
-    Index,
+    Column, Integer, String, Boolean, DateTime, ForeignKey, Text, create_engine
 )
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.future import select
 
+from dotenv import load_dotenv
 # ------------------------------------------------------------
 # Logging configuration
 # ------------------------------------------------------------
