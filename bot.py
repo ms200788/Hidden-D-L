@@ -57,7 +57,8 @@ OWNER_ID = os.environ.get("OWNER_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # must include +asyncpg: postgresql+asyncpg://user:pass@host:port/db
 UPLOAD_CHANNEL_ID = os.environ.get("UPLOAD_CHANNEL_ID")
 WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://hidden-fnxx.onrender.com (required)
-PORT = int(os.environ.get("PORT", "10000"))  # default to 10000 as requested
+port = int(os.getenv("PORT", 10000))
+health_port = int(os.getenv("HEALTH_PORT", 8080))
 
 _missing = []
 if not BOT_TOKEN:
