@@ -1,8 +1,7 @@
 # bot.py
 """
-Persistent Telegram file-sharing bot (webhook mode) - fixed ports:
-- Webhook binds to PORT (default 10000)
-- Health server binds to HEALTH_PORT (default 8080)
+Persistent Telegram file-sharing bot (webhook mode) - fixed FSM and upload channel handling
+
 Compatible with:
 - aiogram==2.25.0
 - SQLAlchemy==1.4.51 (async)
@@ -13,13 +12,12 @@ Compatible with:
 
 Features:
 - Owner-only upload/revoke/edit_start
-- Uploads forwarded to private upload channel; DB stores file_ids
+- Uploads forwarded to private upload channel; DB stores file_ids (persistent)
 - Deep links deliver files in original order + captions
 - Protect content option & autodelete timer (0 = disabled)
 - Persistent autodelete across restarts (deliveries DB table + background worker)
-- Owner bypass: owner always receives non-protected copies
-- Webhook mode to avoid polling conflicts
-- /health available on separate HEALTH_PORT
+- Owner bypass for protect_content
+- Webhook mode with separate health port to avoid address-in-use
 """
 
 import os
@@ -52,14 +50,14 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 # -------------------------
-# Logging configuration
+# Logging
 # -------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("persistent_file_bot")
+logger = logging.getLogger("file_share_bot_fixed")
 
 # -------------------------
 # Environment variables
@@ -147,29 +145,28 @@ class StartMessage(Base):
 
 
 # -------------------------
-# Async DB engine & sessionmaker
+# Async engine & sessionmaker
 # -------------------------
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def init_db():
-    logger.info("Initializing DB (create tables if they do not exist)...")
+    logger.info("Initializing DB (create tables if needed)...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("DB init complete.")
+    logger.info("DB initialized.")
 
 
 # -------------------------
-# Token generation helper
+# Token helper
 # -------------------------
 def generate_token(length: int = 64) -> str:
-    # token_urlsafe sometimes produces longer strings; we slice to exact length
     return secrets.token_urlsafe(length)[:length]
 
 
 # -------------------------
-# Aiogram v2 setup
+# Aiogram setup (v2)
 # -------------------------
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
@@ -186,7 +183,7 @@ class UploadStates(StatesGroup):
 
 
 # -------------------------
-# Autodelete background worker
+# Autodelete worker
 # -------------------------
 AUTODELETE_CHECK_INTERVAL = 30  # seconds
 
@@ -198,7 +195,7 @@ async def add_delivery(chat_id: int, message_id: int, delete_at: Optional[dateti
         rec = DeliveryModel(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
         db.add(rec)
         await db.commit()
-    logger.debug("Scheduled deletion: %s:%s at %s", chat_id, message_id, delete_at.isoformat())
+    logger.debug("Scheduled delete %s:%s at %s", chat_id, message_id, delete_at.isoformat())
 
 
 async def autodelete_worker():
@@ -211,7 +208,7 @@ async def autodelete_worker():
                 res = await db.execute(stmt)
                 due = res.scalars().all()
                 if due:
-                    logger.info("Autodelete: found %d due messages", len(due))
+                    logger.info("Autodelete: %d messages due", len(due))
                 for rec in due:
                     try:
                         await bot.delete_message(chat_id=rec.chat_id, message_id=rec.message_id)
@@ -250,7 +247,7 @@ async def save_start_message(content: str):
             rec = StartMessage(content=content)
             db.add(rec)
         await db.commit()
-    logger.info("Saved /start message.")
+    logger.info("Saved start message.")
 
 
 async def fetch_start_message() -> Optional[str]:
@@ -262,7 +259,18 @@ async def fetch_start_message() -> Optional[str]:
 
 
 # -------------------------
-# /start handler (deep link delivery or welcome)
+# Helper: get FSM state bound to chat+user (reliable)
+# -------------------------
+def get_state_for_message(message: types.Message):
+    """
+    Always use both chat and user so the FSM is reliably tied to the conversation.
+    This fixes cases where user and chat differ (groups) or webhook contexts.
+    """
+    return dp.current_state(chat=message.chat.id, user=message.from_user.id)
+
+
+# -------------------------
+# /start handler
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def handle_start(message: types.Message):
@@ -271,7 +279,7 @@ async def handle_start(message: types.Message):
         content = await fetch_start_message()
         if content:
             rendered = content.replace("{first_name}", message.from_user.first_name or "")
-            # convert {label | url} -> <a href="url">label</a>
+            # convert {label | url} -> anchor
             out: List[str] = []
             i = 0
             while True:
@@ -287,15 +295,12 @@ async def handle_start(message: types.Message):
                 inner = rendered[start + 1:end].strip()
                 if "|" in inner:
                     left, right = inner.split("|", 1)
-                    left = left.strip()
-                    right = right.strip()
-                    out.append(f'<a href="{right}">{left}</a>')
+                    out.append(f'<a href="{right.strip()}">{left.strip()}</a>')
                 else:
                     out.append("{" + inner + "}")
                 i = end + 1
             final_text = "".join(out)
             try:
-                # use plain text since not all clients expect HTML; but HTML is okay too
                 await message.answer(final_text, parse_mode=None)
             except Exception:
                 await message.answer(content.replace("{first_name}", message.from_user.first_name or ""))
@@ -303,7 +308,6 @@ async def handle_start(message: types.Message):
             await message.answer(f"Welcome, {message.from_user.first_name}!")
         return
 
-    # deep-link token present -> deliver session files
     token = args
     session_obj = await get_session_by_token(token)
     if not session_obj:
@@ -326,7 +330,6 @@ async def handle_start(message: types.Message):
     delivered = 0
     for f in files:
         try:
-            # owner bypass for protect_content
             protect_flag = False if message.from_user.id == OWNER_ID else bool(session_obj.protect_content)
             caption = f.caption or None
 
@@ -367,10 +370,10 @@ async def cmd_upload(message: types.Message):
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /upload.")
         return
-    await UploadStates.waiting_for_files.set()
-    state = dp.current_state(user=message.from_user.id)
+    state = get_state_for_message(message)
+    await state.set_state(UploadStates.waiting_for_files.state)
     await state.update_data(files=[])
-    await message.reply("Upload started. Send files (photos/videos/documents/audio/voice/sticker). When done, send /done. To cancel, send /abort.")
+    await message.reply("Upload session started. Send the files (photo/video/document/audio/voice/sticker). When finished send /done. To cancel send /abort.")
 
 
 # -------------------------
@@ -381,7 +384,7 @@ async def cmd_abort(message: types.Message):
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /abort.")
         return
-    state = dp.current_state(user=message.from_user.id)
+    state = get_state_for_message(message)
     data = await state.get_data()
     files = data.get("files", [])
     removed = 0
@@ -394,7 +397,7 @@ async def cmd_abort(message: types.Message):
             except Exception:
                 pass
     await state.finish()
-    await message.reply(f"Upload aborted. Removed {removed} forwarded messages from upload channel (if possible).")
+    await message.reply(f"Upload aborted. Removed {removed} temporary forwarded message(s) from upload channel (if possible).")
 
 
 # -------------------------
@@ -405,9 +408,9 @@ async def cmd_done(message: types.Message):
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /done.")
         return
-    state = dp.current_state(user=message.from_user.id)
+    state = get_state_for_message(message)
     if await state.get_state() != UploadStates.waiting_for_files.state:
-        await message.reply("No active upload session. Start with /upload.")
+        await message.reply("No active upload session. Use /upload to start.")
         return
     data = await state.get_data()
     files = data.get("files", [])
@@ -415,16 +418,16 @@ async def cmd_done(message: types.Message):
         await state.finish()
         await message.reply("No files uploaded. Upload canceled.")
         return
-    await message.reply("Protect content? Reply `on` or `off`.")
-    await UploadStates.awaiting_protect.set()
+    await message.reply("Protect content? Reply with `on` or `off`.")
+    await state.set_state(UploadStates.awaiting_protect.state)
 
 
 # -------------------------
-# Generic message handler for FSM and file forwarding
+# Generic handler for FSM file collection + protect/autodelete
 # -------------------------
 @dp.message_handler()
 async def generic_handler(message: types.Message):
-    state = dp.current_state(user=message.from_user.id)
+    state = get_state_for_message(message)
     curr = await state.get_state()
 
     # awaiting_protect
@@ -436,7 +439,7 @@ async def generic_handler(message: types.Message):
         protect = text == "on"
         await state.update_data(protect=protect)
         await message.reply("Set autodelete minutes (0 - 10080). 0 = no autodelete.")
-        await UploadStates.awaiting_autodelete.set()
+        await state.set_state(UploadStates.awaiting_autodelete.state)
         return
 
     # awaiting_autodelete
@@ -483,14 +486,15 @@ async def generic_handler(message: types.Message):
             orig_file_id = message.sticker.file_id
             caption = ""
         else:
-            await message.reply("Send supported files or /done to finish, /abort to cancel.")
+            await message.reply("Send supported files (photo/video/document/audio/voice/sticker) or /done to finish, /abort to cancel.")
             return
 
         try:
+            # forward to upload channel (bot must be admin there)
             fwd = await bot.forward_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
         except Exception as e:
             logger.exception("Failed to forward to upload channel: %s", e)
-            await message.reply("Failed to forward. Ensure bot is admin in upload channel.")
+            await message.reply("Failed to forward to upload channel. Ensure bot is admin there and allowed to post.")
             return
 
         data = await state.get_data()
@@ -505,7 +509,7 @@ async def generic_handler(message: types.Message):
         await message.reply(f"Saved {ftype}. Send more or /done.")
         return
 
-    # not in FSM: ignore
+    # not an upload FSM message -> ignore
     return
 
 
@@ -628,7 +632,7 @@ async def cmd_revoke(message: types.Message):
 
 
 # -------------------------
-# Owner-only: /edit_start
+# Owner-only: /edit_start (reply to message)
 # -------------------------
 @dp.message_handler(commands=["edit_start"])
 async def cmd_edit_start(message: types.Message):
@@ -636,14 +640,19 @@ async def cmd_edit_start(message: types.Message):
         await message.reply("❌ Only the owner can edit start message.")
         return
     if not message.reply_to_message:
-        await message.reply("Reply to a message that contains the text/caption you want to set for /start.")
+        await message.reply("Reply to a message (text or image caption) that you want to set as the /start message.")
         return
+    # Accept reply text or caption
     content = message.reply_to_message.text or message.reply_to_message.caption or ""
     if not content.strip():
         await message.reply("Replied message has no text/caption.")
         return
-    await save_start_message(content)
-    await message.reply("✅ /start message updated. Placeholders supported: {first_name} and {word | url}.")
+    try:
+        await save_start_message(content)
+        await message.reply("✅ /start message updated. Placeholders supported: {first_name} and {word | url}.")
+    except Exception:
+        logger.exception("Failed to save start message")
+        await message.reply("Failed to save start message. Check logs.")
 
 
 # -------------------------
@@ -652,7 +661,7 @@ async def cmd_edit_start(message: types.Message):
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     await message.reply(
-        "/start - show welcome or use deep link (/start <token>)\n"
+        "/start - show welcome or open deep link (/start <token>)\n"
         "/upload - start upload (owner only)\n"
         "/done - finish upload (owner only)\n"
         "/abort - cancel upload (owner only)\n"
@@ -663,17 +672,13 @@ async def cmd_help(message: types.Message):
 
 
 # -------------------------
-# Health endpoint (separate server)
+# Health server (separate port to avoid conflicts)
 # -------------------------
 async def health(request):
     return web.Response(text="OK")
 
 
 async def start_health_app():
-    """
-    Starts an aiohttp server on HEALTH_PORT for /health.
-    This runs separately to avoid binding conflicts with the aiogram webhook server.
-    """
     app = web.Application()
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
@@ -681,31 +686,28 @@ async def start_health_app():
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
         await site.start()
-        logger.info("Health server listening on port %s", HEALTH_PORT)
+        logger.info("Health server started on port %s", HEALTH_PORT)
     except Exception:
         logger.exception("Failed to start health server: %s", traceback.format_exc())
 
 
 # -------------------------
-# Startup & shutdown hooks for webhook
+# Startup / Shutdown hooks
 # -------------------------
 async def on_startup(dp_obj):
-    logger.info("on_startup: initializing DB and starting background workers...")
+    logger.info("on_startup: initializing DB and background tasks...")
     try:
         await init_db()
     except Exception:
         logger.exception("DB initialization failed at startup")
-    # start autodelete worker
     loop = asyncio.get_event_loop()
     loop.create_task(autodelete_worker())
-    # start health server on separate port to avoid conflicts
     loop.create_task(start_health_app())
-    # set webhook
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception:
-        logger.exception("Failed to set webhook: %s", traceback.format_exc())
+        logger.exception("Failed to set webhook to %s: %s", WEBHOOK_URL, traceback.format_exc())
 
 
 async def on_shutdown(dp_obj):
@@ -726,10 +728,10 @@ async def on_shutdown(dp_obj):
 
 
 # -------------------------
-# Entrypoint: start aiogram webhook (binds to PORT)
+# Entrypoint: run webhook server (binds to PORT)
 # -------------------------
 def main():
-    logger.info("Starting webhook server (port=%s) and health server (port=%s)...", PORT, HEALTH_PORT)
+    logger.info("Starting webhook server (port=%s) and health server (port=%s)", PORT, HEALTH_PORT)
     try:
         start_webhook(
             dispatcher=dp,
@@ -746,5 +748,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# End of file
