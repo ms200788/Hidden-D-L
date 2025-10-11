@@ -1,28 +1,16 @@
 # bot.py
 """
-Telegram file-sharing bot (webhook mode) - full implementation (Aiogram v2)
-
-Features:
-- Persistent PostgreSQL storage (SQLAlchemy async + asyncpg)
-- Private upload channel to store files (bot must be admin)
-- Owner-only upload/revoke/edit_start/help/done/abort
-- /start (and deep link) universal (anyone can open deep link)
+Fixed webhook-mode Telegram file-sharing bot (Aiogram v2.25.0)
+- Uses a single aiohttp server to receive Telegram updates at /webhook/<BOT_TOKEN>
+- Provides /health endpoint on same server
+- Persistent PostgreSQL via SQLAlchemy async + asyncpg
+- Owner-only: /upload, /done, /abort, /revoke, /help, /edit_start
+- Public: /start (and deep-link tokens)
 - Owner bypass for protect_content
-- Autodelete persistent across restarts
-- Webhook mode (no polling) - uses WEBHOOK_HOST + /webhook/<BOT_TOKEN>
-- Health server on separate port to avoid binding conflicts
-- Robust FSM for upload flow
-- Designed to be deployable on Render (or any HTTPS host)
-
-Environment variables (set on Render):
-- BOT_TOKEN
-- OWNER_ID
-- DATABASE_URL (postgresql+asyncpg://...)
-- UPLOAD_CHANNEL_ID
-- WEBHOOK_HOST (https://your-app.onrender.com)
-- PORT (default 10000)
-- HEALTH_PORT (default 8080)
-- LOG_LEVEL (optional)
+- Autodelete persisted in DB and processed by background worker
+- Captures channel file_ids at forward time (no get_message later)
+- Delivery concurrency limit to reduce hitting Telegram limits
+- Robust error handling and logging
 """
 
 import os
@@ -34,9 +22,9 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 from aiohttp import web
+from aiohttp.web_request import Request
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import start_webhook
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -54,26 +42,25 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# ----------------------------
-# Logging config
-# ----------------------------
+# -------------------------
+# Basic configuration from ENV
+# -------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("file_share_bot_final")
+logger = logging.getLogger("fixed_file_share_bot")
 
-# ----------------------------
-# Environment / config
-# ----------------------------
+# Read required env vars
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = os.environ.get("OWNER_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 UPLOAD_CHANNEL_ID = os.environ.get("UPLOAD_CHANNEL_ID")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://hidden-fnxx.onrender.com
 PORT = int(os.environ.get("PORT", "10000"))
-HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))  # not used separately in this deployment but kept for compat
+MAX_CONCURRENT_DELIVERIES = int(os.environ.get("MAX_CONCURRENT_DELIVERIES", "50"))
 
 _missing = []
 if not BOT_TOKEN:
@@ -99,20 +86,20 @@ try:
 except Exception:
     raise RuntimeError("UPLOAD_CHANNEL_ID must be an integer (channel id)")
 
-# webhook setup
+# Build webhook URL and path
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
-# ----------------------------
-# Database models (SQLAlchemy async)
-# ----------------------------
+# -------------------------
+# Database models (SQLAlchemy Async)
+# -------------------------
 Base = declarative_base()
 
 
 class SessionModel(Base):
     __tablename__ = "sessions"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    link = Column(String(128), unique=True, nullable=False, index=True)  # 64-char token
+    link = Column(String(128), unique=True, nullable=False, index=True)  # token
     owner_id = Column(Integer, nullable=False)
     protect_content = Column(Boolean, default=False)
     autodelete_minutes = Column(Integer, default=0)
@@ -126,7 +113,7 @@ class FileModel(Base):
     __tablename__ = "files"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
-    tg_file_id = Column(String, nullable=False)
+    tg_file_id = Column(String, nullable=False)  # file_id that's safe to re-send
     file_type = Column(String(32), nullable=False)  # photo, video, document, audio, voice, sticker
     caption = Column(String, nullable=True)
     order_index = Column(Integer, nullable=False)
@@ -149,65 +136,65 @@ class StartMessage(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-# ----------------------------
-# Async engine & sessionmaker
-# ----------------------------
-# DATABASE_URL must be like: postgresql+asyncpg://user:pass@host:port/dbname
+# -------------------------
+# Async engine + sessionmaker
+# -------------------------
+# DATABASE_URL must use asyncpg driver: postgresql+asyncpg://user:pass@host:port/db
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def init_db():
-    logger.info("Initializing database (create tables if needed)...")
+    logger.info("Initializing DB (create tables if needed)...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database initialization complete.")
+    logger.info("DB initialized.")
 
 
-# ----------------------------
+# -------------------------
 # Utilities
-# ----------------------------
+# -------------------------
 def generate_token(length: int = 64) -> str:
-    """Generate a URL-safe token of exact length (slice token_urlsafe)."""
     return secrets.token_urlsafe(length)[:length]
 
 
-# ----------------------------
-# Aiogram setup (v2)
-# ----------------------------
+# -------------------------
+# Aiogram setup
+# -------------------------
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
+# Semaphore for limiting concurrent send operations (avoid hammering Telegram)
+delivery_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DELIVERIES)
 
-# ----------------------------
+
+# -------------------------
 # FSM states
-# ----------------------------
+# -------------------------
 class UploadStates(StatesGroup):
     waiting_for_files = State()
     awaiting_protect = State()
     awaiting_autodelete = State()
 
 
-# ----------------------------
-# Background autodelete worker
-# ----------------------------
+# -------------------------
+# Autodelete worker (DB persisted)
+# -------------------------
 AUTODELETE_CHECK_INTERVAL = 30  # seconds
 
 
 async def add_delivery(chat_id: int, message_id: int, delete_at: Optional[datetime]):
-    """Persist a message deletion task to DB (delete_at in UTC)."""
     if delete_at is None:
         return
     async with AsyncSessionLocal() as db:
         rec = DeliveryModel(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
         db.add(rec)
         await db.commit()
-    logger.debug("Scheduled deletion for %s:%s at %s", chat_id, message_id, delete_at.isoformat())
+    logger.debug("Added delivery task: %s:%s at %s", chat_id, message_id, delete_at.isoformat())
 
 
 async def autodelete_worker():
-    """Loop: find due deliveries and delete them, remove DB records."""
     logger.info("Autodelete worker started; checking every %s seconds", AUTODELETE_CHECK_INTERVAL)
     while True:
         try:
@@ -215,10 +202,10 @@ async def autodelete_worker():
                 now = datetime.utcnow()
                 stmt = select(DeliveryModel).where(DeliveryModel.delete_at <= now)
                 res = await db.execute(stmt)
-                due_items = res.scalars().all()
-                if due_items:
-                    logger.info("Autodelete: %d messages due", len(due_items))
-                for rec in due_items:
+                due = res.scalars().all()
+                if due:
+                    logger.info("Autodelete: %d messages due", len(due))
+                for rec in due:
                     try:
                         await bot.delete_message(chat_id=rec.chat_id, message_id=rec.message_id)
                         logger.debug("Autodelete: deleted %s:%s", rec.chat_id, rec.message_id)
@@ -227,16 +214,16 @@ async def autodelete_worker():
                     try:
                         await db.delete(rec)
                     except Exception:
-                        logger.exception("Autodelete: failed removing DB record for %s:%s", rec.chat_id, rec.message_id)
+                        logger.exception("Autodelete: failed to remove DB record for %s:%s", rec.chat_id, rec.message_id)
                 await db.commit()
         except Exception:
             logger.exception("Error in autodelete worker: %s", traceback.format_exc())
         await asyncio.sleep(AUTODELETE_CHECK_INTERVAL)
 
 
-# ----------------------------
-# DB helper functions
-# ----------------------------
+# -------------------------
+# DB helpers (sessions/start message)
+# -------------------------
 async def get_session_by_token(token: str) -> Optional[SessionModel]:
     async with AsyncSessionLocal() as db:
         stmt = select(SessionModel).where(SessionModel.link == token)
@@ -267,134 +254,178 @@ async def fetch_start_message() -> Optional[str]:
         return rec.content if rec else None
 
 
-# ----------------------------
-# Helper to get FSM state bound to chat+user reliably
-# ----------------------------
+# -------------------------
+# Helper: reliably get FSM state for message (chat+user)
+# -------------------------
 def get_state_for_message(message: types.Message) -> FSMContext:
-    """
-    Use both chat and user to bind FSM state reliably in webhook environment.
-    """
     return dp.current_state(chat=message.chat.id, user=message.from_user.id)
 
 
-# ----------------------------
-# /start handler (welcome or deep link)
-# ----------------------------
+# -------------------------
+# Helper: unified send that tries protect_content if supported
+# -------------------------
+async def _send_with_fallback(ftype: str, chat_id: int, tg_file_id: str, caption: Optional[str], protect: bool):
+    """
+    Send media while trying to pass protect_content. If the aiogram send_* method doesn't accept
+    the parameter, fall back to calling without it.
+    Returns the sent Message.
+    """
+    kwargs: Dict[str, Any] = {}
+    if caption:
+        kwargs["caption"] = caption
+
+    # try with protect_content first (newer Telegram clients & aiogram versions support it)
+    if protect is not None:
+        kwargs["protect_content"] = protect
+
+    try:
+        if ftype == "photo":
+            return await bot.send_photo(chat_id=chat_id, photo=tg_file_id, **kwargs)
+        elif ftype == "video":
+            return await bot.send_video(chat_id=chat_id, video=tg_file_id, **kwargs)
+        elif ftype == "document":
+            return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
+        elif ftype == "audio":
+            return await bot.send_audio(chat_id=chat_id, audio=tg_file_id, **kwargs)
+        elif ftype == "voice":
+            # voice rarely has caption
+            return await bot.send_voice(chat_id=chat_id, voice=tg_file_id, **kwargs)
+        elif ftype == "sticker":
+            # sticker doesn't accept caption
+            # remove caption and protect if not supported
+            kwargs.pop("caption", None)
+            return await bot.send_sticker(chat_id=chat_id, sticker=tg_file_id, **kwargs)
+        else:
+            return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
+    except TypeError as e:
+        # method signature may not accept protect_content; retry without it
+        logger.debug("TypeError during send (retry without protect_content): %s", e)
+        kwargs.pop("protect_content", None)
+        try:
+            if ftype == "photo":
+                return await bot.send_photo(chat_id=chat_id, photo=tg_file_id, **kwargs)
+            elif ftype == "video":
+                return await bot.send_video(chat_id=chat_id, video=tg_file_id, **kwargs)
+            elif ftype == "document":
+                return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
+            elif ftype == "audio":
+                return await bot.send_audio(chat_id=chat_id, audio=tg_file_id, **kwargs)
+            elif ftype == "voice":
+                return await bot.send_voice(chat_id=chat_id, voice=tg_file_id, **kwargs)
+            elif ftype == "sticker":
+                kwargs.pop("caption", None)
+                return await bot.send_sticker(chat_id=chat_id, sticker=tg_file_id, **kwargs)
+            else:
+                return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
+        except Exception:
+            logger.exception("Failed to resend media after removing protect_content fallback.")
+            raise
+    except Exception:
+        logger.exception("Failed to send media.")
+        raise
+
+
+# -------------------------
+# Handler: /start (welcome or deep link)
+# -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     args = message.get_args().strip() if message.get_args() else ""
-    # No payload -- reply with start message
     if not args:
         content = await fetch_start_message()
         if content:
-            # Replace {first_name} and {label | url}
+            # Render placeholders and simple {label | url} -> anchor
             rendered = content.replace("{first_name}", message.from_user.first_name or "")
-            out_parts: List[str] = []
+            out_chunks: List[str] = []
             i = 0
             while True:
                 s = rendered.find("{", i)
                 if s == -1:
-                    out_parts.append(rendered[i:])
+                    out_chunks.append(rendered[i:])
                     break
                 e = rendered.find("}", s)
                 if e == -1:
-                    out_parts.append(rendered[i:])
+                    out_chunks.append(rendered[i:])
                     break
-                out_parts.append(rendered[i:s])
+                out_chunks.append(rendered[i:s])
                 inner = rendered[s+1:e].strip()
                 if "|" in inner:
                     left, right = inner.split("|", 1)
-                    out_parts.append(f'<a href="{right.strip()}">{left.strip()}</a>')
+                    out_chunks.append(f'<a href="{right.strip()}">{left.strip()}</a>')
                 else:
-                    out_parts.append("{" + inner + "}")
+                    out_chunks.append("{" + inner + "}")
                 i = e + 1
-            final_text = "".join(out_parts)
+            final_text = "".join(out_chunks)
             try:
                 await message.answer(final_text, parse_mode="HTML", disable_web_page_preview=True)
             except Exception:
-                # fallback plain text
                 await message.answer(content.replace("{first_name}", message.from_user.first_name or ""))
         else:
             await message.answer(f"Welcome, {message.from_user.first_name or 'friend'}!")
         return
 
-    # Payload present: treat it as deep-link token
+    # treat args as token
     token = args
     session_obj = await get_session_by_token(token)
     if not session_obj:
         await message.answer("❌ Link not found or expired.")
         return
     if session_obj.revoked:
-        await message.answer("❌ This link has been revoked by the owner.")
+        await message.answer("❌ This link was revoked.")
         return
 
-    # fetch files for the session in order
+    # load files
     async with AsyncSessionLocal() as db:
         stmt = select(FileModel).where(FileModel.session_id == session_obj.id).order_by(FileModel.order_index)
         res = await db.execute(stmt)
         files: List[FileModel] = res.scalars().all()
 
     if not files:
-        await message.answer("❌ No files available for this link.")
+        await message.answer("❌ No files found for this link.")
         return
 
     delivered = 0
+    # deliver files in order; we acquire semaphore per individual send to limit concurrency overall
     for f in files:
         try:
-            # Owner bypass: the owner always gets unprotected copies
             protect_flag = False if message.from_user.id == OWNER_ID else bool(session_obj.protect_content)
-            caption = f.caption or None
-
-            # Send according to file type. note: protect_content parameter exists on some Aiogram versions / Telegram clients;
-            # we implement owner bypass behavior by not setting it for owner; many clients will still enforce client-side.
-            if f.file_type == "photo":
-                sent = await bot.send_photo(chat_id=message.chat.id, photo=f.tg_file_id, caption=caption)
-            elif f.file_type == "video":
-                sent = await bot.send_video(chat_id=message.chat.id, video=f.tg_file_id, caption=caption)
-            elif f.file_type == "document":
-                sent = await bot.send_document(chat_id=message.chat.id, document=f.tg_file_id, caption=caption)
-            elif f.file_type == "audio":
-                sent = await bot.send_audio(chat_id=message.chat.id, audio=f.tg_file_id, caption=caption)
-            elif f.file_type == "voice":
-                sent = await bot.send_voice(chat_id=message.chat.id, voice=f.tg_file_id)
-            elif f.file_type == "sticker":
-                sent = await bot.send_sticker(chat_id=message.chat.id, sticker=f.tg_file_id)
-            else:
-                sent = await bot.send_document(chat_id=message.chat.id, document=f.tg_file_id, caption=caption)
+            # guard with semaphore
+            await delivery_semaphore.acquire()
+            try:
+                sent = await _send_with_fallback(f.file_type, chat_id=message.chat.id, tg_file_id=f.tg_file_id, caption=f.caption, protect=protect_flag)
+            finally:
+                delivery_semaphore.release()
 
             delivered += 1
-
-            # schedule autodelete for this recipient copy if needed
             if session_obj.autodelete_minutes and session_obj.autodelete_minutes > 0:
                 delete_time = datetime.utcnow() + timedelta(minutes=session_obj.autodelete_minutes)
                 await add_delivery(chat_id=sent.chat.id, message_id=sent.message_id, delete_at=delete_time)
         except Exception:
-            logger.exception("Failed to deliver a file for token %s: %s", token, traceback.format_exc())
+            logger.exception("Failed to deliver file id %s for token %s", f.tg_file_id if f else "<none>", token)
 
     if session_obj.autodelete_minutes and session_obj.autodelete_minutes > 0:
-        await message.answer(f"Files delivered ({delivered}). They will be deleted after {session_obj.autodelete_minutes} minute(s).")
+        await message.answer(f"Files delivered: {delivered}. They will be deleted after {session_obj.autodelete_minutes} minute(s).")
     else:
-        await message.answer(f"Files delivered ({delivered}). Autodelete disabled for this link.")
+        await message.answer(f"Files delivered: {delivered}. (Autodelete disabled)")
 
 
-# ----------------------------
-# Owner-only: /upload - start FSM
-# ----------------------------
+# -------------------------
+# Owner-only: /upload
+# -------------------------
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
-    """Start an upload session (owner only). Files sent after this are collected until /done or /abort."""
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /upload.")
         return
     state = get_state_for_message(message)
     await state.set_state(UploadStates.waiting_for_files.state)
     await state.update_data(files=[])
-    await message.reply("Upload session started.\nSend files (photos/videos/documents/audio/voice/sticker). When finished send /done. To cancel send /abort.")
+    await message.reply("Upload session started.\nSend files now (photos/videos/documents/audio/voice/sticker). When finished send /done. To cancel send /abort.")
 
 
-# ----------------------------
-# Owner-only: /abort - cancel upload and cleanup forwarded msgs
-# ----------------------------
+# -------------------------
+# Owner-only: /abort
+# -------------------------
 @dp.message_handler(commands=["abort"])
 async def cmd_abort(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -405,21 +436,21 @@ async def cmd_abort(message: types.Message):
     files = data.get("files", []) or []
     removed = 0
     for f in files:
-        fwd_msg_id = f.get("forwarded_upload_channel_message")
-        if fwd_msg_id:
+        ch_fwd_id = f.get("channel_message_id")
+        if ch_fwd_id:
             try:
-                await bot.delete_message(chat_id=UPLOAD_CHANNEL_ID, message_id=fwd_msg_id)
+                await bot.delete_message(chat_id=UPLOAD_CHANNEL_ID, message_id=ch_fwd_id)
                 removed += 1
             except Exception:
                 # ignore deletion errors
                 pass
     await state.finish()
-    await message.reply(f"Upload aborted. Removed {removed} temporary forwarded message(s) from upload channel (if possible).")
+    await message.reply(f"Upload aborted. Removed {removed} forwarded message(s) from upload channel (if possible).")
 
 
-# ----------------------------
-# Owner-only: /done - ask protect and move FSM to awaiting_protect
-# ----------------------------
+# -------------------------
+# Owner-only: /done
+# -------------------------
 @dp.message_handler(commands=["done"])
 async def cmd_done(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -427,34 +458,28 @@ async def cmd_done(message: types.Message):
         return
     state = get_state_for_message(message)
     if await state.get_state() != UploadStates.waiting_for_files.state:
-        await message.reply("No active upload session. Use /upload to start one.")
+        await message.reply("No active upload session. Start one with /upload.")
         return
     data = await state.get_data()
     files = data.get("files", []) or []
     if not files:
         await state.finish()
-        await message.reply("No files were uploaded. Upload canceled.")
+        await message.reply("No files uploaded. Upload canceled.")
         return
-    await message.reply("Protect content? Reply with `on` or `off`.\nProtect prevents saving/forwarding on some clients.")
+    await message.reply("Protect content? Reply with `on` or `off`.")
     await state.set_state(UploadStates.awaiting_protect.state)
 
 
-# ----------------------------
-# Generic handler: collects files and handles protect/autodelete responses
-# ----------------------------
+# -------------------------
+# Generic handler: accepts files during upload FSM and accepts protect/autodelete replies
+# -------------------------
 @dp.message_handler()
 async def generic_handler(message: types.Message):
-    """
-    Handles three FSM states:
-    - waiting_for_files: forward files to upload channel and store metadata in FSM
-    - awaiting_protect: read 'on'/'off' and ask autodelete minutes
-    - awaiting_autodelete: read minutes (0-10080), finalize upload
-    """
     state = get_state_for_message(message)
-    curr_state = await state.get_state()
+    curr = await state.get_state()
 
     # awaiting_protect
-    if curr_state == UploadStates.awaiting_protect.state:
+    if curr == UploadStates.awaiting_protect.state:
         text = (message.text or "").strip().lower()
         if text not in ("on", "off"):
             await message.reply("Please reply with `on` or `off`.")
@@ -466,21 +491,20 @@ async def generic_handler(message: types.Message):
         return
 
     # awaiting_autodelete
-    if curr_state == UploadStates.awaiting_autodelete.state:
+    if curr == UploadStates.awaiting_autodelete.state:
         text = (message.text or "").strip()
         try:
             minutes = int(text)
             if minutes < 0 or minutes > 10080:
                 raise ValueError
             await state.update_data(autodelete=minutes)
-            # finalize upload
             await finalize_upload_flow(message=message, state=state)
         except ValueError:
-            await message.reply("Please send an integer between 0 and 10080 (minutes).")
+            await message.reply("Please send an integer between 0 and 10080.")
         return
 
-    # waiting_for_files: accept supported media
-    if curr_state == UploadStates.waiting_for_files.state:
+    # waiting_for_files
+    if curr == UploadStates.waiting_for_files.state:
         ftype = None
         orig_file_id = None
         caption = None
@@ -513,35 +537,74 @@ async def generic_handler(message: types.Message):
             await message.reply("Send supported files (photo/video/document/audio/voice/sticker) or /done to finish, /abort to cancel.")
             return
 
-        # forward the message to the upload channel so Telegram stores it there
+        # Forward to upload channel and capture channel-side file id immediately (reliable)
         try:
             fwd_msg = await bot.forward_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
-            fwd_id = fwd_msg.message_id
         except Exception as e:
-            logger.exception("Failed to forward to upload channel: %s", e)
-            await message.reply("Failed to forward to the upload channel. Ensure the bot is admin and can post there.")
+            logger.exception("Forward to upload channel failed: %s", e)
+            await message.reply("Failed to forward to the upload channel. Ensure bot is admin and can post there.")
             return
 
-        # append metadata to FSM
+        # Extract file_id from the forwarded message object (channel-side stable file id)
+        channel_file_id = None
+        channel_file_type = None
+        channel_caption = None
+        try:
+            if fwd_msg.photo:
+                channel_file_type = "photo"
+                channel_file_id = fwd_msg.photo[-1].file_id
+                channel_caption = fwd_msg.caption or ""
+            elif fwd_msg.video:
+                channel_file_type = "video"
+                channel_file_id = fwd_msg.video.file_id
+                channel_caption = fwd_msg.caption or ""
+            elif fwd_msg.document:
+                channel_file_type = "document"
+                channel_file_id = fwd_msg.document.file_id
+                channel_caption = fwd_msg.caption or ""
+            elif fwd_msg.audio:
+                channel_file_type = "audio"
+                channel_file_id = fwd_msg.audio.file_id
+                channel_caption = fwd_msg.caption or ""
+            elif fwd_msg.voice:
+                channel_file_type = "voice"
+                channel_file_id = fwd_msg.voice.file_id
+                channel_caption = ""
+            elif fwd_msg.sticker:
+                channel_file_type = "sticker"
+                channel_file_id = fwd_msg.sticker.file_id
+                channel_caption = ""
+            else:
+                # fallback to original metadata captured earlier
+                channel_file_type = ftype
+                channel_file_id = orig_file_id
+                channel_caption = caption
+        except Exception:
+            logger.exception("Error extracting file id from forwarded message; falling back to captured ids.")
+            channel_file_type = ftype
+            channel_file_id = orig_file_id
+            channel_caption = caption
+
+        # Save in FSM state list
         data = await state.get_data()
         files = data.get("files", []) or []
         files.append({
-            "file_type": ftype,
-            "orig_file_id": orig_file_id,
-            "caption": caption,
-            "forwarded_upload_channel_message": fwd_id,
+            "file_type": channel_file_type,
+            "channel_file_id": channel_file_id,
+            "caption": channel_caption,
+            "channel_message_id": fwd_msg.message_id,
         })
         await state.update_data(files=files)
-        await message.reply(f"Saved {ftype}. Send more files or /done when finished.")
+        await message.reply(f"Saved {channel_file_type}. Send more or /done to finish.")
         return
 
-    # not in FSM: ignore other messages
+    # not part of FSM, ignore other messages
     return
 
 
-# ----------------------------
-# Finalize upload: persist session + files & reply deep link
-# ----------------------------
+# -------------------------
+# Finalize upload: persist session + files into DB and return deep link
+# -------------------------
 async def finalize_upload_flow(message: types.Message, state: FSMContext):
     data = await state.get_data()
     files = data.get("files", []) or []
@@ -559,60 +622,19 @@ async def finalize_upload_flow(message: types.Message, state: FSMContext):
             link=token,
             owner_id=OWNER_ID,
             protect_content=bool(protect),
-            autodelete_minutes=int(autodelete)
+            autodelete_minutes=int(autodelete),
         )
         db.add(session_row)
-        await db.flush()  # populate session_row.id
+        await db.flush()  # ensure session_row.id is available
 
         order_idx = 1
         for entry in files:
-            fwd_msg_id = entry.get("forwarded_upload_channel_message")
-            file_type = None
-            file_id = None
-            caption = None
-            try:
-                # Read message from upload channel to get stable file_id saved in channel
-                fwd_msg = await bot.get_message(chat_id=UPLOAD_CHANNEL_ID, message_id=fwd_msg_id)
-                if fwd_msg.photo:
-                    file_type = "photo"
-                    file_id = fwd_msg.photo[-1].file_id
-                    caption = fwd_msg.caption or ""
-                elif fwd_msg.video:
-                    file_type = "video"
-                    file_id = fwd_msg.video.file_id
-                    caption = fwd_msg.caption or ""
-                elif fwd_msg.document:
-                    file_type = "document"
-                    file_id = fwd_msg.document.file_id
-                    caption = fwd_msg.caption or ""
-                elif fwd_msg.audio:
-                    file_type = "audio"
-                    file_id = fwd_msg.audio.file_id
-                    caption = fwd_msg.caption or ""
-                elif fwd_msg.voice:
-                    file_type = "voice"
-                    file_id = fwd_msg.voice.file_id
-                    caption = ""
-                elif fwd_msg.sticker:
-                    file_type = "sticker"
-                    file_id = fwd_msg.sticker.file_id
-                    caption = ""
-                else:
-                    # fallback to original data captured earlier
-                    file_type = entry.get("file_type")
-                    file_id = entry.get("orig_file_id")
-                    caption = entry.get("caption", "")
-            except Exception as e:
-                # If get_message fails (rare), fallback to original captured id
-                logger.warning("Could not fetch forwarded message %s in upload channel: %s", fwd_msg_id, e)
-                file_type = entry.get("file_type")
-                file_id = entry.get("orig_file_id")
-                caption = entry.get("caption", "")
-
+            file_type = entry.get("file_type")
+            file_id = entry.get("channel_file_id")
+            caption = entry.get("caption", "")
             if not file_id:
-                logger.warning("Skipping file with no file_id in finalize step: %s", entry)
+                logger.warning("Skipping file without id during finalize: %s", entry)
                 continue
-
             fm = FileModel(
                 session_id=session_row.id,
                 tg_file_id=file_id,
@@ -625,21 +647,18 @@ async def finalize_upload_flow(message: types.Message, state: FSMContext):
 
         await db.commit()
 
-    # Prepare deep link for owner to share: t.me/<bot>?start=<token>
     me = await bot.get_me()
     bot_username = me.username or "bot"
     tme_link = f"https://t.me/{bot_username}?start={session_row.link}"
-
     await message.reply(
         f"✅ Upload complete.\nDeep link:\n{tme_link}\n\nProtect content: {'ON' if protect else 'OFF'}\nAutodelete: {autodelete} minute(s)\n\nUse /revoke <token> to disable this link."
     )
-
     await state.finish()
 
 
-# ----------------------------
+# -------------------------
 # Owner-only: /revoke <token>
-# ----------------------------
+# -------------------------
 @dp.message_handler(commands=["revoke"])
 async def cmd_revoke(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -666,9 +685,9 @@ async def cmd_revoke(message: types.Message):
     await message.reply(f"✅ Token revoked: {token}")
 
 
-# ----------------------------
-# Owner-only: /edit_start (reply to a message to set welcome)
-# ----------------------------
+# -------------------------
+# Owner-only: /edit_start (reply to message)
+# -------------------------
 @dp.message_handler(commands=["edit_start"])
 async def cmd_edit_start(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -683,110 +702,138 @@ async def cmd_edit_start(message: types.Message):
         return
     try:
         await save_start_message(content)
-        await message.reply("✅ /start message updated. Placeholders: {first_name} and {word | url} (e.g. {Click | https://example.com})")
+        await message.reply("✅ /start message updated. Placeholders: {first_name} and {word | url}")
     except Exception:
-        logger.exception("Failed to save start message.")
-        await message.reply("Failed to save /start message (see logs).")
+        logger.exception("Failed to save /start message.")
+        await message.reply("Failed to save /start message; check logs.")
 
 
-# ----------------------------
+# -------------------------
 # Owner-only: /help
-# ----------------------------
+# -------------------------
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only the owner can use /help for management commands. Use /start to see welcome.")
+        await message.reply("❌ Only the owner can use /help for management commands. Use /start for welcome.")
         return
-    help_text = (
-        "Owner commands:\n"
-        "/upload - start upload session (owner only)\n"
-        "/done - finalize upload session (owner only)\n"
-        "/abort - cancel upload session (owner only)\n"
+    await message.reply(
+        "/upload - start upload (owner only)\n"
+        "/done - finish upload (owner only)\n"
+        "/abort - cancel upload (owner only)\n"
         "/revoke <token> - revoke link (owner only)\n"
-        "/edit_start - edit the welcome /start message (owner only; reply to a message)\n"
+        "/edit_start - set /start welcome (owner only; reply to message)\n"
         "/help - this help\n\n"
-        "Universal command:\n"
-        "/start - show welcome or use deep link (/start <token>)\n"
+        "Universal:\n"
+        "/start - show welcome or open deep link (/start <token>)"
     )
-    await message.reply(help_text)
 
 
-# ----------------------------
-# Health server (separate port)
-# ----------------------------
-async def health(request):
+# -------------------------
+# Health endpoint
+# -------------------------
+async def health(request: Request):
     return web.Response(text="OK")
 
 
-async def start_health_app():
-    """Start an aiohttp health server on HEALTH_PORT to satisfy uptime monitors."""
-    app = web.Application()
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
+# -------------------------
+# Webhook handler - receives Telegram updates as POSTs
+# -------------------------
+async def handle_webhook(request: Request):
+    """
+    Receive POSTs from Telegram webhook and pass to aiogram Dispatcher for processing.
+    """
     try:
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
-        await site.start()
-        logger.info("Health server started on port %s", HEALTH_PORT)
+        data = await request.json()
+    except Exception as e:
+        logger.warning("Webhook got non-json request: %s", e)
+        return web.Response(status=400, text="Invalid JSON")
+
+    # quick debug log for the update (can be noisy)
+    logger.debug("Received update via webhook: %s", data.get("update_id", "<no id>"))
+
+    try:
+        update = types.Update.de_json(data)
     except Exception:
-        logger.exception("Failed to start health server: %s", traceback.format_exc())
+        # fallback to building Update object manually
+        try:
+            update = types.Update(**data)
+        except Exception:
+            logger.exception("Failed to parse update JSON into types.Update")
+            return web.Response(status=400, text="Bad update")
+
+    try:
+        await dp.process_update(update)
+    except Exception:
+        logger.exception("Dispatcher failed to process update: %s", traceback.format_exc())
+        # still return 200 so Telegram doesn't retry too quickly
+    return web.Response(text="OK")
 
 
-# ----------------------------
-# Startup and shutdown hooks for webhook
-# ----------------------------
-async def on_startup(dp_obj):
-    logger.info("on_startup: initializing DB, setting webhook, starting workers...")
+# -------------------------
+# Application startup/shutdown logic
+# -------------------------
+async def start_app():
+    """
+    Creates aiohttp application, sets webhook URL with Telegram, starts DB + background workers,
+    and then waits forever (until cancellation).
+    """
+    # init DB
     try:
         await init_db()
     except Exception:
-        logger.exception("DB init failed in on_startup.")
+        logger.exception("DB initialization failed on startup")
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(autodelete_worker())
-    loop.create_task(start_health_app())
+    # start autodelete worker
+    asyncio.create_task(autodelete_worker())
 
+    # prepare aiohttp app with webhook and health routes
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    # some clients may send HEAD/GET to the path; handle them gracefully
+    app.router.add_get(WEBHOOK_PATH, lambda request: web.Response(text="Webhook endpoint (GET)"))
+    app.router.add_get("/health", health)
+    app.router.add_head("/", lambda request: web.Response(status=200, text="OK"))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info("aiohttp server started on port %s", PORT)
+
+    # set webhook with Telegram
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception:
         logger.exception("Failed to set webhook to %s", WEBHOOK_URL)
 
-
-async def on_shutdown(dp_obj):
-    logger.info("on_shutdown: deleting webhook and closing resources...")
+    # keep running until cancelled
     try:
-        await bot.delete_webhook()
-    except Exception:
-        logger.exception("Failed to delete webhook")
-    try:
-        await dp.storage.close()
-        await dp.storage.wait_closed()
-    except Exception:
-        logger.exception("Error closing FSM storage")
-    try:
-        await bot.close()
-    except Exception:
-        logger.exception("Error closing bot")
+        await asyncio.Event().wait()
+    finally:
+        logger.info("Shutdown initiated: deleting webhook and cleaning up server")
+        try:
+            await bot.delete_webhook()
+        except Exception:
+            logger.exception("Failed to delete webhook during shutdown")
+        await runner.cleanup()
+        try:
+            await bot.close()
+        except Exception:
+            logger.exception("Failed to close bot session")
 
 
-# ----------------------------
-# Entrypoint: start webhook server (binds to PORT)
-# ----------------------------
+# -------------------------
+# Entrypoint
+# -------------------------
 def main():
-    logger.info("Starting webhook server on port %s and health server on port %s", PORT, HEALTH_PORT)
+    logger.info("Starting bot - webhook host=%s port=%s", WEBHOOK_HOST, PORT)
     try:
-        start_webhook(
-            dispatcher=dp,
-            webhook_path=WEBHOOK_PATH,
-            skip_updates=True,
-            on_startup=on_startup,
-            on_shutdown=on_shutdown,
-            host="0.0.0.0",
-            port=PORT,
-        )
+        asyncio.run(start_app())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down (keyboard/system exit)")
     except Exception:
-        logger.exception("Failed to start webhook: %s", traceback.format_exc())
+        logger.exception("Unhandled exception in main")
 
 
 if __name__ == "__main__":
