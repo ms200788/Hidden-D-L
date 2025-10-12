@@ -1,16 +1,19 @@
 # bot.py
 """
-Aiogram 2.25.0 — Session-based file-sharing bot (webhook)
-- Webhook mode using aiohttp
-- Async SQLAlchemy + asyncpg for persistence (store only metadata + telegram file_ids)
-- Uploads forwarded to a private upload channel; DB stores stable channel file_ids
-- Owner-only upload flow: /upload -> send files -> /done -> on/off -> autodelete minutes -> published deep link
-- /edit_start: reply to text or photo (photo + caption saved) to set /start welcome
-- /start: welcome or deep link (/start <token>) to deliver files in order and captions
-- /revoke: owner revokes a token
-- Autodelete worker persists and removes delivered messages per-session autodelete setting
-- Designed to work on Render with webhook + /health
+Final session file-sharing Telegram bot (aiogram 2.25.0)
+Features:
+ - Webhook mode (aiohttp)
+ - PostgreSQL via SQLAlchemy async + asyncpg
+ - Auto-create tables and safe auto-migration of missing columns
+ - Draft upload flow persisted in DB; forwarded files saved in upload channel with stable file_ids
+ - Up to 99 files per session (all Telegram file types supported)
+ - Owner-only management commands (/upload, /done, /abort, /revoke, /edit_start, /help)
+ - Public /start which also handles deep-link (/start <token>) delivering files in exact order
+ - protect_content option and autodelete timer per session
+ - Autodelete worker persists deliveries and deletes after timer
+ - Health endpoint for uptime checks
 """
+
 # Standard library
 import os
 import sys
@@ -21,11 +24,11 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
-# aiohttp for webhook server
+# aiohttp for webhook & health endpoints
 from aiohttp import web
 from aiohttp.web_request import Request
 
-# aiogram v2
+# aiogram v2 imports
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
@@ -40,33 +43,42 @@ from sqlalchemy import (
     select,
     func,
     Index,
+    text as sa_text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-# ----------------------------
+# ---------------------------
 # Logging & configuration
-# ----------------------------
+# ---------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger("session_share_bot")
 
+# Environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID_ENV = os.environ.get("OWNER_ID", "6169237879")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # must include +asyncpg
 UPLOAD_CHANNEL_ID_ENV = os.environ.get("UPLOAD_CHANNEL_ID")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # https://yourdomain
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://hidden-fnxx.onrender.com
 PORT = int(os.environ.get("PORT", "10000"))
 MAX_CONCURRENT_DELIVERIES = int(os.environ.get("MAX_CONCURRENT_DELIVERIES", "50"))
 MAX_FILES_PER_SESSION = int(os.environ.get("MAX_FILES_PER_SESSION", "99"))
 
 _missing = []
-if not BOT_TOKEN: _missing.append("BOT_TOKEN")
-if not OWNER_ID_ENV: _missing.append("OWNER_ID")
-if not DATABASE_URL: _missing.append("DATABASE_URL")
-if not UPLOAD_CHANNEL_ID_ENV: _missing.append("UPLOAD_CHANNEL_ID")
-if not WEBHOOK_HOST: _missing.append("WEBHOOK_HOST")
+if not BOT_TOKEN:
+    _missing.append("BOT_TOKEN")
+if not OWNER_ID_ENV:
+    _missing.append("OWNER_ID")
+if not DATABASE_URL:
+    _missing.append("DATABASE_URL")
+if not UPLOAD_CHANNEL_ID_ENV:
+    _missing.append("UPLOAD_CHANNEL_ID")
+if not WEBHOOK_HOST:
+    _missing.append("WEBHOOK_HOST")
 if _missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(_missing))
 
@@ -83,12 +95,12 @@ except Exception:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
-logger.info("Config: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s",
+logger.info("Configuration: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s",
             OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_HOST, PORT)
 
-# ----------------------------
-# Database models
-# ----------------------------
+# ---------------------------
+# Database models & engine
+# ---------------------------
 Base = declarative_base()
 
 
@@ -110,8 +122,8 @@ class FileModel(Base):
     __tablename__ = "files"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
-    tg_file_id = Column(String, nullable=False)
-    file_type = Column(String(32), nullable=False)
+    tg_file_id = Column(String, nullable=False)  # stable channel file_id
+    file_type = Column(String(32), nullable=False)  # photo, video, document, audio, voice, sticker, animation...
     caption = Column(String, nullable=True)
     order_index = Column(Integer, nullable=False)
 
@@ -129,42 +141,66 @@ class DeliveryModel(Base):
 class StartMessage(Base):
     __tablename__ = "start_message"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    content = Column(String, nullable=True)          # text content (may include {first_name}, {label | url})
-    photo_file_id = Column(String, nullable=True)    # optional photo file_id to present image+caption welcome
+    content = Column(String, nullable=True)
+    photo_file_id = Column(String, nullable=True)  # newly added column (auto-migration ensures existence)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 Index("ix_files_session_order", FileModel.session_id, FileModel.order_index)
 
-# ----------------------------
-# Async engine & sessionmaker
-# ----------------------------
-# DATABASE_URL must be like: postgresql+asyncpg://user:pass@host:port/dbname
+# Async engine and sessionmaker
+# DATABASE_URL must be e.g. postgresql+asyncpg://user:pass@host:port/dbname
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def init_db() -> None:
-    logger.info("Initializing DB (create tables if needed)...")
+# ---------------------------
+# Auto-migration helper
+# ---------------------------
+async def ensure_tables_and_columns():
+    """
+    Create missing tables, then attempt safe column additions for known upgrades.
+    This avoids breaking when new columns are added to StartMessage or other tables.
+    """
+    logger.info("Running DB create_all and safe auto-migrations...")
     async with engine.begin() as conn:
+        # create all tables if not present
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("DB initialized.")
+
+        # Safe add commonly-missing columns using raw SQL IF NOT EXISTS for Postgres
+        # For portability we try ALTER TABLE and ignore errors.
+        # Add StartMessage.photo_file_id if missing
+        try:
+            await conn.execute(sa_text("ALTER TABLE start_message ADD COLUMN IF NOT EXISTS photo_file_id TEXT"))
+            # We may add other safe migrations here in future
+        except Exception as e:
+            logger.warning("Auto-migration (photo_file_id) may have failed or not required: %s", e)
+
+    logger.info("Auto-migration attempted.")
 
 
-# ----------------------------
-# Aiogram bot & dispatcher (v2)
-# ----------------------------
+# ---------------------------
+# Aiogram setup (v2)
+# ---------------------------
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
+# semaphore to limit concurrent deliveries
 delivery_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DELIVERIES)
 
-# ----------------------------
-# Utilities & DB helpers
-# ----------------------------
+# ---------------------------
+# Utility & DB helper functions
+# ---------------------------
 def generate_token(length: int = 64) -> str:
     return secrets.token_urlsafe(length)[:length]
+
+
+async def init_db():
+    logger.info("Initializing DB and applying migrations...")
+    # create tables / migrate as needed
+    await ensure_tables_and_columns()
+    logger.info("DB ready.")
 
 
 async def create_draft_session(owner_id: int) -> SessionModel:
@@ -273,7 +309,7 @@ async def schedule_delivery(chat_id: int, message_id: int, delete_at: Optional[d
         rec = DeliveryModel(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
         db.add(rec)
         await db.commit()
-    logger.debug("Scheduled deletion %s:%s at %s", chat_id, message_id, delete_at.isoformat())
+    logger.debug("Scheduled deletion for %s:%s at %s", chat_id, message_id, delete_at.isoformat())
 
 
 async def save_start_message(content: Optional[str], photo_file_id: Optional[str] = None):
@@ -289,7 +325,7 @@ async def save_start_message(content: Optional[str], photo_file_id: Optional[str
             rec = StartMessage(content=content, photo_file_id=photo_file_id)
             db.add(rec)
         await db.commit()
-    logger.info("/start message saved (text:%s photo:%s)", bool(content), bool(photo_file_id))
+    logger.info("Saved /start message (text present=%s, photo present=%s)", bool(content), bool(photo_file_id))
 
 
 async def fetch_start_message() -> Tuple[Optional[str], Optional[str]]:
@@ -302,9 +338,9 @@ async def fetch_start_message() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-# ----------------------------
-# Send helper (protect_content support fallback)
-# ----------------------------
+# ---------------------------
+# Sending helper with protect_content fallback
+# ---------------------------
 async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str, caption: Optional[str], protect: bool):
     kwargs: Dict[str, Any] = {}
     if caption:
@@ -330,7 +366,7 @@ async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str,
         else:
             return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
     except TypeError:
-        # fallback if protect_content not supported
+        # fallback without protect_content
         kwargs.pop("protect_content", None)
         if file_type == "photo":
             return await bot.send_photo(chat_id=chat_id, photo=tg_file_id, **kwargs)
@@ -351,13 +387,13 @@ async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str,
         else:
             return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
     except Exception:
-        logger.exception("Error sending media")
+        logger.exception("Failed to send media to %s", chat_id)
         raise
 
 
-# ----------------------------
+# ---------------------------
 # Autodelete worker
-# ----------------------------
+# ---------------------------
 AUTODELETE_CHECK_INTERVAL = 30  # seconds
 
 
@@ -381,20 +417,19 @@ async def autodelete_worker():
                     try:
                         await db.delete(rec)
                     except Exception:
-                        logger.exception("Autodelete: failed to remove DB record %s", rec.id)
+                        logger.exception("Autodelete: failed to delete DB record")
                 await db.commit()
         except Exception:
-            logger.exception("Autodelete worker exception: %s", traceback.format_exc())
+            logger.exception("Error in autodelete worker: %s", traceback.format_exc())
         await asyncio.sleep(AUTODELETE_CHECK_INTERVAL)
 
 
-# ----------------------------
-# Handlers
-# ----------------------------
-# /start - greeting or deep link
+# ---------------------------
+# Message handlers
+# ---------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # parse args - robust for aiogram v2
+    # support deep-link arg parsing
     args = ""
     if message.text:
         parts = message.text.split(maxsplit=1)
@@ -413,7 +448,7 @@ async def cmd_start(message: types.Message):
                     logger.exception("Failed to send /start fallback")
         else:
             if content:
-                # convert {label | url} to HTML links
+                # process {label | url}
                 rendered = (content or "").replace("{first_name}", message.from_user.first_name or "")
                 out: List[str] = []
                 i = 0
@@ -443,7 +478,7 @@ async def cmd_start(message: types.Message):
                 await message.answer(f"Welcome, {message.from_user.first_name or 'friend'}!")
         return
 
-    # treat args as token
+    # deep link mode
     token = args
     session_obj = await get_session_by_token(token)
     if not session_obj:
@@ -482,7 +517,6 @@ async def cmd_start(message: types.Message):
         await message.answer(f"Files delivered: {delivered}. (Autodelete disabled)")
 
 
-# /upload - owner only
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -493,25 +527,26 @@ async def cmd_upload(message: types.Message):
         await message.reply(f"You already have an active draft session. Continue sending files or use /done. Draft token: {existing.link}")
         return
     rec = await create_draft_session(OWNER_ID)
-    await message.reply(f"Upload session started.\nDraft token: {rec.link}\nSend up to {MAX_FILES_PER_SESSION} files (any type). When finished send /done. To cancel send /abort.")
+    await message.reply(f"Upload session started.\nDraft token: {rec.link}\nSend up to {MAX_FILES_PER_SESSION} files (any Telegram type). When finished send /done. To cancel send /abort.")
 
 
-# media handler for owner while draft exists
+# Accept all common media content types owner may send
 @dp.message_handler(content_types=["photo", "video", "document", "audio", "voice", "sticker", "animation"])
 async def handle_owner_media(message: types.Message):
+    # Only owner uploads
     if message.from_user.id != OWNER_ID:
         return
 
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft:
+        # Ignore messages outside an upload session.
         return
 
     files = await list_files_for_session(draft.id)
     if len(files) >= MAX_FILES_PER_SESSION:
-        await message.reply(f"Upload limit reached ({MAX_FILES_PER_SESSION}). Use /done to finalize or /abort to cancel.")
+        await message.reply(f"Upload limit reached ({MAX_FILES_PER_SESSION}). Use /done or /abort.")
         return
 
-    # determine file type and file_id
     ftype = None
     orig_file_id = None
     caption = None
@@ -531,51 +566,51 @@ async def handle_owner_media(message: types.Message):
         elif message.animation:
             ftype = "animation"; orig_file_id = message.animation.file_id; caption = message.caption or ""
     except Exception:
-        logger.exception("Error parsing owner media")
+        logger.exception("Error parsing owner's media")
         await message.reply("Failed to read the file. Try again.")
         return
 
-    # forward to upload channel to get stable file_id
+    # Forward to upload channel (bot must be admin)
     try:
-        fwd = await bot.forward_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        forwarded = await bot.forward_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
     except Exception as e:
-        logger.exception("Failed to forward to upload channel: %s", e)
-        await message.reply("Failed to forward to upload channel. Ensure bot is admin and can post there.")
+        logger.exception("Failed to forward message to upload channel: %s", e)
+        await message.reply("Failed to forward to upload channel. Ensure the bot is admin there.")
         return
 
-    # extract stable id from forwarded
+    # Extract stable file_id from forwarded message in upload channel
     channel_file_id = None
     channel_file_type = None
     channel_caption = None
     try:
-        if fwd.photo:
-            channel_file_type = "photo"; channel_file_id = fwd.photo[-1].file_id; channel_caption = fwd.caption or ""
-        elif fwd.video:
-            channel_file_type = "video"; channel_file_id = fwd.video.file_id; channel_caption = fwd.caption or ""
-        elif fwd.document:
-            channel_file_type = "document"; channel_file_id = fwd.document.file_id; channel_caption = fwd.caption or ""
-        elif fwd.audio:
-            channel_file_type = "audio"; channel_file_id = fwd.audio.file_id; channel_caption = fwd.caption or ""
-        elif fwd.voice:
-            channel_file_type = "voice"; channel_file_id = fwd.voice.file_id; channel_caption = ""
-        elif fwd.sticker:
-            channel_file_type = "sticker"; channel_file_id = fwd.sticker.file_id; channel_caption = ""
-        elif fwd.animation:
-            channel_file_type = "animation"; channel_file_id = fwd.animation.file_id; channel_caption = fwd.caption or ""
+        if forwarded.photo:
+            channel_file_type = "photo"; channel_file_id = forwarded.photo[-1].file_id; channel_caption = forwarded.caption or ""
+        elif forwarded.video:
+            channel_file_type = "video"; channel_file_id = forwarded.video.file_id; channel_caption = forwarded.caption or ""
+        elif forwarded.document:
+            channel_file_type = "document"; channel_file_id = forwarded.document.file_id; channel_caption = forwarded.caption or ""
+        elif forwarded.audio:
+            channel_file_type = "audio"; channel_file_id = forwarded.audio.file_id; channel_caption = forwarded.caption or ""
+        elif forwarded.voice:
+            channel_file_type = "voice"; channel_file_id = forwarded.voice.file_id; channel_caption = ""
+        elif forwarded.sticker:
+            channel_file_type = "sticker"; channel_file_id = forwarded.sticker.file_id; channel_caption = ""
+        elif forwarded.animation:
+            channel_file_type = "animation"; channel_file_id = forwarded.animation.file_id; channel_caption = forwarded.caption or ""
         else:
             channel_file_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
     except Exception:
-        logger.exception("Error extracting channel file id; fallback to original")
+        logger.exception("Failed to extract stable file_id; falling back to original")
         channel_file_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
 
-    # save metadata in DB
+    # Save metadata in DB
     try:
         await append_file_to_session(draft.id, channel_file_id, channel_file_type, channel_caption)
         current_count = len(await list_files_for_session(draft.id))
         await message.reply(f"Saved {channel_file_type}. ({current_count}/{MAX_FILES_PER_SESSION}) Send more or /done when finished.")
     except Exception:
         logger.exception("Failed to append file to DB")
-        await message.reply("Failed to save file info to DB. Try again or /abort.")
+        await message.reply("Failed to save file metadata to DB. Try again or abort with /abort.")
 
 
 @dp.message_handler(commands=["done"])
@@ -589,18 +624,20 @@ async def cmd_done(message: types.Message):
         return
     files = await list_files_for_session(draft.id)
     if not files:
-        await message.reply("No files uploaded in this session. Upload files first or /abort.")
+        await message.reply("No files uploaded in this session. Upload files first.")
         return
-    # ask protect then autodelete
+    # Ask protective option
     await set_session_status(draft.id, "awaiting_protect")
-    await message.reply("Protect content? Reply with `on` or `off`.")
+    await message.reply("Protect content? Reply with `on` or `off`. (Owner bypasses protect.)")
 
 
-# owner replies 'on'/'off' (awaiting_protect)
+# Owner replies with on/off when awaiting_protect
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().lower() in ("on", "off"))
 async def owner_protect_reply(message: types.Message):
     draft = await get_owner_active_draft(OWNER_ID)
-    if not draft or draft.status != "awaiting_protect":
+    if not draft:
+        return
+    if draft.status != "awaiting_protect":
         return
     text = (message.text or "").strip().lower()
     protect = text == "on"
@@ -615,14 +652,16 @@ async def owner_protect_reply(message: types.Message):
         rec.status = "awaiting_autodelete"
         db.add(rec)
         await db.commit()
-    await message.reply(f"Protect set to {'ON' if protect else 'OFF'}. Now reply with autodelete minutes (0 - 10080). 0 = no autodelete.")
+    await message.reply(f"Protect set to {'ON' if protect else 'OFF'}. Now reply with autodelete minutes (0 - 10080). 0 = disabled.")
 
 
-# owner replies minutes (awaiting_autodelete)
+# Owner replies with minutes when awaiting_autodelete
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().isdigit())
 async def owner_autodelete_reply(message: types.Message):
     draft = await get_owner_active_draft(OWNER_ID)
-    if not draft or draft.status != "awaiting_autodelete":
+    if not draft:
+        return
+    if draft.status != "awaiting_autodelete":
         return
     text = (message.text or "").strip()
     try:
@@ -630,7 +669,7 @@ async def owner_autodelete_reply(message: types.Message):
         if minutes < 0 or minutes > 10080:
             raise ValueError
     except ValueError:
-        await message.reply("Send integer minutes between 0 and 10080.")
+        await message.reply("Please send an integer between 0 and 10080.")
         return
     rec = await set_protect_and_autodelete(draft.id, draft.protect_content, minutes)
     if not rec:
@@ -639,7 +678,7 @@ async def owner_autodelete_reply(message: types.Message):
     me = await bot.get_me()
     bot_username = me.username or "bot"
     deep_link = f"https://t.me/{bot_username}?start={rec.link}"
-    await message.reply(f"✅ Session published.\nDeep link: {deep_link}\nProtect: {'ON' if rec.protect_content else 'OFF'}\nAutodelete: {rec.autodelete_minutes} minute(s)\nShare this link.")
+    await message.reply(f"✅ Session published.\nDeep link:\n{deep_link}\nProtect: {'ON' if rec.protect_content else 'OFF'}\nAutodelete: {rec.autodelete_minutes} minute(s)\nShare this link.")
 
 
 @dp.message_handler(commands=["abort"])
@@ -653,7 +692,7 @@ async def cmd_abort(message: types.Message):
         return
     ok = await delete_draft_session(draft.id)
     if ok:
-        await message.reply("Upload aborted and draft removed from DB. Forwarded messages in upload channel remain (we didn't store message ids).")
+        await message.reply("Upload aborted and draft removed. Forwarded messages in upload channel remain (we didn't store their message ids).")
     else:
         await message.reply("Failed to abort session.")
 
@@ -661,7 +700,7 @@ async def cmd_abort(message: types.Message):
 @dp.message_handler(commands=["revoke"])
 async def cmd_revoke(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only the owner can /revoke.")
+        await message.reply("❌ Only the owner can revoke links.")
         return
     parts = message.text.strip().split()
     if len(parts) < 2:
@@ -681,7 +720,7 @@ async def cmd_edit_start(message: types.Message):
         await message.reply("❌ Only the owner can use /edit_start.")
         return
     if not message.reply_to_message:
-        await message.reply("Reply to a message (text or photo) to set /start. Photo+caption will be used if you reply to an image.")
+        await message.reply("Reply to a message (text or photo) to set /start. Photo + caption will be used when replying to an image.")
         return
     reply = message.reply_to_message
     # photo + caption
@@ -691,15 +730,15 @@ async def cmd_edit_start(message: types.Message):
         await save_start_message(caption, photo_file_id)
         await message.reply("✅ /start updated with image + caption (if caption present).")
         return
-    # text
+    # text-only
     if reply.text:
         await save_start_message(reply.text, None)
         await message.reply("✅ /start updated with text.")
         return
-    # caption (document/case)
+    # caption-only
     if reply.caption:
         await save_start_message(reply.caption, None)
-        await message.reply("✅ /start updated with caption text.")
+        await message.reply("✅ /start updated with caption.")
         return
     await message.reply("Unsupported message type. Reply to text or photo.")
 
@@ -707,28 +746,29 @@ async def cmd_edit_start(message: types.Message):
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only the owner can use /help.")
+        await message.reply("❌ Only the owner can use /help for management.")
         return
     await message.reply(
         "/upload - start upload (owner only)\n"
-        "/done - finalize upload (owner only) and reply to prompts\n"
+        "/done - finalize upload and reply to prompts (owner only)\n"
         "/abort - cancel upload (owner only)\n"
-        "/revoke <token> - revoke link (owner only)\n"
-        "/edit_start - reply to message to set /start (photo or text)\n"
+        "/revoke <token> - revoke session (owner only)\n"
+        "/edit_start - reply to a message to set /start (owner only)\n"
         "/help - this message\n\n"
-        "Public: /start - show welcome or open deep link (/start <token>)"
+        "Public:\n"
+        "/start - show welcome or use /start <token> to fetch files"
     )
 
 
-# fallback do nothing
 @dp.message_handler()
 async def fallback(message: types.Message):
+    # Intentionally ignore unrelated messages to avoid noisy replies
     return
 
 
-# ----------------------------
+# ---------------------------
 # Webhook handler (aiohttp)
-# ----------------------------
+# ---------------------------
 async def webhook_handler(request: Request):
     try:
         data = await request.json()
@@ -740,10 +780,10 @@ async def webhook_handler(request: Request):
         try:
             update = types.Update(**data)
         except Exception:
-            logger.exception("Failed to parse update")
+            logger.exception("Failed to parse update JSON")
             return web.Response(status=400, text="bad update")
 
-    # ensure current bot & dispatcher in context so message.answer() works properly
+    # ensure aiogram context for message.answer() and send functions
     try:
         Bot.set_current(bot)
     except Exception:
@@ -752,7 +792,7 @@ async def webhook_handler(request: Request):
         Dispatcher.set_current(dp)
     except Exception:
         try:
-            dp.set_current(dp)  # fallback
+            dp.set_current(dp)
         except Exception:
             pass
 
@@ -763,26 +803,26 @@ async def webhook_handler(request: Request):
     return web.Response(text="OK")
 
 
-# health endpoint for uptime monitors
+# Health endpoint
 async def health_handler(request: Request):
     return web.Response(text="OK")
 
 
-# ----------------------------
-# Startup & run
-# ----------------------------
+# ---------------------------
+# Startup and run
+# ---------------------------
 async def start_services_and_run():
-    # init database
+    # Initialize DB + auto-migration
     try:
         await init_db()
     except Exception:
         logger.exception("init_db failed")
 
-    # start autodelete worker
+    # Start autodelete worker
     asyncio.create_task(autodelete_worker())
-    logger.info("Autodelete worker started")
+    logger.info("Autodelete worker started; checking every %s seconds", AUTODELETE_CHECK_INTERVAL)
 
-    # start aiohttp app
+    # Build aiohttp app with webhook and health endpoints
     app = web.Application()
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
     app.router.add_get(WEBHOOK_PATH, lambda req: web.Response(text="Webhook endpoint (GET)"))
@@ -793,9 +833,9 @@ async def start_services_and_run():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info("aiohttp started on port %s", PORT)
+    logger.info("aiohttp server started on port %s", PORT)
 
-    # set webhook
+    # register webhook with Telegram
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
@@ -803,26 +843,26 @@ async def start_services_and_run():
         logger.exception("Failed to set webhook to %s", WEBHOOK_URL)
 
     try:
-        await asyncio.Event().wait()
+        await asyncio.Event().wait()  # run forever
     finally:
-        logger.info("Shutting down: removing webhook and cleanup")
+        logger.info("Shutting down: removing webhook & cleanup")
         try:
             await bot.delete_webhook()
         except Exception:
-            logger.exception("Failed to delete webhook")
+            logger.exception("Failed to delete webhook during shutdown")
         await runner.cleanup()
         try:
             await bot.close()
         except Exception:
-            logger.exception("Failed to close bot session")
+            logger.exception("Failed to close bot cleanly")
 
 
 def main():
-    logger.info("Starting bot main, webhook_host=%s port=%s", WEBHOOK_HOST, PORT)
+    logger.info("Launching session_share_bot; webhook host=%s port=%s", WEBHOOK_HOST, PORT)
     try:
         asyncio.run(start_services_and_run())
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt - exit")
+        logger.info("Shutting down due to KeyboardInterrupt")
     except Exception:
         logger.exception("Fatal error in main")
         sys.exit(1)
