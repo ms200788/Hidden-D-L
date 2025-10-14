@@ -1,10 +1,10 @@
 # bot.py
-# Session-share Telegram bot (single file) - Fixed version (photo in /edit_start, deep link summary on publish)
+# Session-share Telegram bot (single file) - Fixed only: photo in /edit_start and deep link delivery
 #
 # Required env vars:
 # BOT_TOKEN, OWNER_ID, DATABASE_URL, UPLOAD_CHANNEL_ID, WEBHOOK_HOST
 #
-# Deploy as before (webhook + /health). Bot username set to @Code_66_bot for deep links.
+# Keep webhook deployment as before.
 # ------------------------------------------------------------------------------
 
 import os
@@ -93,8 +93,8 @@ except Exception as e:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
-# IMPORTANT: deep link uses your bot username. You've specified @Code_66_bot
-BOT_USERNAME = "Code_66_bot"  # fixed by your instruction
+# IMPORTANT: deep link uses your bot username. You've previously specified Code_66_bot
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Code_66_bot")
 
 logger.info("Configuration: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s, BOT_USERNAME=%s",
             OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_HOST, PORT, BOT_USERNAME)
@@ -476,12 +476,18 @@ async def fetch_start_message() -> Tuple[Optional[str], Optional[str]]:
 
 
 async def send_media_with_protect(chat_id: int, file_type: str, tg_file_id: str, caption: Optional[str], protect: bool):
+    """
+    Send media keeping caption exactly as provided (rendered HTML) and try protect_content if supported.
+    Returns the sent message object.
+    """
     kwargs: Dict[str, Any] = {}
     if caption:
         kwargs["caption"] = caption
         kwargs["parse_mode"] = "HTML"
-        kwargs["disable_web_page_preview"] = True
+        # NOTE: disable_web_page_preview is not applicable for media sends; avoid using it here.
 
+    # Some versions of aiogram/Telegram don't support protect_content param in send_* methods.
+    # We set it and catch TypeError to fallback.
     try:
         kwargs["protect_content"] = protect
         if file_type == "photo":
@@ -505,6 +511,7 @@ async def send_media_with_protect(chat_id: int, file_type: str, tg_file_id: str,
         else:
             return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
     except TypeError:
+        # fallback if protect_content param not supported
         kwargs.pop("protect_content", None)
         try:
             if file_type == "photo":
@@ -569,7 +576,11 @@ async def autodelete_worker():
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # Save user quietly for broadcast list
+    """
+    /start -> greeting (owner-only config)
+    /start <token> -> deep link delivery (sends files with ONLY original captions)
+    """
+    # Save the user quietly for broadcast list
     try:
         await save_user_if_not_exists(message.from_user)
     except Exception:
@@ -582,18 +593,19 @@ async def cmd_start(message: types.Message):
             args = parts[1].strip()
 
     if not args:
-        # show start message content (photo if set)
+        # show start message content
         content, photo = await fetch_start_message()
         if photo:
-            # Render caption with placeholders
             caption_html = render_text_with_links(content or "", message.from_user.first_name)
             try:
-                await message.answer_photo(photo=photo, caption=caption_html, parse_mode="HTML", disable_web_page_preview=True)
+                # removed unsupported disable_web_page_preview kwarg for photo
+                await message.answer_photo(photo=photo, caption=caption_html, parse_mode="HTML")
                 return
             except Exception:
                 logger.exception("Failed to send start photo fallback")
         if content:
             try:
+                # send_message accepts disable_web_page_preview
                 await message.answer(render_text_with_links(content, message.from_user.first_name), parse_mode="HTML", disable_web_page_preview=True)
             except Exception:
                 await message.answer(content.replace("{first_name}", message.from_user.first_name or ""))
@@ -601,7 +613,7 @@ async def cmd_start(message: types.Message):
             await message.answer(f"Welcome, {message.from_user.first_name or 'friend'}!")
         return
 
-    # token provided -> deliver session files with original captions only
+    # token provided -> fetch session
     token = args
     session_obj = await get_session_by_token(token)
     if not session_obj:
@@ -636,16 +648,18 @@ async def cmd_start(message: types.Message):
         except Exception:
             logger.exception("Failed to deliver file %s for session %s", f.tg_file_id, session_obj.link)
 
-    # Final messaging behaviour: if autodelete set -> send "Delivery complete..." message; else a summary
     if session_obj.autodelete_minutes and session_obj.autodelete_minutes > 0:
         await message.answer(f"Files delivered: {delivered}.")
         await message.answer(f"Delivery complete. Above files will be deleted in {session_obj.autodelete_minutes} minute(s).\n\nNo other data will be sent.")
     else:
         await message.answer(f"Files delivered: {delivered}. (Autodelete disabled)")
 
+    return
+
 
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
+    """ Owner-only: start an upload session (draft). After starting, owner should send files; they will be forwarded to UPLOAD_CHANNEL. """
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /upload.")
         return
@@ -661,7 +675,7 @@ async def cmd_upload(message: types.Message):
         rec = await create_draft_session(OWNER_ID)
         await message.reply(
             f"✅ Upload session started.\nDraft token: {rec.link}\n"
-            f"Send up to {MAX_FILES_PER_SESSION} files (photos/videos/documents/audio/voice/sticker/animation).\n"
+            f"Send up to {MAX_FILES_PER_SESSION} files (photos/videos/documents/audio/voice/sticker/animation). "
             "When finished send /done. To cancel send /abort."
         )
     except Exception:
@@ -671,6 +685,7 @@ async def cmd_upload(message: types.Message):
 
 @dp.message_handler(content_types=["photo", "video", "document", "audio", "voice", "sticker", "animation"])
 async def handle_owner_media(message: types.Message):
+    """ When owner sends media while a draft exists, forward to upload channel and save stable file id to DB as part of session. Non-owner messages: just quietly save user info for broadcast list. """
     # Save user info if it's not owner
     if message.from_user.id != OWNER_ID:
         try:
@@ -681,6 +696,7 @@ async def handle_owner_media(message: types.Message):
 
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft:
+        # No upload in progress; ignore
         return
 
     files = await list_files_for_session(draft.id)
@@ -688,38 +704,25 @@ async def handle_owner_media(message: types.Message):
         await message.reply(f"Upload limit reached ({MAX_FILES_PER_SESSION}). Use /done or /abort.")
         return
 
+    # Determine original file id and type
     ftype = None
     orig_file_id = None
     caption = ""
     try:
         if message.photo:
-            ftype = "photo"
-            orig_file_id = message.photo[-1].file_id
-            caption = message.caption or ""
+            ftype = "photo"; orig_file_id = message.photo[-1].file_id; caption = message.caption or ""
         elif message.video:
-            ftype = "video"
-            orig_file_id = message.video.file_id
-            caption = message.caption or ""
+            ftype = "video"; orig_file_id = message.video.file_id; caption = message.caption or ""
         elif message.document:
-            ftype = "document"
-            orig_file_id = message.document.file_id
-            caption = message.caption or ""
+            ftype = "document"; orig_file_id = message.document.file_id; caption = message.caption or ""
         elif message.audio:
-            ftype = "audio"
-            orig_file_id = message.audio.file_id
-            caption = message.caption or ""
+            ftype = "audio"; orig_file_id = message.audio.file_id; caption = message.caption or ""
         elif message.voice:
-            ftype = "voice"
-            orig_file_id = message.voice.file_id
-            caption = ""
+            ftype = "voice"; orig_file_id = message.voice.file_id; caption = ""
         elif message.sticker:
-            ftype = "sticker"
-            orig_file_id = message.sticker.file_id
-            caption = ""
+            ftype = "sticker"; orig_file_id = message.sticker.file_id; caption = ""
         elif message.animation:
-            ftype = "animation"
-            orig_file_id = message.animation.file_id
-            caption = message.caption or ""
+            ftype = "animation"; orig_file_id = message.animation.file_id; caption = message.caption or ""
     except Exception:
         logger.exception("Failed to parse incoming owner media")
         await message.reply("Failed to parse media. Try again.")
@@ -733,46 +736,29 @@ async def handle_owner_media(message: types.Message):
         await message.reply("Failed to forward to upload channel. Ensure bot is member/admin and channel id is correct.")
         return
 
-    # Extract stable file id from forwarded message
+    # Extract stable file id from the forwarded message (upload channel keeps file accessible)
     try:
         if getattr(fwd, "photo", None):
-            channel_type = "photo"
-            channel_file_id = fwd.photo[-1].file_id
-            channel_caption = fwd.caption or ""
+            channel_type = "photo"; channel_file_id = fwd.photo[-1].file_id; channel_caption = fwd.caption or ""
         elif getattr(fwd, "video", None):
-            channel_type = "video"
-            channel_file_id = fwd.video.file_id
-            channel_caption = fwd.caption or ""
+            channel_type = "video"; channel_file_id = fwd.video.file_id; channel_caption = fwd.caption or ""
         elif getattr(fwd, "document", None):
-            channel_type = "document"
-            channel_file_id = fwd.document.file_id
-            channel_caption = fwd.caption or ""
+            channel_type = "document"; channel_file_id = fwd.document.file_id; channel_caption = fwd.caption or ""
         elif getattr(fwd, "audio", None):
-            channel_type = "audio"
-            channel_file_id = fwd.audio.file_id
-            channel_caption = fwd.caption or ""
+            channel_type = "audio"; channel_file_id = fwd.audio.file_id; channel_caption = fwd.caption or ""
         elif getattr(fwd, "voice", None):
-            channel_type = "voice"
-            channel_file_id = fwd.voice.file_id
-            channel_caption = ""
+            channel_type = "voice"; channel_file_id = fwd.voice.file_id; channel_caption = ""
         elif getattr(fwd, "sticker", None):
-            channel_type = "sticker"
-            channel_file_id = fwd.sticker.file_id
-            channel_caption = ""
+            channel_type = "sticker"; channel_file_id = fwd.sticker.file_id; channel_caption = ""
         elif getattr(fwd, "animation", None):
-            channel_type = "animation"
-            channel_file_id = fwd.animation.file_id
-            channel_caption = fwd.caption or ""
+            channel_type = "animation"; channel_file_id = fwd.animation.file_id; channel_caption = fwd.caption or ""
         else:
-            channel_type = ftype
-            channel_file_id = orig_file_id
-            channel_caption = caption
+            channel_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
     except Exception:
         logger.exception("Failed to extract stable file id from forwarded message; falling back to original")
-        channel_type = ftype
-        channel_file_id = orig_file_id
-        channel_caption = caption
+        channel_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
 
+    # Save metadata to DB
     try:
         await append_file_to_session(draft.id, channel_file_id, channel_type, channel_caption or "")
         current_count = len(await list_files_for_session(draft.id))
@@ -784,6 +770,7 @@ async def handle_owner_media(message: types.Message):
 
 @dp.message_handler(commands=["done"])
 async def cmd_done(message: types.Message):
+    """ Owner only: finalize the draft, ask for protect content and autodelete minutes. After finalization, session is published and summary message posted to upload channel only. """
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /done.")
         return
@@ -804,6 +791,8 @@ async def cmd_done(message: types.Message):
 
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().lower() in ("on", "off"))
 async def handle_protect_reply(message: types.Message):
+    """ Owner replies 'on' or 'off' after /done; set protect_content and ask for autodelete minutes. """
+    # find the latest draft that is awaiting_protect
     async with AsyncSessionLocal() as db:
         stmt = select(SessionModel).where(SessionModel.owner_id == OWNER_ID, SessionModel.status == "awaiting_protect").order_by(SessionModel.created_at.desc()).limit(1)
         res = await db.execute(stmt)
@@ -823,11 +812,14 @@ async def handle_protect_reply(message: types.Message):
 
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().isdigit())
 async def handle_autodelete_reply(message: types.Message):
+    """ Owner replies with autodelete minutes after protect step. Finalize session, set to published and post summary to upload channel only. """
+    # Get latest session awaiting_autodelete
     async with AsyncSessionLocal() as db:
         stmt = select(SessionModel).where(SessionModel.owner_id == OWNER_ID, SessionModel.status == "awaiting_autodelete").order_by(SessionModel.created_at.desc()).limit(1)
         res = await db.execute(stmt)
         draft = res.scalars().first()
         if not draft:
+            # This handler may catch unrelated digits; ignore
             return
         try:
             minutes = int((message.text or "").strip())
@@ -842,30 +834,29 @@ async def handle_autodelete_reply(message: types.Message):
         await db.commit()
         await db.refresh(draft)
 
-    # Compose deep link using BOT_USERNAME you provided
+    # Compose deep link
     deep_link = f"https://t.me/{BOT_USERNAME}?start={draft.link}"
 
+    # Fetch files count
     files = await list_files_for_session(draft.id)
     total = len(files)
 
-    # Prepare formatted summary text exactly as requested
-    protect_str = "ON" if draft.protect_content else "OFF"
-    summary_text = (
-        f"✅ Upload Complete!\n\n"
-        f"Session - {draft.id}\n"
-        f"Deep link - {deep_link}\n"
-        f"No of files in this session - {total}\n"
-        f"Autodelete - {draft.autodelete_minutes}\n"
-        f"Protect content - {protect_str}\n"
-    )
-
-    # Post summary message to upload channel (this is critical)
+    # Post summary message to upload channel ONLY (owner requested)
     try:
-        await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=summary_text)
+        protect_str = "ON" if draft.protect_content else "OFF"
+        summary = (
+            f"✅ Upload Complete!\n\n"
+            f"Session - {draft.id}\n"
+            f"Deep link - {deep_link}\n"
+            f"No of files in this session - {total}\n"
+            f"Autodelete - {draft.autodelete_minutes}\n"
+            f"Protect content - {protect_str}\n"
+        )
+        await bot.send_message(chat_id=UPLOAD_CHANNEL_ID, text=summary)
     except Exception:
-        logger.exception("Failed to send session summary to upload channel")
+        logger.exception("Failed to post session summary to upload channel")
 
-    # Also send the deep link + info privately to owner for confirmation
+    # Send owner confirmation privately
     try:
         owner_msg = (
             f"✅ Session published\n\n"
@@ -880,9 +871,9 @@ async def handle_autodelete_reply(message: types.Message):
     except Exception:
         logger.exception("Failed to send publish confirmation to owner")
 
-    # Inform owner in the chat where /done was called
+    # let owner know in private that session is published
     try:
-        await message.reply("✅ Session published. Summary posted to upload channel and deep link sent to owner.")
+        await message.reply(f"✅ Session published and summary posted to upload channel. Deep link token saved. (Not broadcasted to users.)")
     except Exception:
         logger.exception("Failed to reply to owner after publishing")
 
@@ -922,6 +913,10 @@ async def cmd_revoke(message: types.Message):
 
 @dp.message_handler(commands=["editstart", "edit_start"])
 async def cmd_edit_start(message: types.Message):
+    """
+    Owner should reply to a message (text or photo+caption) with /editstart to set the /start welcome content.
+    The stored start message will be used when users send /start (no args).
+    """
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only owner can use /editstart.")
         return
@@ -943,7 +938,7 @@ async def cmd_edit_start(message: types.Message):
             await save_start_message(reply.text, None)
             await message.reply("✅ /start updated with text.")
             return
-        # If reply has caption only (e.g., media without photo) -> save caption
+        # If reply has caption only -> save caption
         if getattr(reply, "caption", None):
             await save_start_message(reply.caption, None)
             await message.reply("✅ /start updated with caption.")
@@ -956,6 +951,10 @@ async def cmd_edit_start(message: types.Message):
 
 @dp.message_handler(commands=["broadcast"])
 async def cmd_broadcast(message: types.Message):
+    """
+    Owner-only broadcast: reply to a message to broadcast its content to saved users.
+    Supports {first_name} and {word | url} placeholders in text.
+    """
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only owner can broadcast.")
         return
@@ -964,6 +963,7 @@ async def cmd_broadcast(message: types.Message):
         return
     reply = message.reply_to_message
 
+    # gather all users
     async with AsyncSessionLocal() as db:
         stmt = select(UserModel.id)
         res = await db.execute(stmt)
@@ -973,6 +973,7 @@ async def cmd_broadcast(message: types.Message):
         await message.reply("No users to broadcast to.")
         return
 
+    # prepare content
     b_photo = None
     b_text = None
     try:
@@ -1010,7 +1011,8 @@ async def cmd_broadcast(message: types.Message):
             try:
                 if b_photo:
                     caption_html = render_text_with_links(b_text or "", fname)
-                    await bot.send_photo(chat_id=int(uid), photo=b_photo, caption=caption_html, parse_mode="HTML", disable_web_page_preview=True)
+                    # removed unsupported disable_web_page_preview arg for media
+                    await bot.send_photo(chat_id=int(uid), photo=b_photo, caption=caption_html, parse_mode="HTML")
                     sent_count += 1
                 else:
                     await bot.send_message(chat_id=int(uid), text=render_text_with_links(b_text or "", fname), parse_mode="HTML", disable_web_page_preview=True)
@@ -1049,6 +1051,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler()
 async def fallback_handler(message: types.Message):
+    """ Catch-all: store user info for broadcast list and ignore. """
     try:
         await save_user_if_not_exists(message.from_user)
     except Exception:
@@ -1098,6 +1101,7 @@ async def start_services_and_run():
     except Exception:
         logger.exception("init_db failed; proceeding anyway")
 
+    # Start autodelete worker
     asyncio.create_task(autodelete_worker())
     logger.info("Autodelete worker scheduled")
 
@@ -1113,12 +1117,14 @@ async def start_services_and_run():
     await site.start()
     logger.info("aiohttp server started on port %s", PORT)
 
+    # set webhook
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception:
         logger.exception("Failed to set webhook to %s", WEBHOOK_URL)
 
+    # keep running
     try:
         await asyncio.Event().wait()
     finally:
