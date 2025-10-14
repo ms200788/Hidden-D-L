@@ -1,32 +1,25 @@
 # bot.py
 """
-Final corrected session-share Telegram bot (single-file)
-- aiogram v2 compatible
-- async SQLAlchemy + asyncpg
-- BIGINT-safe: all Telegram ID columns use BigInteger (avoids integer out of range)
-- Uses environment variables:
-    BOT_TOKEN
-    OWNER_ID
-    DATABASE_URL (postgresql+asyncpg://...)
-    UPLOAD_CHANNEL_ID (single channel id; set in env)
-    WEBHOOK_HOST (e.g. https://your-app.onrender.com)
-    PORT (optional; default 10000)
-- Upload flow:
-    /upload  (owner only) -> send 1..99 files -> /done -> bot asks Protect on/off -> bot asks autodelete minutes (0..10080)
-    After autodelete value, session is published, deep link created: https://t.me/<bot_username>?start=<token>
-- Files are forwarded to UPLOAD_CHANNEL and only stable file_id stored in DB (low DB storage)
-- /revoke <token> owner-only to disable link
-- /editstart (owner only): reply to message to set start content (supports photo+text or text)
-- /broadcast (owner only): reply to message to broadcast to saved users (supports {first_name} and {word | url})
+Session-share Telegram bot - final single-file.
+
+Features:
+- aiogram v2 (compatible with aiogram 2.25.0)
+- PostgreSQL via SQLAlchemy async + asyncpg (recommended for concurrency)
+- All Telegram ID columns use BigInteger to avoid overflow
+- Upload flow: /upload (owner) -> send 1..99 files -> /done -> protect on/off -> autodelete minutes -> publish deep-link
+- Files forwarded to UPLOAD_CHANNEL; DB stores stable file_id references (low DB storage)
+- Deep link: https://t.me/<bot_username>?start=<token>
+- /revoke <token> (owner only)
+- /editstart (owner only) - reply to message (text or photo) to set /start content
+- /broadcast (owner only) - reply to message and broadcast to saved users. Supports {first_name} and {word | url}
 - /help (owner only), /health (public)
-- Autodelete worker deletes delivered messages when scheduled
-- Tries safe in-place migration for integer->bigint if required
-- No hard-coded channel ID (uses env UPLOAD_CHANNEL_ID)
-- Designed to be persistent and handle concurrency
+- Autodelete worker removes delivered messages when their timer expires
+- Best-effort auto-migrations converting integer -> bigint for ID columns
+- Designed to run on Render / any container host; use PostgreSQL for persistence and concurrency
 """
 
 # -----------------------
-# Standard library
+# Standard library imports
 # -----------------------
 import os
 import sys
@@ -39,19 +32,19 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 # -----------------------
-# HTTP server (aiohttp)
+# aiohttp for webhook server
 # -----------------------
 from aiohttp import web
 from aiohttp.web_request import Request
 
 # -----------------------
-# Aiogram v2
+# aiogram v2
 # -----------------------
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # -----------------------
-# SQLAlchemy async + asyncpg
+# SQLAlchemy + asyncpg
 # -----------------------
 from sqlalchemy import (
     Column,
@@ -70,36 +63,33 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 # -----------------------
-# Logging configuration
+# Logging
 # -----------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("final_session_share_bot")
+logger = logging.getLogger("session_share_bot")
 
 # -----------------------
-# Read environment variables (required)
+# Environment variables (required)
 # -----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID_ENV = os.environ.get("OWNER_ID")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgresql+asyncpg://user:pass@host:5432/db
+DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgresql+asyncpg://user:pass@host:5432/dbname
 UPLOAD_CHANNEL_ID_ENV = os.environ.get("UPLOAD_CHANNEL_ID")  # e.g. -1001234567890
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://your-app.onrender.com
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://service.onrender.com
 PORT = int(os.environ.get("PORT", "10000"))
 
-# -----------------------
-# Operational constants and tunables
-# -----------------------
-MAX_FILES_PER_SESSION = int(os.environ.get("MAX_FILES_PER_SESSION", "99"))  # 1..99
+# Tunables
+MAX_FILES_PER_SESSION = int(os.environ.get("MAX_FILES_PER_SESSION", "99"))
 MAX_CONCURRENT_DELIVERIES = int(os.environ.get("MAX_CONCURRENT_DELIVERIES", "50"))
 BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "10"))
 AUTODELETE_CHECK_INTERVAL = int(os.environ.get("AUTODELETE_CHECK_INTERVAL", "30"))  # seconds
 DRAFT_TOKEN_LENGTH = int(os.environ.get("DRAFT_TOKEN_LENGTH", "64"))
 AUTODELETE_MAX_MINUTES = int(os.environ.get("AUTODELETE_MAX_MINUTES", "10080"))  # 7 days
 
-# Validate required envs
 _missing = []
 if not BOT_TOKEN:
     _missing.append("BOT_TOKEN")
@@ -117,20 +107,20 @@ if _missing:
 try:
     OWNER_ID = int(OWNER_ID_ENV)
 except Exception as e:
-    raise RuntimeError("OWNER_ID must be an integer (your Telegram numeric id). Error: " + str(e))
+    raise RuntimeError("OWNER_ID must be an integer. Error: " + str(e))
 
 try:
     UPLOAD_CHANNEL_ID = int(UPLOAD_CHANNEL_ID_ENV)
 except Exception as e:
-    raise RuntimeError("UPLOAD_CHANNEL_ID must be an integer (channel id like -100...). Error: " + str(e))
+    raise RuntimeError("UPLOAD_CHANNEL_ID must be an integer. Error: " + str(e))
 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
-logger.info("Configuration loaded: OWNER_ID=%s UPLOAD_CHANNEL_ID=%s WEBHOOK_HOST=%s PORT=%s", OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_HOST, PORT)
+logger.info("Configuration: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s", OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_HOST, PORT)
 
 # -----------------------
-# Database: models + engine
+# Database models
 # -----------------------
 Base = declarative_base()
 
@@ -163,7 +153,7 @@ class FileModel(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     session_id = Column(BigInteger, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
     tg_file_id = Column(String, nullable=False)  # stable file_id from upload channel
-    file_type = Column(String(32), nullable=False)  # photo, video, document, audio, voice, sticker, animation, etc.
+    file_type = Column(String(32), nullable=False)
     caption = Column(String, nullable=True)
     order_index = Column(Integer, nullable=False)
 
@@ -188,88 +178,89 @@ class StartMessage(Base):
 
 Index("ix_files_session_order", FileModel.session_id, FileModel.order_index)
 
-# Create async engine and sessionmaker
+# -----------------------
+# Async engine & sessionmaker
+# -----------------------
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 # -----------------------
 # Auto-migration helpers (safe)
 # -----------------------
-async def create_tables_and_safe_migrations():
+async def ensure_tables_and_safe_migrations():
     """
-    Create tables if missing and attempt safe auto-migrations:
-    - Add commonly-missing columns if absent
-    - Attempt to ALTER known integer columns to BIGINT (to fix integer overflow)
-    This function logs failures but tries hard to repair typical schema issues.
+    Create tables if missing and perform safe, best-effort migrations:
+    - Create missing tables/columns
+    - Attempt to ALTER known integer ID columns to BIGINT if they are INTEGER (fix "integer out of range")
     """
-    logger.info("Initializing DB: create tables if required and attempt safe migrations...")
+    logger.info("DB init: creating tables and attempting safe migrations...")
     async with engine.begin() as conn:
-        # Create tables if missing
+        # Create tables
         await conn.run_sync(Base.metadata.create_all)
 
-        # Add columns safely with IF NOT EXISTS where appropriate (Postgres)
+        # Add commonly-missing columns (safe)
         try:
             await conn.execute(sa_text("ALTER TABLE IF EXISTS start_message ADD COLUMN IF NOT EXISTS photo_file_id TEXT"))
         except Exception:
-            logger.debug("start_message.photo_file_id add skipped or failed (non-fatal)")
+            logger.debug("Could not auto-add start_message.photo_file_id (ignorable)")
 
         try:
             await conn.execute(sa_text("ALTER TABLE IF EXISTS sessions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'draft'"))
         except Exception:
-            logger.debug("sessions.status add skipped or failed")
+            logger.debug("sessions.status already exists or could not be added")
 
         try:
             await conn.execute(sa_text("ALTER TABLE IF EXISTS sessions ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE"))
         except Exception:
-            logger.debug("sessions.protect_content add skipped or failed")
+            logger.debug("sessions.protect_content exists or could not be added")
 
         try:
             await conn.execute(sa_text("ALTER TABLE IF EXISTS sessions ADD COLUMN IF NOT EXISTS autodelete_minutes INTEGER DEFAULT 0"))
         except Exception:
-            logger.debug("sessions.autodelete_minutes add skipped or failed")
+            logger.debug("sessions.autodelete_minutes exists or could not be added")
 
-    # Now ensure known ID columns are BIGINT. If they're integer, try to ALTER them.
-    await ensure_bigint_for_known_columns()
-    logger.info("DB initialization + safe migration completed.")
+    # Attempt to alter integer -> bigint for known columns
+    await attempt_alter_integer_columns_to_bigint()
 
 
-async def ensure_bigint_for_known_columns():
+async def attempt_alter_integer_columns_to_bigint():
     """
-    For a list of known table.column pairs that must be BIGINT (Telegram IDs),
-    check their current data_type via information_schema; if INTEGER -> ALTER to BIGINT.
-    This helps fix 'integer out of range' errors on inserts for big Telegram IDs.
+    Check known columns, and if their data type is integer, attempt to ALTER them to BIGINT.
+    This fixes numeric out of range problems due to large Telegram IDs.
     """
-    known_targets = {
+    known = {
         "users": ["id"],
         "sessions": ["id", "owner_id"],
         "files": ["id", "session_id"],
         "deliveries": ["id", "chat_id", "message_id"],
         "start_message": ["id"],
     }
+
     async with engine.begin() as conn:
-        for table, cols in known_targets.items():
+        for table, cols in known.items():
             for col in cols:
                 try:
                     q = """
                     SELECT data_type
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = :table AND column_name = :col
+                    WHERE table_schema = 'public' AND table_name = :table AND column_name = :col;
                     """
                     res = await conn.execute(sa_text(q).bindparams(table=table, col=col))
                     row = res.first()
                     if not row:
                         continue
-                    data_type = row[0]
-                    if data_type == "integer":
+                    dtype = row[0]
+                    if dtype == "integer":
                         alter_sql = f'ALTER TABLE "{table}" ALTER COLUMN "{col}" TYPE BIGINT USING "{col}"::BIGINT;'
                         try:
-                            logger.info("Altering %s.%s from INTEGER to BIGINT...", table, col)
+                            logger.info("Altering %s.%s from INTEGER -> BIGINT", table, col)
                             await conn.execute(sa_text(alter_sql))
-                            logger.info("Altered %s.%s to BIGINT", table, col)
+                            logger.info("Altered %s.%s to BIGINT successfully", table, col)
                         except Exception:
-                            logger.exception("Failed to ALTER %s.%s to BIGINT (non-fatal)", table, col)
+                            logger.exception("Failed to ALTER %s.%s to BIGINT", table, col)
                 except Exception:
-                    logger.exception("Error checking/alting %s.%s", table, col)
+                    logger.exception("Error checking/altering %s.%s", table, col)
+
 
 # -----------------------
 # Aiogram setup
@@ -278,11 +269,10 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
-# Delivery concurrency control
 delivery_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DELIVERIES)
 
 # -----------------------
-# Helper utilities
+# Utilities
 # -----------------------
 def generate_token(length: int = DRAFT_TOKEN_LENGTH) -> str:
     return secrets.token_urlsafe(length)[:length]
@@ -290,8 +280,7 @@ def generate_token(length: int = DRAFT_TOKEN_LENGTH) -> str:
 
 def render_text_with_links(text: Optional[str], first_name: Optional[str] = None) -> str:
     """
-    Replace {first_name} with user's first name and convert {word | url} patterns
-    into an HTML anchor tag. Return HTML-escaped final string.
+    Replace {first_name} and convert {word | url} patterns into HTML-safe anchor tags.
     Example: "Click {here | https://example.com}" -> "Click <a href='https://example.com'>here</a>"
     """
     if not text:
@@ -323,10 +312,11 @@ def render_text_with_links(text: Optional[str], first_name: Optional[str] = None
 
 
 # -----------------------
-# Database access helper functions
+# Database helper functions
 # -----------------------
 async def init_db():
-    await create_tables_and_safe_migrations()
+    await ensure_tables_and_safe_migrations()
+    logger.info("Database initialization complete.")
 
 
 async def save_user_if_not_exists(user: types.User):
@@ -341,14 +331,14 @@ async def save_user_if_not_exists(user: types.User):
             rec = UserModel(id=int(user.id), first_name=user.first_name, last_name=user.last_name, username=user.username)
             db.add(rec)
             await db.commit()
-            logger.debug("Saved user %s to DB", user.id)
+            logger.debug("Saved user %s", user.id)
         except Exception:
-            logger.exception("save_user_if_not_exists error")
+            logger.exception("save_user_if_not_exists failed")
 
 
 async def create_draft_session(owner_id: int) -> SessionModel:
     """
-    Create draft session with retries. If numeric overflow causes failure, ensure bigint migration attempted and retry.
+    Creates a draft session and retries with adjustments on certain DB errors (e.g. integer overflow).
     """
     async with AsyncSessionLocal() as db:
         last_exc = None
@@ -365,12 +355,12 @@ async def create_draft_session(owner_id: int) -> SessionModel:
                 last_exc = e
                 await db.rollback()
                 logger.warning("create_draft_session attempt %d failed: %s", attempt + 1, e)
-                if "out of range" in str(e).lower():
-                    logger.warning("Detected numeric out of range; attempting DB column migration to BIGINT and retry.")
+                if "out of range" in str(e).lower() or "numericvalueoutofrange" in str(e).lower():
+                    logger.warning("Detected numeric out of range; attempting to alter integer columns to BIGINT and retry.")
                     try:
-                        await ensure_bigint_for_known_columns()
+                        await attempt_alter_integer_columns_to_bigint()
                     except Exception:
-                        logger.exception("Migration attempt failed")
+                        logger.exception("attempt_alter_integer_columns_to_bigint failed")
         logger.error("create_draft_session failed after retries: %s", last_exc)
         raise RuntimeError("Failed to create draft session") from last_exc
 
@@ -444,7 +434,7 @@ async def revoke_session_by_token(token: str) -> bool:
             rec.status = "revoked"
             db.add(rec)
             await db.commit()
-            logger.info("Revoked session token %s", token)
+            logger.info("Revoked session %s", token)
             return True
         return False
 
@@ -506,13 +496,9 @@ async def fetch_start_message() -> Tuple[Optional[str], Optional[str]]:
 
 
 # -----------------------
-# Send helpers (respect protect_content; owner bypass)
+# send helpers (protect content support)
 # -----------------------
 async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str, caption: Optional[str], protect: bool):
-    """
-    Send media to a chat, attempting to set protect_content where supported by aiogram version.
-    If protect_content is not accepted (TypeError), fallback to sending without it.
-    """
     kwargs: Dict[str, Any] = {}
     if caption:
         kwargs["caption"] = caption
@@ -540,7 +526,7 @@ async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str,
         else:
             return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
     except TypeError:
-        # protect_content param not accepted by this aiogram/Telegram version
+        # protect_content not supported in this aiogram version; retry without it
         kwargs.pop("protect_content", None)
         try:
             if file_type == "photo":
@@ -560,7 +546,7 @@ async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str,
             else:
                 return await bot.send_document(chat_id=chat_id, document=tg_file_id, **kwargs)
         except Exception:
-            logger.exception("Fallback send without protect_content failed")
+            logger.exception("Fallback send without protect failed")
             raise
     except Exception:
         logger.exception("send_media_with_protect failed")
@@ -568,10 +554,10 @@ async def send_media_with_protect(file_type: str, chat_id: int, tg_file_id: str,
 
 
 # -----------------------
-# Autodelete worker (persistent)
+# autodelete worker
 # -----------------------
 async def autodelete_worker():
-    logger.info("Autodelete worker started; interval=%s seconds", AUTODELETE_CHECK_INTERVAL)
+    logger.info("Autodelete worker started; checking every %s seconds", AUTODELETE_CHECK_INTERVAL)
     while True:
         try:
             async with AsyncSessionLocal() as db:
@@ -580,36 +566,37 @@ async def autodelete_worker():
                 res = await db.execute(stmt)
                 due = res.scalars().all()
                 if due:
-                    logger.info("Autodelete: %d deliveries due", len(due))
+                    logger.info("Autodelete: %d messages due", len(due))
                 for rec in due:
                     try:
                         await bot.delete_message(chat_id=rec.chat_id, message_id=rec.message_id)
-                        logger.debug("Autodelete deleted %s:%s", rec.chat_id, rec.message_id)
+                        logger.debug("Deleted delivered message %s:%s", rec.chat_id, rec.message_id)
                     except Exception as e:
-                        logger.warning("Autodelete could not delete %s:%s -> %s", rec.chat_id, rec.message_id, e)
+                        logger.warning("Autodelete: failed to delete %s:%s -> %s", rec.chat_id, rec.message_id, e)
                     try:
                         await db.delete(rec)
                     except Exception:
-                        logger.exception("Failed to remove delivery record after deletion")
+                        logger.exception("Autodelete: failed to delete DB record")
                 await db.commit()
         except Exception:
-            logger.exception("Autodelete worker encountered an error: %s", traceback.format_exc())
+            logger.exception("Autodelete worker exception: %s", traceback.format_exc())
         await asyncio.sleep(AUTODELETE_CHECK_INTERVAL)
 
 
 # -----------------------
-# Message handlers
+# handlers
 # -----------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     """
-    /start  -> show configured start message (supports {first_name} and {word | url})
-    /start <token> -> deliver files for token (if published and not revoked)
+    /start shows welcome (supports {first_name} and {word | url})
+    /start <token> delivers files for token
     """
+    # Save user for broadcast list
     try:
         await save_user_if_not_exists(message.from_user)
     except Exception:
-        logger.exception("save_user_if_not_exists failed in /start")
+        logger.exception("Failed to save user on /start")
 
     args = ""
     if message.text:
@@ -627,7 +614,7 @@ async def cmd_start(message: types.Message):
                 try:
                     await message.answer(render_text_with_links(content, message.from_user.first_name), parse_mode="HTML")
                 except Exception:
-                    logger.exception("Failed to send /start fallback")
+                    logger.exception("Failed to send start fallback")
         else:
             if content:
                 try:
@@ -636,7 +623,6 @@ async def cmd_start(message: types.Message):
                     await message.answer(content.replace("{first_name}", message.from_user.first_name or ""))
         return
 
-    # treat args as deep link token
     token = args
     session_obj = await get_session_by_token(token)
     if not session_obj:
@@ -669,7 +655,7 @@ async def cmd_start(message: types.Message):
                 delete_time = datetime.utcnow() + timedelta(minutes=session_obj.autodelete_minutes)
                 await schedule_delivery(chat_id=sent.chat.id, message_id=sent.message_id, delete_at=delete_time)
         except Exception:
-            logger.exception("Failed to deliver file %s in session %s", f.tg_file_id, session_obj.link)
+            logger.exception("Failed to deliver file %s for session %s", f.tg_file_id, session_obj.link)
     if session_obj.autodelete_minutes and session_obj.autodelete_minutes > 0:
         await message.answer(f"Files delivered: {delivered}. They will be deleted after {session_obj.autodelete_minutes} minute(s).")
     else:
@@ -678,7 +664,6 @@ async def cmd_start(message: types.Message):
 
 @dp.message_handler(commands=["upload"])
 async def cmd_upload(message: types.Message):
-    """Owner-only: start upload session (draft)."""
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only the owner can use /upload.")
         return
@@ -688,13 +673,13 @@ async def cmd_upload(message: types.Message):
         logger.exception("get_owner_active_draft failed")
         existing = None
     if existing:
-        await message.reply(f"You already have an active draft. Continue sending files or use /done. Draft token: {existing.link}")
+        await message.reply(f"You already have an active draft session. Continue sending files or use /done. Draft token: {existing.link}")
         return
     try:
         rec = await create_draft_session(OWNER_ID)
         await message.reply(
             f"✅ Upload session started.\nDraft token: {rec.link}\n"
-            f"Send up to {MAX_FILES_PER_SESSION} files (photo/video/document/audio/voice/sticker/animation). "
+            f"Send up to {MAX_FILES_PER_SESSION} files (photos/videos/documents/audio/voice/sticker/animation). "
             "When finished send /done. To cancel send /abort."
         )
     except Exception:
@@ -704,29 +689,25 @@ async def cmd_upload(message: types.Message):
 
 @dp.message_handler(content_types=["photo", "video", "document", "audio", "voice", "sticker", "animation"])
 async def handle_owner_media(message: types.Message):
-    """
-    When owner is uploading: forward each media to UPLOAD_CHANNEL_ID and store stable file_id in DB.
-    Non-owner media are ignored for upload but user info is saved for broadcasting list.
-    """
-    # Non-owner: save user then ignore
+    # If not owner, just save user and ignore
     if message.from_user.id != OWNER_ID:
         try:
             await save_user_if_not_exists(message.from_user)
         except Exception:
-            logger.exception("save_user_if_not_exists failed for non-owner media")
+            logger.exception("save_user_if_not_exists failed")
         return
 
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft:
-        # not in upload session; ignore
+        # no upload in progress
         return
 
     files = await list_files_for_session(draft.id)
     if len(files) >= MAX_FILES_PER_SESSION:
-        await message.reply(f"Upload limit reached ({MAX_FILES_PER_SESSION}). Use /done to finalize or /abort to cancel.")
+        await message.reply(f"Upload limit reached ({MAX_FILES_PER_SESSION}). Use /done or /abort.")
         return
 
-    # detect file type and original file_id
+    # detect type and file_id
     ftype = None
     orig_file_id = None
     caption = ""
@@ -746,19 +727,19 @@ async def handle_owner_media(message: types.Message):
         elif message.animation:
             ftype = "animation"; orig_file_id = message.animation.file_id; caption = message.caption or ""
     except Exception:
-        logger.exception("Failed to parse owner media; ask to retry")
-        await message.reply("Failed to parse file. Try sending it again.")
+        logger.exception("Failed to parse incoming owner media")
+        await message.reply("Failed to parse media. Try again.")
         return
 
-    # forward to upload channel to ensure file is stored there and we get a stable file_id
+    # forward to upload channel (so file is stored there and we can use it's stable file_id)
     try:
         fwd = await bot.forward_message(chat_id=UPLOAD_CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
     except Exception:
         logger.exception("Forward to upload channel failed")
-        await message.reply("Failed to forward to upload channel. Ensure the bot has permissions and channel id is correct.")
+        await message.reply("Failed to forward to upload channel. Ensure the bot is member/admin and the channel id is correct.")
         return
 
-    # extract stable file id from forwarded message
+    # extract file id from forwarded message
     try:
         if fwd.photo:
             channel_type = "photo"; channel_file_id = fwd.photo[-1].file_id; channel_caption = fwd.caption or ""
@@ -777,7 +758,7 @@ async def handle_owner_media(message: types.Message):
         else:
             channel_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
     except Exception:
-        logger.exception("Failed to extract file id from forwarded message; falling back")
+        logger.exception("Failed to extract stable file id from forwarded message; falling back to original")
         channel_type = ftype; channel_file_id = orig_file_id; channel_caption = caption
 
     try:
@@ -786,18 +767,17 @@ async def handle_owner_media(message: types.Message):
         await message.reply(f"Saved {channel_type}. ({current_count}/{MAX_FILES_PER_SESSION}) Send more or /done when finished.")
     except Exception:
         logger.exception("append_file_to_session failed")
-        await message.reply("Failed to save file metadata to DB; try again or /abort.")
+        await message.reply("Failed to save file metadata; try again or /abort.")
 
 
 @dp.message_handler(commands=["done"])
 async def cmd_done(message: types.Message):
-    """Owner finalizes uploads and bot asks for protect on/off"""
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only owner can use /done.")
         return
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft:
-        await message.reply("No active upload session. Use /upload to start.")
+        await message.reply("No active upload session.")
         return
     files = await list_files_for_session(draft.id)
     if not files:
@@ -809,10 +789,6 @@ async def cmd_done(message: types.Message):
 
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().lower() in ("on", "off"))
 async def owner_protect_reply(message: types.Message):
-    """
-    After /done, owner replies 'on' or 'off' to set protect flag.
-    Then bot moves to awaiting_autodelete and asks for minutes.
-    """
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft or draft.status != "awaiting_protect":
         return
@@ -834,9 +810,8 @@ async def owner_protect_reply(message: types.Message):
 
 @dp.message_handler(commands=["setprotect"])
 async def cmd_setprotect(message: types.Message):
-    """Owner explicit command to set protect for current draft"""
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only owner can use /setprotect.")
+        await message.reply("Only owner can use /setprotect")
         return
     parts = message.text.strip().split()
     if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
@@ -858,14 +833,13 @@ async def cmd_setprotect(message: types.Message):
         rec.status = "awaiting_autodelete"
         db.add(rec)
         await db.commit()
-    await message.reply(f"Protect set to {'ON' if val else 'OFF'}. Now set autodelete via /setautodelete <minutes>.")
+    await message.reply(f"Protect set to {'ON' if val else 'OFF'} for current draft. Now set autodelete with /setautodelete <minutes>.")
 
 
 @dp.message_handler(commands=["setautodelete"])
 async def cmd_setautodelete(message: types.Message):
-    """Owner sets autodelete minutes and publishes the session"""
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only owner can set autodelete.")
+        await message.reply("Only owner can use /setautodelete")
         return
     parts = message.text.strip().split()
     if len(parts) < 2:
@@ -889,18 +863,11 @@ async def cmd_setautodelete(message: types.Message):
     me = await bot.get_me()
     bot_username = me.username or "bot"
     deep_link = f"https://t.me/{bot_username}?start={rec.link}"
-    await message.reply(
-        "✅ Session published.\n"
-        f"Deep link:\n{deep_link}\n"
-        f"Protect: {'ON' if rec.protect_content else 'OFF'}\n"
-        f"Autodelete: {rec.autodelete_minutes} minute(s)\n"
-        "Use /revoke <token> to disable when needed."
-    )
+    await message.reply(f"✅ Session published.\nDeep link:\n{deep_link}\nProtect: {'ON' if rec.protect_content else 'OFF'}\nAutodelete: {rec.autodelete_minutes} minute(s). Use /revoke <token> to disable.")
 
 
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and (m.text or "").strip().isdigit())
 async def owner_autodelete_reply(message: types.Message):
-    """Owner can reply with a number to set autodelete after awaiting_autodelete state"""
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft or draft.status != "awaiting_autodelete":
         return
@@ -909,7 +876,7 @@ async def owner_autodelete_reply(message: types.Message):
         if minutes < 0 or minutes > AUTODELETE_MAX_MINUTES:
             raise ValueError
     except ValueError:
-        await message.reply(f"Please provide integer minutes between 0 and {AUTODELETE_MAX_MINUTES}.")
+        await message.reply(f"Please send an integer between 0 and {AUTODELETE_MAX_MINUTES}.")
         return
     rec = await set_protect_and_autodelete(draft.id, draft.protect_content, minutes)
     if not rec:
@@ -918,20 +885,13 @@ async def owner_autodelete_reply(message: types.Message):
     me = await bot.get_me()
     bot_username = me.username or "bot"
     deep_link = f"https://t.me/{bot_username}?start={rec.link}"
-    await message.reply(
-        "✅ Session published.\n"
-        f"Deep link:\n{deep_link}\n"
-        f"Protect: {'ON' if rec.protect_content else 'OFF'}\n"
-        f"Autodelete: {rec.autodelete_minutes} minute(s)\n"
-        "Use /revoke <token> to disable when needed."
-    )
+    await message.reply(f"✅ Session published.\nDeep link:\n{deep_link}\nProtect: {'ON' if rec.protect_content else 'OFF'}\nAutodelete: {rec.autodelete_minutes} minute(s). Use /revoke <token> to disable.")
 
 
 @dp.message_handler(commands=["abort"])
 async def cmd_abort(message: types.Message):
-    """Owner cancels the active draft"""
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only owner can use /abort.")
+        await message.reply("❌ Only the owner can /abort.")
         return
     draft = await get_owner_active_draft(OWNER_ID)
     if not draft:
@@ -939,16 +899,15 @@ async def cmd_abort(message: types.Message):
         return
     ok = await delete_draft_session(draft.id)
     if ok:
-        await message.reply("Upload aborted and draft removed.")
+        await message.reply("Upload aborted; draft removed from DB.")
     else:
         await message.reply("Failed to abort session.")
 
 
 @dp.message_handler(commands=["revoke"])
 async def cmd_revoke(message: types.Message):
-    """Owner revokes a published token"""
     if message.from_user.id != OWNER_ID:
-        await message.reply("❌ Only owner can use /revoke.")
+        await message.reply("❌ Only owner can /revoke.")
         return
     parts = message.text.strip().split()
     if len(parts) < 2:
@@ -964,7 +923,6 @@ async def cmd_revoke(message: types.Message):
 
 @dp.message_handler(commands=["editstart", "edit_start"])
 async def cmd_edit_start(message: types.Message):
-    """Owner replies to message to set /start content (text or photo+text)"""
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only owner can use /editstart.")
         return
@@ -991,11 +949,6 @@ async def cmd_edit_start(message: types.Message):
 
 @dp.message_handler(commands=["broadcast"])
 async def cmd_broadcast(message: types.Message):
-    """
-    Owner-only broadcast.
-    Reply to a message to broadcast that message to all saved users.
-    Supports {first_name} and {word | url} patterns.
-    """
     if message.from_user.id != OWNER_ID:
         await message.reply("❌ Only owner can use /broadcast.")
         return
@@ -1087,19 +1040,18 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler()
 async def fallback(message: types.Message):
-    # Save user info silently for broadcast list and ignore other messages
+    # Save user info silently for broadcast list
     try:
         await save_user_if_not_exists(message.from_user)
     except Exception:
         logger.exception("save_user_if_not_exists failed in fallback")
-    # intentionally silent: we do not respond to arbitrary messages
+    # intentionally silent
 
 
 # -----------------------
-# Webhook handler (aiohttp)
+# Webhook handler for aiohttp
 # -----------------------
 async def webhook_handler(request: Request):
-    # Accept only JSON updates from Telegram
     try:
         data = await request.json()
     except Exception:
@@ -1112,21 +1064,20 @@ async def webhook_handler(request: Request):
         except Exception:
             logger.exception("Failed to parse update")
             return web.Response(status=400, text="bad update")
-
-    # Ensure aiogram current context for message.answer etc.
+    # process update
     try:
-        Bot.set_current(bot)
-    except Exception:
-        pass
-    try:
-        Dispatcher.set_current(dp)
-    except Exception:
+        # Set current bot context for aiogram internals if available
         try:
-            dp.set_current(dp)
+            Bot.set_current(bot)
         except Exception:
             pass
-
-    try:
+        try:
+            Dispatcher.set_current(dp)
+        except Exception:
+            try:
+                dp.set_current(dp)
+            except Exception:
+                pass
         await dp.process_update(update)
     except Exception:
         logger.exception("Dispatcher processing failed: %s", traceback.format_exc())
@@ -1138,20 +1089,19 @@ async def health_handler(request: Request):
 
 
 # -----------------------
-# Startup: init DB, autodelete worker, webhook server, set webhook
+# Startup sequence & run server
 # -----------------------
 async def start_services_and_run():
     logger.info("Starting session_share_bot; webhook_host=%s port=%s", WEBHOOK_HOST, PORT)
     try:
         await init_db()
     except Exception:
-        logger.exception("init_db failed (continuing): %s", traceback.format_exc())
+        logger.exception("init_db failed; proceeding anyway (see logs)")
 
     # start autodelete worker
     asyncio.create_task(autodelete_worker())
-    logger.info("Autodelete worker started")
+    logger.info("Autodelete worker scheduled")
 
-    # aiohttp web app
     app = web.Application()
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
     app.router.add_get(WEBHOOK_PATH, lambda req: web.Response(text="Webhook endpoint (GET)"))
@@ -1164,18 +1114,18 @@ async def start_services_and_run():
     await site.start()
     logger.info("aiohttp server started on port %s", PORT)
 
-    # set webhook on Telegram
+    # set webhook
     try:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception:
         logger.exception("Failed to set webhook to %s", WEBHOOK_URL)
 
-    # block forever
+    # keep alive
     try:
         await asyncio.Event().wait()
     finally:
-        logger.info("Shutdown initiated: deleting webhook and cleaners")
+        logger.info("Shutdown initiated")
         try:
             await bot.delete_webhook()
         except Exception:
