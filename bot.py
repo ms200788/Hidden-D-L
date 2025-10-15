@@ -1,10 +1,16 @@
 # bot.py
-# Session-share Telegram bot (single file) - Fixed only: photo in /edit_start and deep link delivery
+# Session-share Telegram bot (single file) - Final fixed version
+# - Fixes: /edit_start photo saving & sending, deep-link delivery of files
+# - Adds: internal self-ping (uses WEBHOOK_HOST from env) to keep Render service alive
+# - Keeps all original behavior, DB models, and flows unchanged otherwise.
 #
 # Required env vars:
-# BOT_TOKEN, OWNER_ID, DATABASE_URL, UPLOAD_CHANNEL_ID, WEBHOOK_HOST
+#   BOT_TOKEN, OWNER_ID, DATABASE_URL, UPLOAD_CHANNEL_ID, WEBHOOK_HOST
+# Optional:
+#   PORT (default 10000), BOT_USERNAME (for deep links; fallback to bot.get_me())
 #
-# Keep webhook deployment as before.
+# Deploy the same way as before (webhook + /health). This file intentionally
+# only applies minimal fixes you asked for and adds the self-ping keepalive.
 # ------------------------------------------------------------------------------
 
 import os
@@ -17,6 +23,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
+import aiohttp
 from aiohttp import web
 from aiohttp.web_request import Request
 
@@ -57,7 +64,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID_ENV = os.environ.get("OWNER_ID")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgresql+asyncpg://user:pass@host:5432/dbname
 UPLOAD_CHANNEL_ID_ENV = os.environ.get("UPLOAD_CHANNEL_ID")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # e.g. https://yourdomain.com
 PORT = int(os.environ.get("PORT", "10000"))
 
 MAX_FILES_PER_SESSION = int(os.environ.get("MAX_FILES_PER_SESSION", "99"))
@@ -93,11 +100,17 @@ except Exception as e:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
-# IMPORTANT: deep link uses your bot username. You've previously specified Code_66_bot
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "Code_66_bot")
+# BOT_USERNAME may be provided; otherwise we'll fetch via API at runtime
+BOT_USERNAME = os.environ.get("BOT_USERNAME")  # optional override, e.g. "Code_66_bot"
 
-logger.info("Configuration: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s, BOT_USERNAME=%s",
-            OWNER_ID, UPLOAD_CHANNEL_ID, WEBHOOK_HOST, PORT, BOT_USERNAME)
+logger.info(
+    "Configuration: OWNER_ID=%s, UPLOAD_CHANNEL_ID=%s, WEBHOOK_HOST=%s, PORT=%s, BOT_USERNAME=%s",
+    OWNER_ID,
+    UPLOAD_CHANNEL_ID,
+    WEBHOOK_HOST,
+    PORT,
+    BOT_USERNAME,
+)
 
 # ---------------------------
 # Database models
@@ -175,11 +188,16 @@ AsyncSessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_com
 
 
 async def ensure_tables_and_safe_migrations():
+    """
+    Create tables (if missing) and attempt safe migrations:
+     - add missing columns if simple to add
+     - attempt to alter integer -> bigint for known columns (best-effort)
+    """
     logger.info("DB init: creating tables if needed and attempting safe migrations...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Best-effort: add photo_file_id column if missing
+    # Best-effort: add columns if missing (no harm)
     try:
         async with engine.begin() as conn:
             await conn.execute(sa_text("ALTER TABLE IF EXISTS start_message ADD COLUMN IF NOT EXISTS photo_file_id TEXT"))
@@ -204,10 +222,15 @@ async def ensure_tables_and_safe_migrations():
     except Exception:
         logger.debug("sessions.autodelete_minutes may already exist")
 
+    # Attempt to alter integer -> bigint columns to avoid numeric overflow issues (best-effort)
     await attempt_alter_integer_columns_to_bigint()
 
 
 async def attempt_alter_integer_columns_to_bigint():
+    """
+    For PostgreSQL: check known columns; if data_type == 'integer', ALTER to BIGINT.
+    This is best-effort and will be ignored if DB user lacks privilege.
+    """
     logger.info("Attempting to alter integer columns to BIGINT (if necessary)")
     known = {
         "users": ["id"],
@@ -246,6 +269,7 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
+# a small semaphore to limit concurrent deliveries to Telegram (avoid floods)
 delivery_semaphore = asyncio.Semaphore(MAX_DELIVERY_CONCURRENCY)
 
 # ---------------------------
@@ -254,6 +278,7 @@ delivery_semaphore = asyncio.Semaphore(MAX_DELIVERY_CONCURRENCY)
 
 
 def generate_token(length: int = DRAFT_TOKEN_LENGTH) -> str:
+    # generates URL-safe tokens of requested length
     tok = secrets.token_urlsafe(length * 2)[:length]
     return tok
 
@@ -263,9 +288,20 @@ def _escape_html(s: str) -> str:
 
 
 def render_text_with_links(text: Optional[str], first_name: Optional[str] = None) -> str:
+    """
+    Replace {first_name} and convert {word | url} patterns into HTML anchor tags.
+
+    Examples:
+      "Visit {here | https://ex.com}" -> 'Visit <a href="https://ex.com">here</a>'
+      "Hello {first_name}" -> 'Hello John'
+    """
     if not text:
         return ""
+
+    # First replace {first_name}
     out = text.replace("{first_name}", html.escape(first_name or ""))
+
+    # Now parse {left | right} occurrences. We must preserve other braces if malformed.
     result_parts: List[str] = []
     i = 0
     L = len(out)
@@ -274,9 +310,11 @@ def render_text_with_links(text: Optional[str], first_name: Optional[str] = None
         if s == -1:
             result_parts.append(_escape_html(out[i:]))
             break
+        # append pre-brace text escaped
         result_parts.append(_escape_html(out[i:s]))
         e = out.find("}", s)
         if e == -1:
+            # no closing brace; append rest escaped and break
             result_parts.append(_escape_html(out[s:]))
             break
         inner = out[s + 1:e].strip()
@@ -288,6 +326,7 @@ def render_text_with_links(text: Optional[str], first_name: Optional[str] = None
             href = html.escape(right_t, quote=True)
             result_parts.append(f'<a href="{href}">{left_escaped}</a>')
         else:
+            # not a link pattern - render literally escaped
             result_parts.append(_escape_html("{" + inner + "}"))
         i = e + 1
     return "".join(result_parts)
@@ -299,11 +338,13 @@ def render_text_with_links(text: Optional[str], first_name: Optional[str] = None
 
 
 async def init_db():
+    """ Initialize DB and run safe auto-migrations. """
     await ensure_tables_and_safe_migrations()
     logger.info("DB initialization completed.")
 
 
 async def save_user_if_not_exists(user: types.User):
+    """ Saves user's basic info for future broadcast. Non-blocking helper. """
     if not user:
         return
     async with AsyncSessionLocal() as db:
@@ -321,6 +362,7 @@ async def save_user_if_not_exists(user: types.User):
 
 
 async def create_draft_session(owner_id: int) -> SessionModel:
+    """ Create a draft session. Retries on conflicts/unique collisions. """
     async with AsyncSessionLocal() as db:
         last_exc = None
         for attempt in range(6):
@@ -484,7 +526,6 @@ async def send_media_with_protect(chat_id: int, file_type: str, tg_file_id: str,
     if caption:
         kwargs["caption"] = caption
         kwargs["parse_mode"] = "HTML"
-        # NOTE: disable_web_page_preview is not applicable for media sends; avoid using it here.
 
     # Some versions of aiogram/Telegram don't support protect_content param in send_* methods.
     # We set it and catch TypeError to fallback.
@@ -499,6 +540,7 @@ async def send_media_with_protect(chat_id: int, file_type: str, tg_file_id: str,
         elif file_type == "audio":
             return await bot.send_audio(chat_id=chat_id, audio=tg_file_id, **kwargs)
         elif file_type == "voice":
+            # voice doesn't support caption
             kwargs.pop("caption", None)
             kwargs.pop("parse_mode", None)
             return await bot.send_voice(chat_id=chat_id, voice=tg_file_id, **kwargs)
@@ -568,6 +610,39 @@ async def autodelete_worker():
         except Exception:
             logger.exception("Autodelete worker exception: %s", traceback.format_exc())
         await asyncio.sleep(AUTODELETE_CHECK_INTERVAL)
+
+
+# ---------------------------
+# Self-ping (keepalive) worker
+# ---------------------------
+
+async def self_ping_worker():
+    """
+    Periodically GETs {WEBHOOK_HOST}/health to keep Render/hosting from idling the service.
+    Uses WEBHOOK_HOST from environment so it can be changed for testing.
+    """
+    if not WEBHOOK_HOST:
+        logger.warning("WEBHOOK_HOST not set; self-ping disabled.")
+        return
+    url = f"{WEBHOOK_HOST.rstrip('/')}/health"
+    logger.info("Self-ping worker starting; will ping %s every 300s", url)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(url, timeout=15) as resp:
+                        if resp.status == 200:
+                            logger.debug("Self-ping OK: %s", url)
+                        else:
+                            logger.warning("Self-ping unexpected status %s for %s", resp.status, url)
+                except asyncio.TimeoutError:
+                    logger.warning("Self-ping timeout for %s", url)
+                except Exception as e:
+                    logger.warning("Self-ping failed for %s: %s", url, e)
+        except Exception:
+            logger.exception("Unexpected error in self-ping outer loop")
+        # Sleep 5 minutes to be safe and keep service active
+        await asyncio.sleep(300)
 
 
 # ---------------------------
@@ -834,8 +909,16 @@ async def handle_autodelete_reply(message: types.Message):
         await db.commit()
         await db.refresh(draft)
 
-    # Compose deep link
-    deep_link = f"https://t.me/{BOT_USERNAME}?start={draft.link}"
+    # Compose deep link, prefer BOT_USERNAME from env if provided, else use bot.get_me()
+    try:
+        bot_username = BOT_USERNAME
+        if not bot_username:
+            me = await bot.get_me()
+            bot_username = me.username or me.first_name or "bot"
+    except Exception:
+        bot_username = BOT_USERNAME or "bot"
+
+    deep_link = f"https://t.me/{bot_username}?start={draft.link}"
 
     # Fetch files count
     files = await list_files_for_session(draft.id)
@@ -856,7 +939,7 @@ async def handle_autodelete_reply(message: types.Message):
     except Exception:
         logger.exception("Failed to post session summary to upload channel")
 
-    # Send owner confirmation privately
+    # Also send the deep link + info privately to owner for confirmation
     try:
         owner_msg = (
             f"✅ Session published\n\n"
@@ -871,9 +954,9 @@ async def handle_autodelete_reply(message: types.Message):
     except Exception:
         logger.exception("Failed to send publish confirmation to owner")
 
-    # let owner know in private that session is published
+    # let owner know in the chat where /done was called
     try:
-        await message.reply(f"✅ Session published and summary posted to upload channel. Deep link token saved. (Not broadcasted to users.)")
+        await message.reply("✅ Session published and summary posted to upload channel. Deep link token saved. (Not broadcasted to users.)")
     except Exception:
         logger.exception("Failed to reply to owner after publishing")
 
@@ -938,7 +1021,7 @@ async def cmd_edit_start(message: types.Message):
             await save_start_message(reply.text, None)
             await message.reply("✅ /start updated with text.")
             return
-        # If reply has caption only -> save caption
+        # If reply has caption only (e.g., media without photo) -> save caption
         if getattr(reply, "caption", None):
             await save_start_message(reply.caption, None)
             await message.reply("✅ /start updated with caption.")
@@ -1011,7 +1094,6 @@ async def cmd_broadcast(message: types.Message):
             try:
                 if b_photo:
                     caption_html = render_text_with_links(b_text or "", fname)
-                    # removed unsupported disable_web_page_preview arg for media
                     await bot.send_photo(chat_id=int(uid), photo=b_photo, caption=caption_html, parse_mode="HTML")
                     sent_count += 1
                 else:
@@ -1076,6 +1158,7 @@ async def webhook_handler(request: Request):
             logger.exception("Failed to parse update")
             return web.Response(status=400, text="bad update")
     try:
+        # Set current bot context for aiogram internals if available
         try:
             Bot.set_current(bot)
         except Exception:
@@ -1104,6 +1187,10 @@ async def start_services_and_run():
     # Start autodelete worker
     asyncio.create_task(autodelete_worker())
     logger.info("Autodelete worker scheduled")
+
+    # Start self-ping worker to keep hosting awake (added as requested)
+    asyncio.create_task(self_ping_worker())
+    logger.info("Self-ping worker scheduled (keeps service alive)")
 
     app = web.Application()
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
