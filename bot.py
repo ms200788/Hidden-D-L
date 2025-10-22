@@ -725,9 +725,9 @@ async def cmd_start(message: types.Message):
 
     if session_obj.autodelete_minutes and session_obj.autodelete_minutes > 0:
         await message.answer(f"Files delivered: {delivered}.")
-        await message.answer(f"Delivery complete. Above files will be deleted in {session_obj.autodelete_minutes} minute(s).\n\nNo other data will be sent.")
+        await message.answer(f"Delivery complete. Above files will be deleted in {session_obj.autodelete_minutes} minute(s).\n\n.")
     else:
-        await message.answer(f"Files delivered: {delivered}. (Autodelete disabled)")
+        await message.answer(f"Files delivered: {delivered}.")
 
     return
 
